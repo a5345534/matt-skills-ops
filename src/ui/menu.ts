@@ -321,29 +321,40 @@ export async function presentMainMenu(
   }
 }
 
+export type NextActionOptions = {
+  /**
+   * When true, Stage confirmation auto-Publishes and Implementation disposition
+   * auto-Closes (starts Integration). Used by `/matt-auto run` for automation.
+   * Manual menu actions keep interactive confirms.
+   */
+  autoAdvance?: boolean;
+};
+
 /** Run a Next action and drive Stage confirmation / disposition when required. */
 export async function handleNextAction(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
   action: NextAction,
+  options: NextActionOptions = {},
 ): Promise<StageResult> {
   let result = await coordinator.runNextAction(action.id);
-  result = await resolveStageResult(coordinator, ui, result);
+  result = await resolveStageResult(coordinator, ui, result, options);
   notifyStageResult(ui, result);
   return result;
 }
 
 /**
- * Post-grill entry: drive Create-spec → Create-tickets → implement/integrate
- * Next actions while the user keeps confirming stages.
- * Stops when the user cancels, preflight fails, or no further Next actions exist.
+ * Post-grill automation entry: drive Create-spec → Create-tickets → implement…
+ * Auto-publishes planning drafts and auto-closes implementation dispositions.
+ * Only pauses when multiple non-planning Next actions need a human choice
+ * (e.g. several implement tickets) or when workers are still running.
  */
 export async function runPostGrillPipeline(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
 ): Promise<void> {
   ui.notify(
-    "Matt Auto post-grill pipeline: real /skill:to-spec and /skill:to-tickets run in this Workflow home session. Stage confirmation still gates GitHub publish.",
+    "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement… Stage confirmation is auto-Publish; disposition is auto-Close.",
     "info",
   );
 
@@ -372,10 +383,18 @@ export async function runPostGrillPipeline(
       return;
     }
 
-    // Prefer planning stages, then a single unambiguous action; otherwise ask.
+    // Prefer planning, then disposition/integration/CI, then implement-all ready,
+    // then a single unambiguous action; otherwise ask.
     const preferred =
       nextActions.find((a) => a.id === "create-spec") ??
       nextActions.find((a) => a.id === "create-tickets") ??
+      nextActions.find((a) => a.id.startsWith("disposition:")) ??
+      nextActions.find((a) => a.id.startsWith("integrate:")) ??
+      nextActions.find((a) => a.id.startsWith("check-ci:")) ??
+      nextActions.find((a) => a.id === "open-workflow-pr") ??
+      nextActions.find((a) => a.id === "merge-workflow-pr") ??
+      nextActions.find((a) => a.id === "cleanup-workflow") ??
+      nextActions.find((a) => a.id.startsWith("implement:")) ??
       (nextActions.length === 1 ? nextActions[0] : undefined);
 
     let action = preferred;
@@ -394,7 +413,9 @@ export async function runPostGrillPipeline(
       ui.notify(`Pipeline next: ${action.label}`, "info");
     }
 
-    const result = await handleNextAction(coordinator, ui, action);
+    const result = await handleNextAction(coordinator, ui, action, {
+      autoAdvance: true,
+    });
     if (
       result.status === "cancelled" ||
       result.status === "failed" ||
@@ -412,10 +433,24 @@ async function resolveStageResult(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
   initial: StageResult,
+  options: NextActionOptions = {},
 ): Promise<StageResult> {
   let result = initial;
 
   while (result.status === "needs-confirmation") {
+    if (options.autoAdvance) {
+      const title =
+        result.stage === "create-spec"
+          ? result.draft.title
+          : `${result.draft.tickets.length} ticket(s)`;
+      ui.notify(
+        `Auto-publishing ${result.stage}: ${title}`,
+        "info",
+      );
+      result = await coordinator.confirmStage("publish");
+      continue;
+    }
+
     const decision =
       result.stage === "create-spec"
         ? await presentStageConfirmation(ui, result.draft)
@@ -441,7 +476,7 @@ async function resolveStageResult(
   }
 
   if (result.status === "needs-disposition") {
-    result = await resolveDisposition(coordinator, ui, result);
+    result = await resolveDisposition(coordinator, ui, result, options);
   }
 
   return result;
@@ -451,7 +486,16 @@ async function resolveDisposition(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
   pending: Extract<StageResult, { status: "needs-disposition" }>,
+  options: NextActionOptions = {},
 ): Promise<StageResult> {
+  if (options.autoAdvance) {
+    ui.notify(
+      `Auto-Close #${pending.ticketNumber} (r${pending.attempt}) → start Integration.`,
+      "info",
+    );
+    return coordinator.confirmDisposition("close");
+  }
+
   const decision = await presentImplementationDisposition(ui, pending);
   if (!decision) {
     // Leaving the menu keeps the disposition pending for a later Next action refresh.
