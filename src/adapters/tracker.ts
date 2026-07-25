@@ -17,6 +17,20 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Parse `gh issue create` stdout. Older gh prints only the issue URL:
+ *   https://github.com/owner/repo/issues/42
+ * Newer gh with --json is intentionally not required for compatibility.
+ */
+export function parseIssueNumberFromCreateOutput(
+  stdout: string,
+): number | undefined {
+  const match = stdout.match(/\/issues\/(\d+)\b/);
+  if (!match?.[1]) return undefined;
+  const number = Number(match[1]);
+  return Number.isInteger(number) && number > 0 ? number : undefined;
+}
+
 async function run(
   cwd: string,
   command: string,
@@ -273,38 +287,42 @@ export function createTrackerPort(cwd: string): TrackerPort {
 
   return {
     async createIssue(input) {
-      const args = [
-        "issue",
-        "create",
-        "--title",
-        input.title,
-        "--body",
-        input.body,
-        "--json",
-        "number,url",
-      ];
-      for (const label of input.labels) {
-        args.push("--label", label);
-      }
-
-      const result = await run(cwd, "gh", args);
-      if (result.code !== 0) {
-        throw new Error(
-          result.stderr.trim() ||
-            `gh issue create failed with exit code ${result.code}`,
-        );
-      }
-
-      let parsed: { number?: number };
+      // Older gh (e.g. 2.45) does not support `gh issue create --json`.
+      // Write body via file and parse the issue URL from stdout.
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "matt-auto-issue-"));
+      const bodyFile = path.join(tmpDir, "body.md");
       try {
-        parsed = JSON.parse(result.stdout) as { number?: number };
-      } catch {
-        throw new Error("gh issue create returned non-JSON output.");
+        await writeFile(bodyFile, input.body, "utf8");
+        const args = [
+          "issue",
+          "create",
+          "--title",
+          input.title,
+          "--body-file",
+          bodyFile,
+        ];
+        for (const label of input.labels) {
+          args.push("--label", label);
+        }
+
+        const result = await run(cwd, "gh", args);
+        if (result.code !== 0) {
+          throw new Error(
+            result.stderr.trim() ||
+              `gh issue create failed with exit code ${result.code}`,
+          );
+        }
+
+        const number = parseIssueNumberFromCreateOutput(result.stdout);
+        if (number === undefined) {
+          throw new Error(
+            `gh issue create did not return a recognizable issue URL. Output: ${result.stdout.trim()}`,
+          );
+        }
+        return { number };
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
       }
-      if (typeof parsed.number !== "number") {
-        throw new Error("gh issue create did not return an issue number.");
-      }
-      return { number: parsed.number };
     },
 
     async writeWorkflowManifest(issueNumber, manifest) {
