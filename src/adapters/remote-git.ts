@@ -5,6 +5,29 @@ import type { RemoteGitPort } from "../ports.js";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * True when delete failed only because the remote branch is already gone.
+ * Matches English and common Chinese git/i18n messages.
+ */
+export function isMissingRemoteBranchError(
+  stderr: string,
+  stdout = "",
+): boolean {
+  const detail = `${stderr}
+${stdout}`.toLowerCase();
+  return (
+    detail.includes("remote ref does not exist") ||
+    detail.includes("does not exist") ||
+    detail.includes("not found") ||
+    detail.includes("unable to delete") ||
+    // zh_TW / zh_CN git messages seen in the wild
+    detail.includes("遠端引用不存在") ||
+    detail.includes("远程引用不存在") ||
+    detail.includes("無法刪除") ||
+    detail.includes("无法删除")
+  );
+}
+
 async function run(
   cwd: string,
   command: string,
@@ -58,8 +81,20 @@ export function createRemoteGitPort(workflowRoot: string): RemoteGitPort {
 
     async deleteRemoteBranches(branchNames) {
       for (const branchName of branchNames) {
-        // `git push origin --delete <branch>` fails if the remote branch is already gone;
-        // treat missing remotes as success so paired cleanup stays idempotent.
+        // Prefer skipping branches that are already gone (locale-independent).
+        const listed = await run(root, "git", [
+          "ls-remote",
+          "--heads",
+          "origin",
+          branchName,
+        ]);
+        if (listed.code === 0 && listed.stdout.trim().length === 0) {
+          continue;
+        }
+
+        // `git push origin --delete <branch>` still fails if the remote branch
+        // vanished between ls-remote and delete; treat missing as success so
+        // paired cleanup stays idempotent across git locales (en/zh).
         const result = await run(root, "git", [
           "push",
           "origin",
@@ -67,17 +102,12 @@ export function createRemoteGitPort(workflowRoot: string): RemoteGitPort {
           branchName,
         ]);
         if (result.code === 0) continue;
-        const detail = (result.stderr || result.stdout || "").toLowerCase();
-        const missing =
-          detail.includes("remote ref does not exist") ||
-          detail.includes("does not exist") ||
-          detail.includes("not found") ||
-          detail.includes("unable to delete");
-        if (!missing) {
-          throw new Error(
-            `git push origin --delete ${branchName} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
-          );
+        if (isMissingRemoteBranchError(result.stderr, result.stdout)) {
+          continue;
         }
+        throw new Error(
+          `git push origin --delete ${branchName} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
+        );
       }
     },
   };
