@@ -812,6 +812,7 @@ function createModels(
 ): ModelsPort {
   return {
     listAvailableModels: async () => models,
+    getHomeModel: async () => undefined,
   };
 }
 

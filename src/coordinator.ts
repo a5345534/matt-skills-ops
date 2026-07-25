@@ -3600,6 +3600,10 @@ export function createWorkflowCoordinator(
     return ports.models.listAvailableModels();
   }
 
+  async function getHomeModel() {
+    return ports.models.getHomeModel();
+  }
+
   async function thinkingLevelsFor(
     provider: string,
     modelId: string,
@@ -3626,6 +3630,7 @@ export function createWorkflowCoordinator(
     setRootWorkerProfile,
     clearRootWorkerProfile,
     listAvailableModels,
+    getHomeModel,
     thinkingLevelsFor,
     getPanelState,
     confirmDisposition,

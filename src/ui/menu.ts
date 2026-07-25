@@ -899,23 +899,28 @@ export async function presentWorkerProfileMenu(
 }
 
 /**
- * Prompt for model (searchable when `ui.input` is available) then thinking level.
- * Model choices come from Pi’s authenticated available catalog.
+ * Prompt for model (home model shortcut + catalog) then thinking level.
+ * Model choices come from Pi’s authenticated available catalog and the live
+ * Workflow home selection. Never mutates the home model.
  */
 export async function promptWorkerProfile(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
 ): Promise<WorkerProfile | undefined> {
-  const models = await coordinator.listAvailableModels();
-  if (models.length === 0) {
+  const [models, home] = await Promise.all([
+    coordinator.listAvailableModels(),
+    coordinator.getHomeModel(),
+  ]);
+
+  if (models.length === 0 && !home) {
     ui.notify(
-      "No authenticated models are available in Pi’s catalog. Authenticate a provider (for example via /login) and retry.",
+      "No authenticated models are available in Pi’s catalog, and Workflow home has no model selected. Authenticate a provider (for example via /login) or pick a home model with /model, then retry.",
       "warning",
     );
     return undefined;
   }
 
-  const model = await selectAvailableModel(models, ui);
+  const model = await selectAvailableModel(models, ui, home ?? undefined);
   if (!model) return undefined;
 
   const levels = [...model.thinkingLevels];
@@ -927,9 +932,23 @@ export async function promptWorkerProfile(
     return undefined;
   }
 
+  // Prefer home thinking level when the user picked the home model shortcut.
+  const preferred =
+    home &&
+    home.provider === model.provider &&
+    home.modelId === model.modelId &&
+    levels.includes(home.thinkingLevel)
+      ? home.thinkingLevel
+      : undefined;
+  const orderedLevels = preferred
+    ? [preferred, ...levels.filter((level) => level !== preferred)]
+    : levels;
+
   const levelChoice = await ui.select(
-    `Thinking level for ${model.provider}/${model.modelId}`,
-    levels,
+    preferred
+      ? `Thinking level for ${model.provider}/${model.modelId} (home default first)`
+      : `Thinking level for ${model.provider}/${model.modelId}`,
+    orderedLevels,
   );
   if (!levelChoice) return undefined;
   if (!levels.includes(levelChoice)) {
@@ -947,43 +966,24 @@ export async function promptWorkerProfile(
   };
 }
 
-/**
- * Searchable model picker: optional filter input, then Pi-style select.
- * Does not change the Workflow home currently selected model.
- */
-export async function selectAvailableModel(
+const SEARCH_MODELS_ITEM = "🔍 Search models…";
+const USE_HOME_MODEL_PREFIX = "★ Use Workflow home model";
+
+function formatHomeModelOption(home: {
+  provider: string;
+  modelId: string;
+  thinkingLevel: string;
+  label: string;
+}): string {
+  return `${USE_HOME_MODEL_PREFIX} — ${home.provider}/${home.modelId} (thinking ${home.thinkingLevel})`;
+}
+
+function matchModelByLabel(
   models: readonly AvailableModel[],
-  ui: MattAutoUi,
-): Promise<AvailableModel | undefined> {
-  let filtered: AvailableModel[] = [...models];
-
-  if (ui.input) {
-    const query = await ui.input(
-      "Filter models (provider, id, or name; empty = all)",
-      "search…",
-    );
-    if (query === undefined) return undefined;
-    const needle = query.trim().toLowerCase();
-    if (needle.length > 0) {
-      filtered = models.filter((model) => {
-        const haystack =
-          `${model.provider} ${model.modelId} ${model.label}`.toLowerCase();
-        return haystack.includes(needle);
-      });
-    }
-  }
-
-  if (filtered.length === 0) {
-    ui.notify("No models matched that filter.", "warning");
-    return undefined;
-  }
-
-  const options = filtered.map((model) => model.label);
-  const selected = await ui.select("Select Worker model", options);
-  if (!selected) return undefined;
-
+  selected: string,
+): AvailableModel | undefined {
   // Longest match first so provider/id prefixes do not steal longer ids.
-  const match = filtered
+  return models
     .filter((model) =>
       selected.includes(`${model.provider}/${model.modelId}`),
     )
@@ -992,7 +992,100 @@ export async function selectAvailableModel(
         `${b.provider}/${b.modelId}`.length -
         `${a.provider}/${a.modelId}`.length,
     )[0];
-  return match;
+}
+
+function filterModels(
+  models: readonly AvailableModel[],
+  query: string,
+): AvailableModel[] {
+  const needle = query.trim().toLowerCase();
+  if (needle.length === 0) return [...models];
+  return models.filter((model) => {
+    const haystack =
+      `${model.provider} ${model.modelId} ${model.label}`.toLowerCase();
+    return haystack.includes(needle);
+  });
+}
+
+/**
+ * Model picker: optional Workflow home shortcut, then full catalog.
+ * Optional search is an explicit menu item — never a blank filter screen that
+ * looks like an empty catalog.
+ * Does not change the Workflow home currently selected model.
+ */
+export async function selectAvailableModel(
+  models: readonly AvailableModel[],
+  ui: MattAutoUi,
+  home?: {
+    provider: string;
+    modelId: string;
+    thinkingLevel: string;
+    label: string;
+    thinkingLevels: readonly string[];
+  },
+): Promise<AvailableModel | undefined> {
+  if (models.length === 0 && !home) {
+    ui.notify(
+      "No models are available to list. Authenticate a provider (for example via /login) or select a home model with /model, then retry.",
+      "warning",
+    );
+    return undefined;
+  }
+
+  let catalog: AvailableModel[] = [...models];
+
+  while (true) {
+    const homeOption = home ? formatHomeModelOption(home) : undefined;
+    const options = [
+      ...(homeOption ? [homeOption] : []),
+      ...(ui.input !== undefined ? [SEARCH_MODELS_ITEM] : []),
+      ...catalog.map((model) => model.label),
+    ];
+
+    if (options.length === 0) {
+      ui.notify("No models are available to list.", "warning");
+      return undefined;
+    }
+
+    const selected = await ui.select(
+      catalog.length === models.length
+        ? `Select Worker model (${catalog.length} available${home ? ", home shortcut on top" : ""})`
+        : `Select Worker model (${catalog.length} match${catalog.length === 1 ? "" : "es"})`,
+      options,
+    );
+    if (!selected) return undefined;
+
+    if (home && selected.startsWith(USE_HOME_MODEL_PREFIX)) {
+      return {
+        provider: home.provider,
+        modelId: home.modelId,
+        label: home.label,
+        thinkingLevels: home.thinkingLevels,
+      };
+    }
+
+    if (selected === SEARCH_MODELS_ITEM) {
+      if (!ui.input) return undefined;
+      const query = await ui.input(
+        "Search models (provider, id, or name; empty = show all)",
+        "e.g. sonnet, openai, gpt…",
+      );
+      if (query === undefined) continue;
+      const filtered = filterModels(models, query);
+      if (filtered.length === 0) {
+        ui.notify(
+          `No models matched "${query.trim()}". Showing full catalog again.`,
+          "warning",
+        );
+        catalog = [...models];
+        continue;
+      }
+      catalog = filtered;
+      continue;
+    }
+
+    return matchModelByLabel(catalog, selected);
+  }
 }
 
 /** Present only currently available Next actions (`/matt-auto next`). */

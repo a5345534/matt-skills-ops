@@ -2,6 +2,7 @@ import type {
   ActiveWorkflow,
   AvailableModel,
   CiStatus,
+  HomeModelSelection,
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
@@ -400,6 +401,11 @@ export type PreferencesPort = {
 export type ModelsPort = {
   /** Models currently available under authenticated providers. */
   listAvailableModels(): Promise<readonly AvailableModel[]>;
+  /**
+   * Current Workflow home model + thinking level, if Pi has a selection.
+   * Read-only; Matt Auto never changes the home model through this port.
+   */
+  getHomeModel(): Promise<HomeModelSelection | undefined>;
 };
 
 /**

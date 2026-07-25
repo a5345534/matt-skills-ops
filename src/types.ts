@@ -498,6 +498,18 @@ export type AvailableModel = {
 };
 
 /**
+ * Workflow home's currently selected model + thinking level.
+ * Offered as a one-tap Worker profile choice; never mutated by Matt Auto.
+ */
+export type HomeModelSelection = {
+  provider: string;
+  modelId: string;
+  thinkingLevel: string;
+  label: string;
+  thinkingLevels: readonly string[];
+};
+
+/**
  * Relationship of a discovered Workflow root to the discovery start path.
  * - nearest: nearest enclosing Git repository (default selection)
  * - nested-independent: independent Git repo nested under the nearest root
@@ -593,6 +605,11 @@ export type WorkflowCoordinator = {
    * Used by Worker profile menus; never mutates the home model.
    */
   listAvailableModels(): Promise<readonly AvailableModel[]>;
+  /**
+   * Current Workflow home model + thinking level, when Pi has one selected.
+   * Used so Worker profile menus can offer "use home model".
+   */
+  getHomeModel(): Promise<HomeModelSelection | undefined>;
   /**
    * Thinking levels supported by a model in the available catalog.
    * Returns `["off"]` when the model is unknown or has no reasoning support.

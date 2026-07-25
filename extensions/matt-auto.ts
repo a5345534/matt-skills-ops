@@ -118,6 +118,17 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   let coordinator: WorkflowCoordinator | undefined;
   let boundCwd: string | undefined;
   let boundModelRegistry: Parameters<typeof createModelsPort>[0] | undefined;
+  // Updated on every /matt-auto invocation so "use home model" stays current.
+  let homeModelRef:
+    | {
+        provider: string;
+        id: string;
+        thinkingLevel: string;
+        name?: string;
+        reasoning?: boolean;
+        thinkingLevelMap?: Record<string, string | null>;
+      }
+    | undefined;
 
   const skillsHost = createSkillsHost(() => activeUi);
 
@@ -125,8 +136,10 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     cwd: string,
     modelRegistry: Parameters<typeof createModelsPort>[0],
     ui: MattAutoUi,
+    homeModel: typeof homeModelRef,
   ): WorkflowCoordinator {
     activeUi = ui;
+    homeModelRef = homeModel;
 
     const sameSession =
       coordinator &&
@@ -144,7 +157,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     coordinator = createWorkflowCoordinator({
       startPath: cwd,
       topology: createGitTopologyPort(),
-      models: createModelsPort(modelRegistry),
+      models: createModelsPort(modelRegistry, () => homeModelRef),
       forRoot(rootPath) {
         return {
           environment: createEnvironmentPort(rootPath),
@@ -187,7 +200,27 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const subcommand = args.trim();
       const ui = uiFrom(ctx);
-      const active = ensureCoordinator(ctx.cwd, ctx.modelRegistry, ui);
+      const homeModel = ctx.model
+        ? {
+            provider: ctx.model.provider,
+            id: ctx.model.id,
+            thinkingLevel: String(ctx.thinkingLevel ?? "off"),
+            name: ctx.model.name,
+            reasoning: Boolean(ctx.model.reasoning),
+            ...(ctx.model.thinkingLevelMap
+              ? {
+                  thinkingLevelMap: ctx.model
+                    .thinkingLevelMap as Record<string, string | null>,
+                }
+              : {}),
+          }
+        : undefined;
+      const active = ensureCoordinator(
+        ctx.cwd,
+        ctx.modelRegistry,
+        ui,
+        homeModel,
+      );
 
       if (subcommand === "" || subcommand === "menu") {
         await presentMainMenu(active, ui);
