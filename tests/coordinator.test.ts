@@ -2759,6 +2759,39 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
   });
 
+  it("recovers Retry Integration after Close failed at Integration workspace create", async () => {
+    const attempts = new Map<string, number>([["42:43", 7]]);
+    const workspace = createWorkspace("/repo", { attempts });
+    const transcripts = createTranscripts();
+    const key = { workflowId: 42, ticketNumber: 43, attempt: 7 };
+    await transcripts.port.append(key, {
+      type: "stage-result",
+      workerId: "implement-42-43-r7",
+      outcome: { status: "completed", summary: "done" },
+    });
+    await transcripts.port.append(key, {
+      type: "disposition",
+      decision: "close",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-start",
+      ticketBranch: "matt-auto/42/ticket-43/r7",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-failed",
+      reason: "Failed to create Integration workspace: git ref conflict",
+    });
+
+    const { coordinator } = ticketsPublishedFixture({
+      workspace,
+      transcripts,
+    });
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+  });
+
   it("aborts the session-owned worker cleanly and leaves GitHub state recoverable", async () => {
     const { coordinator, workers, tracker } = ticketsPublishedFixture();
 

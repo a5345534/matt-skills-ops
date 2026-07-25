@@ -295,18 +295,19 @@ export function createWorkflowCoordinator(
   }
 
   /**
-   * If the latest attempt for a ticket completed (Stage result / inferred) and
-   * was never dispositioned, restore pendingDisposition so the pipeline does
-   * not launch rN+1 for the same work.
+   * Rebuild in-memory Integration / disposition state from transcripts so a new
+   * /matt-auto run does not re-Implement tickets that already completed (or
+   * already failed Integration after Close).
    */
   async function recoverPendingDispositionFromTranscripts(
     bound: RootScopedPorts,
     active: ActiveWorkflow,
   ): Promise<void> {
-    if (pendingDisposition || activeWorker) return;
+    if (pendingDisposition || pendingIntegration || activeWorker) return;
     const ticketNumbers = active.tickets ?? [];
+    const rootPath = selectedPath ?? ports.startPath;
+
     for (const ticketNumber of ticketNumbers) {
-      // Skip tickets already integrated or in recovery cooldown without success.
       if (
         (active.integratedTickets ?? []).some((t) => t.number === ticketNumber)
       ) {
@@ -325,58 +326,100 @@ export function createWorkflowCoordinator(
       });
 
       let completed = false;
+      let closedForIntegrate = false;
+      let integrationFailedReason: string | undefined;
       let summary: string | undefined;
       let headSha: string | undefined;
+
       for (const raw of events) {
         if (!raw || typeof raw !== "object") continue;
         const e = raw as Record<string, unknown>;
         const type = e.type;
-        if (type === "disposition") {
-          completed = false;
-          summary = undefined;
-          headSha = undefined;
-          continue;
-        }
+
         if (type === "compatibility-recovery" || type === "worker-aborted") {
           completed = false;
+          closedForIntegrate = false;
+          integrationFailedReason = undefined;
           summary = undefined;
           headSha = undefined;
           continue;
         }
+
         if (type === "stage-result") {
           const outcome = e.outcome as Record<string, unknown> | undefined;
           if (outcome?.status === "completed") {
             completed = true;
+            closedForIntegrate = false;
+            integrationFailedReason = undefined;
             if (typeof outcome.summary === "string") summary = outcome.summary;
             if (typeof outcome.localCommitSha === "string") {
               headSha = outcome.localCommitSha;
             }
           } else {
             completed = false;
+            closedForIntegrate = false;
+            integrationFailedReason = undefined;
             summary = undefined;
             headSha = undefined;
           }
           continue;
         }
+
         if (type === "stage-result-inferred") {
           completed = true;
+          closedForIntegrate = false;
+          integrationFailedReason = undefined;
           if (typeof e.headSha === "string") headSha = e.headSha;
           summary =
             typeof e.reason === "string"
               ? e.reason
               : "Inferred completion from local commits";
+          continue;
+        }
+
+        if (type === "disposition") {
+          const decision = e.decision;
+          if (decision === "close" && completed) {
+            // Close was chosen — Integration may still be pending/failed.
+            closedForIntegrate = true;
+            integrationFailedReason = undefined;
+          } else {
+            // leave-open / investigate: not waiting on Integration.
+            completed = false;
+            closedForIntegrate = false;
+            integrationFailedReason = undefined;
+            summary = undefined;
+            headSha = undefined;
+          }
+          continue;
+        }
+
+        if (type === "integration-unit-failed") {
+          if (closedForIntegrate || completed) {
+            closedForIntegrate = true;
+            integrationFailedReason =
+              typeof e.reason === "string"
+                ? e.reason
+                : "Integration unit failed";
+          }
+          continue;
+        }
+
+        if (
+          type === "integration-unit-complete" ||
+          type === "integration-unit-skipped"
+        ) {
+          completed = false;
+          closedForIntegrate = false;
+          integrationFailedReason = undefined;
         }
       }
-
-      if (!completed) continue;
 
       const branchName = implementationBranchName(
         active.workflowId,
         ticketNumber,
         attempt,
       );
-      // Prefer bound root path for worktree layout; fall back via dirname of cwd.
-      const rootPath = selectedPath ?? ports.startPath;
       const worktreePath = implementationWorktreePath(
         rootPath,
         active.workflowId,
@@ -384,24 +427,40 @@ export function createWorkflowCoordinator(
         attempt,
       );
 
-      pendingDisposition = {
-        workerId: `recovered-${active.workflowId}-${ticketNumber}-r${attempt}`,
-        workflowId: active.workflowId,
-        ticketNumber,
-        attempt,
-        branchName,
-        worktreePath,
-        status: "needs-disposition",
-        receivedStageResult: true,
-        summary:
-          summary ??
-          (headSha
-            ? `Recovered completed attempt r${attempt} @ ${headSha.slice(0, 8)}`
-            : `Recovered completed attempt r${attempt}`),
-      };
-      // Clear recovery cooldown so disposition is offered.
-      implementationRecoveryCooldown.delete(ticketNumber);
-      return;
+      // Prefer retrying a failed Integration over re-Implementing.
+      if (closedForIntegrate && integrationFailedReason) {
+        pendingIntegration = {
+          workflowId: active.workflowId,
+          ticketNumber,
+          attempt,
+          branchName,
+          worktreePath,
+          lastFailure: integrationFailedReason,
+        };
+        implementationRecoveryCooldown.delete(ticketNumber);
+        return;
+      }
+
+      // Completed implement, never Closed (or Close not recorded).
+      if (completed && !closedForIntegrate) {
+        pendingDisposition = {
+          workerId: `recovered-${active.workflowId}-${ticketNumber}-r${attempt}`,
+          workflowId: active.workflowId,
+          ticketNumber,
+          attempt,
+          branchName,
+          worktreePath,
+          status: "needs-disposition",
+          receivedStageResult: true,
+          summary:
+            summary ??
+            (headSha
+              ? `Recovered completed attempt r${attempt} @ ${headSha.slice(0, 8)}`
+              : `Recovered completed attempt r${attempt}`),
+        };
+        implementationRecoveryCooldown.delete(ticketNumber);
+        return;
+      }
     }
   }
 
@@ -1125,9 +1184,10 @@ export function createWorkflowCoordinator(
         return [];
       }
 
-      // New /matt-auto run loses in-memory pendingDisposition. Rebuild it from
-      // the latest transcript so we Auto-Close instead of re-Implementing.
-      if (!pendingDisposition) {
+      // New /matt-auto run loses in-memory disposition/integration state.
+      // Rebuild from transcripts so we Retry Integration / Auto-Close instead
+      // of launching another Implement attempt for the same ticket.
+      if (!pendingDisposition && !pendingIntegration) {
         await recoverPendingDispositionFromTranscripts(bound, active);
       }
 
