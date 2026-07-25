@@ -65,7 +65,7 @@ A session-owned worker that runs the installed `resolving-merge-conflicts` skill
 _Avoid_: automatic conflict guessing, aborted merge without recovery
 
 **Workspace layout**:
-Sibling directories outside the Workflow root that hold Integration and Implementation workspaces for a workflow. Branches use `matt-auto/<Workflow ID>` and `matt-auto/<Workflow ID>/ticket-<n>/r<attempt>`.
+Sibling directories outside the Workflow root that hold Integration and Implementation workspaces for a workflow. Branches use `matt-auto/<Workflow ID>/integration` and `matt-auto/<Workflow ID>/ticket-<n>/r<attempt>` (Integration must not use the bare `matt-auto/<id>` prefix — Git cannot nest refs under an existing branch name).
 _Avoid_: in-repo temporary worktrees
 
 **Workflow cleanup**:

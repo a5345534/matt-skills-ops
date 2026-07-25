@@ -131,7 +131,7 @@ When tickets are published and the ready frontier is non-empty, Next actions inc
 
 Choosing **Close** on a completed Implementation disposition runs one Integration unit at a time:
 
-1. Ensure a dedicated **Integration workspace** worktree outside the Workflow root on branch `matt-auto/<Workflow ID>` (not Workflow home).
+1. Ensure a dedicated **Integration workspace** worktree outside the Workflow root on branch `matt-auto/<Workflow ID>/integration` (not Workflow home; never bare `matt-auto/<id>` — Git ref prefix conflict with ticket branches).
 2. Merge the ticket branch into the Integration branch (local only).
 3. On **merge conflict**: keep the in-progress merge and launch a session-owned **Conflict resolution worker** in the Integration workspace that runs the installed `resolving-merge-conflicts` skill (Matt Auto does not invent a separate conflict resolver).
 4. On successful Conflict resolution (or a clean merge): run **Local verification** — project-discoverable checks (e.g. `package.json` scripts `typecheck` / `test`) in the Integration workspace.

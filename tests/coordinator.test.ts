@@ -2593,10 +2593,10 @@ describe("Workflow coordinator single Implementation worker path", () => {
       integrated: true,
       ticketClosed: false,
       ciStatus: "pending",
-      integrationBranch: "matt-auto/42",
+      integrationBranch: "matt-auto/42/integration",
       integrationWorktreePath: "/matt-auto-workspaces/42/integration",
       localVerification: { ok: true, commands: ["npm test"] },
-      pushedBranches: ["matt-auto/42", "matt-auto/42/ticket-43/r1"],
+      pushedBranches: ["matt-auto/42/integration", "matt-auto/42/ticket-43/r1"],
       branchName: "matt-auto/42/ticket-43/r1",
       worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
     });
@@ -2900,7 +2900,7 @@ describe("Workflow coordinator Integration unit", () => {
       expect(result.stage).toBe("ci-gate");
       expect(result.integrated).toBe(true);
       expect(result.ticketClosed).toBe(false);
-      expect(result.integrationBranch).toBe("matt-auto/42");
+      expect(result.integrationBranch).toBe("matt-auto/42/integration");
       expect(result.integrationWorktreePath).toBe(
         "/matt-auto-workspaces/42/integration",
       );
@@ -2910,7 +2910,7 @@ describe("Workflow coordinator Integration unit", () => {
       {
         workflowId: 42,
         baseRef: DEFAULT_TARGET_BRANCH,
-        branchName: "matt-auto/42",
+        branchName: "matt-auto/42/integration",
         worktreePath: "/matt-auto-workspaces/42/integration",
       },
     ]);
@@ -2923,12 +2923,12 @@ describe("Workflow coordinator Integration unit", () => {
       { workflowId: 42, ticketBranch: "matt-auto/42/ticket-43/r1" },
     ]);
     expect(remoteGit.state.pushes).toEqual([
-      "matt-auto/42",
+      "matt-auto/42/integration",
       "matt-auto/42/ticket-43/r1",
     ]);
 
     const manifest = tracker.state.manifests.get(42);
-    expect(manifest?.integrationBranch).toBe("matt-auto/42");
+    expect(manifest?.integrationBranch).toBe("matt-auto/42/integration");
     expect(manifest?.integratedTickets).toEqual([
       {
         number: 43,
@@ -3007,7 +3007,7 @@ describe("Workflow coordinator Integration unit", () => {
       ticketClosed: false,
     });
     expect(remoteGit.state.pushes).toEqual([
-      "matt-auto/42",
+      "matt-auto/42/integration",
       "matt-auto/42/ticket-43/r1",
     ]);
     expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
@@ -3029,7 +3029,7 @@ describe("Workflow coordinator Integration unit", () => {
     // Launch another ready ticket (#44) — should base on Integration branch.
     await coordinator.runNextAction(implementTicketActionId(44));
     const launch = workspace.state.creates.find((c) => c.ticketNumber === 44);
-    expect(launch?.baseRef).toBe("matt-auto/42");
+    expect(launch?.baseRef).toBe("matt-auto/42/integration");
   });
 
   it("processes Integration units one completed ticket at a time", async () => {
@@ -3120,7 +3120,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
       ticketNumber: 43,
       attempt: 1,
       workerId: "conflict-42-43-r1",
-      integrationBranch: "matt-auto/42",
+      integrationBranch: "matt-auto/42/integration",
       integrationWorktreePath: "/matt-auto-workspaces/42/integration",
       conflictResolution: true,
     });
@@ -3135,7 +3135,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
       expect.objectContaining({
         workerId: "conflict-42-43-r1",
         worktreePath: "/matt-auto-workspaces/42/integration",
-        branchName: "matt-auto/42",
+        branchName: "matt-auto/42/integration",
         skillCommand: "/resolving-merge-conflicts",
         prompt: expect.stringContaining("/resolving-merge-conflicts"),
       }),
@@ -3153,7 +3153,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
     expect(panel?.integration).toMatchObject({
       ticketNumber: 43,
       status: "conflict-resolution",
-      branchName: "matt-auto/42",
+      branchName: "matt-auto/42/integration",
     });
     expect(
       panel?.lines.some((l) => /Conflict resolution #43/.test(l)),
@@ -3182,7 +3182,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
       "/matt-auto-workspaces/42/integration",
     ]);
     expect(remoteGit.state.pushes).toEqual([
-      "matt-auto/42",
+      "matt-auto/42/integration",
       "matt-auto/42/ticket-43/r1",
     ]);
     expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
@@ -3284,7 +3284,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
     });
 
     expect(remoteGit.state.pushes).toEqual([
-      "matt-auto/42",
+      "matt-auto/42/integration",
       "matt-auto/42/ticket-43/r1",
     ]);
   });
@@ -3396,7 +3396,7 @@ describe("Workflow coordinator on-demand CI gate", () => {
       ticketClosed: false,
       ciStatus: "pending",
     });
-    expect(ci.state.checks).toEqual(["matt-auto/42"]);
+    expect(ci.state.checks).toEqual(["matt-auto/42/integration"]);
     expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
     expect(tracker.state.closeIssueCalls).toEqual([]);
   });
@@ -3417,7 +3417,7 @@ describe("Workflow coordinator on-demand CI gate", () => {
     expect(ci.state.checks).toHaveLength(1);
     const recheck = await coordinator.runNextAction(checkCiActionId(43));
     expect(recheck).toMatchObject({ status: "pending-ci", stage: "ci-gate", ticketClosed: false });
-    expect(ci.state.checks).toEqual(["matt-auto/42", "matt-auto/42"]);
+    expect(ci.state.checks).toEqual(["matt-auto/42/integration", "matt-auto/42/integration"]);
   });
 
   it("closes the ticket only when CI is green", async () => {
@@ -3503,7 +3503,7 @@ describe("Workflow coordinator on-demand CI gate", () => {
     ci.state.result = { status: "success", summary: "fixed" };
     const retried = await coordinator.runNextAction(ciRecoveryActionId(43, "retry"));
     expect(retried).toMatchObject({ status: "completed", ticketClosed: true, ciStatus: "success" });
-    expect(remoteGit.state.pushes.slice(pushesBefore)).toEqual(["matt-auto/42"]);
+    expect(remoteGit.state.pushes.slice(pushesBefore)).toEqual(["matt-auto/42/integration"]);
     expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("CLOSED");
   });
 
@@ -3591,11 +3591,11 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
       workflowId: 42,
       workflowPrNumber: 500,
       targetBranch: DEFAULT_TARGET_BRANCH,
-      integrationBranch: "matt-auto/42",
+      integrationBranch: "matt-auto/42/integration",
     });
     expect(tracker.state.createPrCalls).toEqual([
       {
-        head: "matt-auto/42",
+        head: "matt-auto/42/integration",
         base: DEFAULT_TARGET_BRANCH,
         title: expect.stringContaining("Workflow #42"),
       },
@@ -3604,7 +3604,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(manifest?.stage).toBe("pr-opened");
     expect(manifest?.workflowPr).toMatchObject({
       number: 500,
-      headBranch: "matt-auto/42",
+      headBranch: "matt-auto/42/integration",
       baseBranch: DEFAULT_TARGET_BRANCH,
     });
 
@@ -3695,7 +3695,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(workspace.state.cleanupCalls).toEqual([42]);
     expect(remoteGit.state.deleted).toHaveLength(1);
     const deleted = remoteGit.state.deleted[0] ?? [];
-    expect(deleted).toContain("matt-auto/42");
+    expect(deleted).toContain("matt-auto/42/integration");
     expect(deleted).toContain("matt-auto/42/ticket-43/r1");
     expect(deleted).toContain("matt-auto/42/ticket-44/r1");
     expect(deleted).toContain("matt-auto/42/ticket-45/r1");
@@ -3799,7 +3799,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     // Original completed workflow is not mutated beyond its completed stage.
     expect(tracker.state.manifests.get(42)).toEqual(originalManifest);
     expect(tracker.state.manifests.get(42)?.stage).toBe("completed");
-    expect(tracker.state.manifests.get(42)?.integrationBranch).toBe("matt-auto/42");
+    expect(tracker.state.manifests.get(42)?.integrationBranch).toBe("matt-auto/42/integration");
 
     const active = await coordinator.getActiveWorkflow();
     expect(active).toMatchObject({

@@ -95,10 +95,13 @@ export function implementationBranchName(
 
 /**
  * Branch name for the workflow Integration branch.
- * Format: matt-auto/<Workflow ID>
+ * Format: matt-auto/<Workflow ID>/integration
+ *
+ * NOTE: Must NOT be `matt-auto/<id>` alone — Git forbids a branch ref that is a
+ * prefix of another (e.g. matt-auto/255 vs matt-auto/255/ticket-256/r1).
  */
 export function integrationBranchName(workflowId: number): string {
-  return `matt-auto/${workflowId}`;
+  return `matt-auto/${workflowId}/integration`;
 }
 
 /** Prefix for Next actions that retry a failed Integration unit. */
