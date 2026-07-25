@@ -9,6 +9,7 @@ export {
 export {
   buildCreateSpecSkillPrompt,
   buildCreateTicketsSkillPrompt,
+  findLatestDraftText,
   isPublishableSpecDraft,
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,

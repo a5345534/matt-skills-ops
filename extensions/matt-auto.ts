@@ -25,6 +25,7 @@ import {
   createVerificationPort,
   createWorkersPort,
   createWorkspacePort,
+  findLatestDraftText,
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
   type SkillsHost,
@@ -41,7 +42,8 @@ import {
 type PlanningSession = {
   sendUserMessage: (text: string) => void;
   waitForIdle: () => Promise<void>;
-  getLastAssistantText: () => string;
+  /** Recent assistant texts newest-last, including session branch fallback. */
+  getAssistantTexts: () => string[];
 };
 
 function extractAssistantText(message: {
@@ -89,14 +91,17 @@ function createSkillsHost(
       planning.sendUserMessage(buildCreateSpecSkillPrompt());
       await planning.waitForIdle();
 
-      const draft = parseSpecDraftFromAssistantText(
-        planning.getLastAssistantText(),
-      );
+      const texts = planning.getAssistantTexts();
+      const marked =
+        findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---") ??
+        texts[texts.length - 1] ??
+        "";
+      const draft = parseSpecDraftFromAssistantText(marked);
       if (!draft) {
         return {
           ok: false,
           reason:
-            "Create-spec did not produce a publishable draft after /skill:to-spec. Ensure the grilling conversation has enough substance, then retry Create-spec. Matt Auto does not publish empty or placeholder drafts.",
+            "Create-spec finished but Matt Auto could not parse a publishable ---MATT-AUTO-SPEC-DRAFT--- block (check TITLE/BODY markers, no leading spaces preferred). Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
         };
       }
       return { ok: true, draft };
@@ -121,14 +126,17 @@ function createSkillsHost(
       planning.sendUserMessage(buildCreateTicketsSkillPrompt(input));
       await planning.waitForIdle();
 
-      const draft = parseTicketsDraftFromAssistantText(
-        planning.getLastAssistantText(),
-      );
+      const texts = planning.getAssistantTexts();
+      const marked =
+        findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---") ??
+        texts[texts.length - 1] ??
+        "";
+      const draft = parseTicketsDraftFromAssistantText(marked);
       if (!draft) {
         return {
           ok: false,
           reason:
-            "Create-tickets did not produce a valid breakdown after /skill:to-tickets. Retry Create-tickets. Matt Auto does not publish until Stage confirmation Publish.",
+            "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block. Retry Create-tickets. Nothing was published to GitHub.",
         };
       }
       return { ok: true, draft };
@@ -177,7 +185,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       }
     | undefined;
   let planningSession: PlanningSession | undefined;
-  let lastAssistantText = "";
+  const assistantTexts: string[] = [];
 
   const skillsHost = createSkillsHost(
     () => activeUi,
@@ -189,7 +197,9 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     if (message.role === "assistant") {
       const text = extractAssistantText(message);
       if (text.trim()) {
-        lastAssistantText = text;
+        assistantTexts.push(text);
+        // Cap memory for long sessions.
+        if (assistantTexts.length > 50) assistantTexts.shift();
       }
     }
   });
@@ -248,7 +258,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     boundModelRegistry = undefined;
     activeUi = undefined;
     planningSession = undefined;
-    lastAssistantText = "";
+    assistantTexts.length = 0;
   });
 
   pi.registerCommand("matt-auto", {
@@ -281,11 +291,28 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       // Planning skills run in this Workflow home session so grill context remains.
       planningSession = {
         sendUserMessage: (text: string) => {
-          lastAssistantText = "";
           pi.sendUserMessage(text);
         },
         waitForIdle: () => ctx.waitForIdle(),
-        getLastAssistantText: () => lastAssistantText,
+        getAssistantTexts: () => {
+          // Prefer live event stream; fall back to session branch scan.
+          if (assistantTexts.length > 0) return [...assistantTexts];
+          const fromSession: string[] = [];
+          try {
+            for (const entry of ctx.sessionManager.getBranch()) {
+              if (entry.type !== "message") continue;
+              const message = entry.message as {
+                role?: string;
+                content?: unknown;
+              };
+              const text = extractAssistantText(message);
+              if (text.trim()) fromSession.push(text);
+            }
+          } catch {
+            // Session scan is best-effort.
+          }
+          return fromSession;
+        },
       };
 
       const active = ensureCoordinator(

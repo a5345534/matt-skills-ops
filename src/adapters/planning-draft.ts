@@ -16,6 +16,7 @@ export function isPublishableSpecDraft(draft: SpecDraft): boolean {
   const body = draft.body.trim();
   if (!title || !body) return false;
   if (PLACEHOLDER_TITLES.has(title.toLowerCase())) return false;
+  if (title.includes(SPEC_START) || title.includes("MATT-AUTO")) return false;
 
   // Reject bodies that are only empty markdown headings.
   const withoutHeadings = body
@@ -29,24 +30,49 @@ export function isPublishableSpecDraft(draft: SpecDraft): boolean {
 /**
  * Parse a Create-spec draft from an assistant message.
  * Prefers Matt Auto markers; falls back to first-line title + remaining body.
+ * Tolerates leading spaces on markers/fields (common TUI wrap artifacts).
  */
 export function parseSpecDraftFromAssistantText(
   text: string,
 ): SpecDraft | undefined {
   const marked = extractBetween(text, SPEC_START, SPEC_END);
   if (marked) {
-    const titleMatch = /^TITLE:\s*(.+)$/m.exec(marked);
-    const bodyMatch = /^BODY:\s*\n?([\s\S]*)$/m.exec(marked);
+    const titleMatch = /^\s*TITLE:\s*(.+)$/m.exec(marked);
+    const bodyMatch = /^\s*BODY:\s*\r?\n?([\s\S]*)$/m.exec(marked);
     const title = titleMatch?.[1]?.trim() ?? "";
     const body = (bodyMatch?.[1] ?? "").trim();
     if (title && body) {
       const draft = { title, body };
       return isPublishableSpecDraft(draft) ? draft : undefined;
     }
+
+    // Marker block found but TITLE/BODY lines were nonstandard — treat the
+    // whole block as body with a first non-empty line as title.
+    const lines = marked
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => line.trim().length > 0);
+    if (lines.length >= 2) {
+      const fallbackTitle = lines[0]!
+        .replace(/^\s*TITLE:\s*/i, "")
+        .replace(/^#\s*/, "")
+        .trim();
+      const fallbackBody = lines
+        .slice(1)
+        .join("\n")
+        .replace(/^\s*BODY:\s*/i, "")
+        .trim();
+      const draft = { title: fallbackTitle, body: fallbackBody };
+      if (isPublishableSpecDraft(draft)) return draft;
+    }
   }
 
   const trimmed = text.trim();
   if (!trimmed) return undefined;
+  // Do not use fallback when markers were present but unparsable — avoids
+  // treating the start marker as a title.
+  if (includesMarker(text, SPEC_START)) return undefined;
+
   const lines = trimmed.split(/\r?\n/);
   const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
   const body = lines.slice(1).join("\n").replace(/^\n+/, "").trim();
@@ -65,8 +91,8 @@ export function parseTicketsDraftFromAssistantText(
   const marked = extractBetween(text, TICKETS_START, TICKETS_END);
   const candidate = (marked ?? text).trim();
 
-  // Strip optional fenced code block.
-  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/m.exec(candidate);
+  // Strip optional fenced code block (anywhere in the candidate).
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/m.exec(candidate);
   const jsonText = (fenced?.[1] ?? candidate).trim();
 
   try {
@@ -111,7 +137,7 @@ export function buildCreateSpecSkillPrompt(): string {
     "1. Do **NOT** create GitHub issues, run `gh`, publish, or label anything.",
     "2. Do **NOT** interview the user or wait for seam confirmation — choose the best seams and record them under Implementation Decisions.",
     "3. Produce a complete PRD-quality body (Problem, Solution, extensive User Stories, Implementation Decisions, Testing Decisions, Out of Scope, Further Notes).",
-    "4. When finished, output **exactly** the following block (no text after the end marker):",
+    "4. When finished, output **exactly** the following block with **no leading spaces** on marker or field lines (no text after the end marker):",
     "",
     SPEC_START,
     "TITLE: <concise spec title>",
@@ -141,7 +167,7 @@ export function buildCreateTicketsSkillPrompt(input: {
     "1. Do **NOT** create GitHub issues, run `gh`, publish, or label anything.",
     "2. Do **NOT** wait for interactive quiz confirmation — produce the best breakdown.",
     "3. Each ticket needs localId, title, body (what to build + acceptance criteria), and blockedBy (localIds or empty).",
-    "4. When finished, output **exactly** the following block (no text after the end marker):",
+    "4. When finished, output **exactly** the following block with **no leading spaces** on marker lines:",
     "",
     TICKETS_START,
     "```json",
@@ -160,15 +186,43 @@ export function buildCreateTicketsSkillPrompt(input: {
   ].join("\n");
 }
 
+/** Find the last assistant-ish text blob that contains a Matt Auto draft marker. */
+export function findLatestDraftText(
+  texts: readonly string[],
+  marker: string = SPEC_START,
+): string | undefined {
+  for (let i = texts.length - 1; i >= 0; i -= 1) {
+    const text = texts[i];
+    if (text && includesMarker(text, marker)) return text;
+  }
+  return undefined;
+}
+
+function includesMarker(text: string, marker: string): boolean {
+  return text.replace(/^\s+/gm, "").includes(marker);
+}
+
 function extractBetween(
   text: string,
   start: string,
   end: string,
 ): string | undefined {
-  const startIdx = text.lastIndexOf(start);
-  if (startIdx < 0) return undefined;
-  const afterStart = startIdx + start.length;
-  const endIdx = text.indexOf(end, afterStart);
-  if (endIdx < 0) return undefined;
-  return text.slice(afterStart, endIdx).trim();
+  // Allow leading whitespace on marker lines (TUI wrap / indent artifacts).
+  const startRe = new RegExp(
+    `(?:^|\\n)[ \\t]*${escapeRegExp(start)}[ \\t]*(?:\\n|$)`,
+  );
+  const endRe = new RegExp(
+    `(?:^|\\n)[ \\t]*${escapeRegExp(end)}[ \\t]*(?:\\n|$)`,
+  );
+  const startMatch = startRe.exec(text);
+  if (!startMatch) return undefined;
+  const afterStart = startMatch.index + startMatch[0].length;
+  const rest = text.slice(afterStart);
+  const endMatch = endRe.exec(rest);
+  if (!endMatch) return undefined;
+  return rest.slice(0, endMatch.index).trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

@@ -57,6 +57,22 @@ Add an export button on the reports page.
       ].join("\n"),
     });
   });
+
+  it("parses markers even when TITLE/BODY lines have leading spaces", () => {
+    const text = `
+---MATT-AUTO-SPEC-DRAFT---
+ TITLE: Platform web-browsing tools (fetch_url + read_html) with governed enablement
+ BODY:
+
+ Problem Statement
+
+ Operators ask the digital employee to obtain web-browsing ability (often phrased as apply for a web tool). Today there is no real platform runtime.
+---END-MATT-AUTO-SPEC-DRAFT---
+`;
+    const draft = parseSpecDraftFromAssistantText(text);
+    expect(draft?.title).toMatch(/Platform web-browsing tools/);
+    expect(draft?.body).toMatch(/Operators ask the digital employee/);
+  });
 });
 
 describe("parseTicketsDraftFromAssistantText", () => {
