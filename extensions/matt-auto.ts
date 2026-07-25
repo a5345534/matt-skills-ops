@@ -16,9 +16,11 @@ import {
   createCiPort,
   createEnvironmentPort,
   createGitTopologyPort,
+  createMattAutoLogger,
   createModelsPort,
   createPreferencesPort,
   createRemoteGitPort,
+  createSessionLogger,
   createSkillsPort,
   createTrackerPort,
   createTranscriptPort,
@@ -28,6 +30,7 @@ import {
   findLatestDraftText,
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
+  type MattAutoLogger,
   type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
@@ -36,6 +39,7 @@ import {
   presentMainMenu,
   presentNextActions,
   runPostGrillPipeline,
+  setMenuLogger,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
@@ -70,12 +74,15 @@ function extractAssistantText(message: {
 function createSkillsHost(
   getUi: () => MattAutoUi | undefined,
   getPlanning: () => PlanningSession | undefined,
+  getLog: () => MattAutoLogger | undefined,
 ): SkillsHost {
   return {
     async runCreateSpec() {
       const ui = getUi();
       const planning = getPlanning();
+      const log = getLog();
       if (!ui || !planning) {
+        log?.error("runCreateSpec: host not ready");
         return {
           ok: false,
           reason:
@@ -87,6 +94,8 @@ function createSkillsHost(
         "Running installed /skill:to-spec in Workflow home (no GitHub publish yet)…",
         "info",
       );
+      log?.info("runCreateSpec:start");
+      const started = Date.now();
 
       planning.sendUserMessage(buildCreateSpecSkillPrompt());
       await planning.waitForIdle();
@@ -96,21 +105,37 @@ function createSkillsHost(
         findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---") ??
         texts[texts.length - 1] ??
         "";
+      log?.debug("runCreateSpec:assistant", {
+        textCount: texts.length,
+        markedChars: marked.length,
+        hasMarker: marked.includes("MATT-AUTO-SPEC-DRAFT"),
+        ms: Date.now() - started,
+      });
       const draft = parseSpecDraftFromAssistantText(marked);
       if (!draft) {
+        log?.warn("runCreateSpec:parse-failed", {
+          preview: marked.slice(0, 300),
+        });
         return {
           ok: false,
           reason:
             "Create-spec finished but Matt Auto could not parse a publishable ---MATT-AUTO-SPEC-DRAFT--- block (check TITLE/BODY markers, no leading spaces preferred). Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
         };
       }
+      log?.info("runCreateSpec:ok", {
+        title: draft.title,
+        bodyChars: draft.body.length,
+        ms: Date.now() - started,
+      });
       return { ok: true, draft };
     },
 
     async runCreateTickets(input) {
       const ui = getUi();
       const planning = getPlanning();
+      const log = getLog();
       if (!ui || !planning) {
+        log?.error("runCreateTickets: host not ready");
         return {
           ok: false,
           reason:
@@ -122,6 +147,10 @@ function createSkillsHost(
         `Running installed /skill:to-tickets for Workflow #${input.workflowId} (no GitHub publish yet)…`,
         "info",
       );
+      log?.info("runCreateTickets:start", {
+        workflowId: input.workflowId,
+      });
+      const started = Date.now();
 
       planning.sendUserMessage(buildCreateTicketsSkillPrompt(input));
       await planning.waitForIdle();
@@ -131,14 +160,28 @@ function createSkillsHost(
         findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---") ??
         texts[texts.length - 1] ??
         "";
+      log?.debug("runCreateTickets:assistant", {
+        textCount: texts.length,
+        markedChars: marked.length,
+        hasMarker: marked.includes("MATT-AUTO-TICKETS-DRAFT"),
+        ms: Date.now() - started,
+      });
       const draft = parseTicketsDraftFromAssistantText(marked);
       if (!draft) {
+        log?.warn("runCreateTickets:parse-failed", {
+          preview: marked.slice(0, 300),
+        });
         return {
           ok: false,
           reason:
             "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block. Retry Create-tickets. Nothing was published to GitHub.",
         };
       }
+      log?.info("runCreateTickets:ok", {
+        ticketCount: draft.tickets.length,
+        localIds: draft.tickets.map((t) => t.localId),
+        ms: Date.now() - started,
+      });
       return { ok: true, draft };
     },
   };
@@ -174,6 +217,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   let coordinator: WorkflowCoordinator | undefined;
   let boundCwd: string | undefined;
   let boundModelRegistry: Parameters<typeof createModelsPort>[0] | undefined;
+  let logger: MattAutoLogger = createSessionLogger();
   let homeModelRef:
     | {
         provider: string;
@@ -190,6 +234,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   const skillsHost = createSkillsHost(
     () => activeUi,
     () => planningSession,
+    () => logger,
   );
 
   pi.on("message_end", async (event) => {
@@ -224,6 +269,10 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     if (coordinator) {
       void coordinator.abortWorkers();
     }
+
+    logger = createMattAutoLogger(cwd);
+    setMenuLogger(logger);
+    logger.info("coordinator:bind", { cwd });
 
     coordinator = createWorkflowCoordinator({
       startPath: cwd,
@@ -272,6 +321,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const subcommand = args.trim();
       const ui = uiFrom(ctx);
+      const commandStarted = Date.now();
       const homeModel = ctx.model
         ? {
             provider: ctx.model.provider,
@@ -322,26 +372,39 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         homeModel,
       );
 
-      if (subcommand === "" || subcommand === "menu") {
-        await presentMainMenu(active, ui);
-        return;
-      }
+      logger.info("command:start", {
+        subcommand: subcommand || "menu",
+        cwd: ctx.cwd,
+        logFile: logger.filePath(),
+      });
 
-      if (subcommand === "next") {
-        await presentNextActions(active, ui);
-        return;
-      }
+      try {
+        if (subcommand === "" || subcommand === "menu") {
+          await presentMainMenu(active, ui);
+          return;
+        }
 
-      if (subcommand === "run") {
-        // Post-grill entry: drive to-spec → tickets → implement… with stage confirms.
-        await runPostGrillPipeline(active, ui);
-        return;
-      }
+        if (subcommand === "next") {
+          await presentNextActions(active, ui);
+          return;
+        }
 
-      ctx.ui.notify(
-        `Unknown Matt Auto argument "${subcommand}". Try \`/matt-auto\`, \`/matt-auto next\`, or \`/matt-auto run\`.`,
-        "error",
-      );
+        if (subcommand === "run") {
+          ui.notify(`Matt Auto log: ${logger.filePath()}`, "info");
+          await runPostGrillPipeline(active, ui);
+          return;
+        }
+
+        ctx.ui.notify(
+          `Unknown Matt Auto argument "${subcommand}". Try /matt-auto, /matt-auto next, or /matt-auto run.`,
+          "error",
+        );
+      } finally {
+        logger.info("command:end", {
+          subcommand: subcommand || "menu",
+          ms: Date.now() - commandStarted,
+        });
+      }
     },
   });
 }

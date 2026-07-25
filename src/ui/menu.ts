@@ -1,3 +1,4 @@
+import type { MattAutoLogger } from "../adapters/logger.js";
 import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
@@ -12,6 +13,21 @@ import {
   REWORK_TICKET_ACTION_PREFIX,
   TICKET_PROGRESS_ACTION,
 } from "../constants.js";
+
+let menuLogger: MattAutoLogger | undefined;
+
+/** Attach a logger for menu/pipeline diagnostics (local file only). */
+export function setMenuLogger(logger: MattAutoLogger | undefined): void {
+  menuLogger = logger;
+}
+
+function log(
+  level: "debug" | "info" | "warn" | "error",
+  message: string,
+  data?: unknown,
+): void {
+  menuLogger?.[level](message, data);
+}
 import type {
   AvailableModel,
   ImplementationDispositionDecision,
@@ -424,8 +440,20 @@ export async function handleNextAction(
   action: NextAction,
   options: NextActionOptions = {},
 ): Promise<StageResult> {
+  const started = Date.now();
+  log("info", "handleNextAction:start", {
+    id: action.id,
+    label: action.label,
+    autoAdvance: Boolean(options.autoAdvance),
+  });
   let result = await coordinator.runNextAction(action.id);
   result = await resolveStageResult(coordinator, ui, result, options);
+  log("info", "handleNextAction:end", {
+    id: action.id,
+    status: result.status,
+    stage: "stage" in result ? result.stage : undefined,
+    ms: Date.now() - started,
+  });
   notifyStageResult(ui, result);
   return result;
 }
@@ -444,18 +472,39 @@ export async function runPostGrillPipeline(
     "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement… Stage confirmation is auto-Publish; disposition is auto-Close.",
     "info",
   );
+  log("info", "pipeline:start", {
+    logFile: menuLogger?.filePath(),
+  });
 
   for (let step = 0; step < 50; step += 1) {
+    const stepStarted = Date.now();
     const preflight = await coordinator.preflight();
+    log("debug", "pipeline:preflight", {
+      step,
+      ok: preflight.ok,
+      ms: Date.now() - stepStarted,
+      failed: preflight.checks.filter((c) => !c.ok).map((c) => c.id),
+    });
     if (!preflight.ok) {
       ui.notify(summarizePreflightFailures(preflight), "warning");
+      log("warn", "pipeline:stop", { reason: "preflight-failed", step });
       return;
     }
 
-    let nextActions = await coordinator.nextActions();
+    const nextStarted = Date.now();
+    const nextActions = await coordinator.nextActions();
+    log("info", "pipeline:nextActions", {
+      step,
+      ms: Date.now() - nextStarted,
+      ids: nextActions.map((a) => a.id),
+      labels: nextActions.map((a) => a.label),
+    });
     if (nextActions.length === 0) {
       const panel = await coordinator.getPanelState();
       if (panel && panel.workers.length > 0) {
+        log("info", "pipeline:wait-workers", {
+          workers: panel.workers.map((w) => w.ticketNumber),
+        });
         await waitForPipelineWorkers(coordinator, ui);
         continue;
       }
@@ -463,10 +512,16 @@ export async function runPostGrillPipeline(
         "Pipeline idle — no actionable Next steps (ready frontier may be empty or all tickets blocked).",
         "info",
       );
+      log("info", "pipeline:stop", { reason: "idle", step });
       return;
     }
 
     const preferred = selectPipelineAction(nextActions);
+    log("info", "pipeline:select", {
+      step,
+      preferredId: preferred?.id,
+      preferredLabel: preferred?.label,
+    });
 
     let action = preferred;
     if (!action) {
@@ -483,6 +538,11 @@ export async function runPostGrillPipeline(
           ].join("\n"),
           "warning",
         );
+        log("warn", "pipeline:stop", {
+          reason: "empty-frontier",
+          step,
+          nextActions: nextActions.map((a) => a.id),
+        });
         return;
       }
       const selected = await ui.select(
@@ -491,10 +551,12 @@ export async function runPostGrillPipeline(
       );
       if (!selected) {
         ui.notify("Pipeline paused.", "info");
+        log("info", "pipeline:stop", { reason: "user-paused", step });
         return;
       }
       action = actionable.find((a) => selected.startsWith(a.label));
       if (!action) return;
+      log("info", "pipeline:user-choice", { id: action.id });
     } else {
       ui.notify(`Pipeline next: ${action.label}`, "info");
     }
@@ -508,17 +570,28 @@ export async function runPostGrillPipeline(
       result.status === "compatibility-recovery"
     ) {
       ui.notify("Pipeline stopped.", "warning");
+      log("warn", "pipeline:stop", {
+        reason: result.status,
+        step,
+        stage: "stage" in result ? result.stage : undefined,
+        detail: "reason" in result ? result.reason : undefined,
+      });
       return;
     }
 
     // Implement returns "running" while the worker is live — wait here instead
     // of falling through to an empty nextActions and exiting to the main menu.
     if (result.status === "running") {
+      log("info", "pipeline:worker-running", {
+        ticketNumber:
+          "ticketNumber" in result ? result.ticketNumber : undefined,
+      });
       await waitForPipelineWorkers(coordinator, ui);
     }
   }
 
   ui.notify("Pipeline reached step limit — re-run /matt-auto run to continue.", "warning");
+  log("warn", "pipeline:stop", { reason: "step-limit" });
 }
 
 async function resolveStageResult(
@@ -539,6 +612,10 @@ async function resolveStageResult(
         `Auto-publishing ${result.stage}: ${title}`,
         "info",
       );
+      log("info", "stage:auto-publish", {
+        stage: result.stage,
+        title,
+      });
       result = await coordinator.confirmStage("publish");
       continue;
     }

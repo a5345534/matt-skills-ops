@@ -20,6 +20,16 @@ pi install /absolute/path/to/matt-skills-ops
 pi install -l /absolute/path/to/matt-skills-ops
 ```
 
+## Debug log
+
+Matt Auto writes an append-only local log (not committed / not pushed to GitHub):
+
+```text
+<workflow-root>/.pi/matt-auto/logs/matt-auto-YYYY-MM-DD.log
+```
+
+`/matt-auto run` prints the log path. Useful events: `pipeline:nextActions`, `pipeline:select`, `handleNextAction:*`, `runCreateSpec:*`, `runCreateTickets:*`, timings (`ms`), and stop reasons.
+
 ## Develop
 
 ```bash

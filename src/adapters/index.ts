@@ -39,3 +39,8 @@ export {
 } from "./verification.js";
 export { createRemoteGitPort } from "./remote-git.js";
 export { createCiPort } from "./ci.js";
+export {
+  createMattAutoLogger,
+  createSessionLogger,
+  type MattAutoLogger,
+} from "./logger.js";
