@@ -57,11 +57,23 @@ Preferences live under:
 - Global: `~/.pi/agent/matt-auto/preferences.json`
 - Workflow root: `.pi/matt-auto/preferences.json`
 
-Example Worker profile:
+### Worker profile
+
+Configure from the Matt Auto menu (**Configure Worker profile…**):
+
+- Global default (all Workflow roots)
+- Workflow-root override (current root only)
+
+Model choices come from Pi’s authenticated available-model catalog via a searchable selector. Thinking levels are limited to those the selected model supports. Configuring a Worker profile never changes the Workflow home currently selected model.
+
+Precedence: workflow snapshot (later tickets) → Workflow-root override → global default.
+
+Example preferences:
 
 ```json
 {
   "workerProfile": {
+    "provider": "anthropic",
     "modelId": "claude-sonnet-4",
     "thinkingLevel": "medium"
   }
@@ -70,4 +82,4 @@ Example Worker profile:
 
 ## Status
 
-Tickets #2–#3 establish the package shell, coordinator seam, preflight menus, and Workflow root selection. Planning stages, workers, integration, CI, and Workflow PR land in later tickets.
+Tickets #2–#4 establish the package shell, coordinator seam, preflight menus, Workflow root selection, and Worker profile defaults. Planning stages, workers, integration, CI, and Workflow PR land in later tickets.

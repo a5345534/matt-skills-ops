@@ -8,6 +8,7 @@ export {
 export type {
   EnvironmentPort,
   GitTopologyPort,
+  ModelsPort,
   NestedGitRepository,
   PreferencesPort,
   RootScopedPorts,
@@ -15,11 +16,14 @@ export type {
   WorkflowCoordinatorPorts,
 } from "./ports.js";
 export type {
+  AvailableModel,
   NextAction,
   PreflightCheck,
   PreflightCheckId,
   PreflightResult,
+  ResolvedWorkerProfile,
   WorkerProfile,
+  WorkerProfileSource,
   WorkflowCoordinator,
   WorkflowRoot,
   WorkflowRootKind,

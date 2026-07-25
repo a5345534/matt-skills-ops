@@ -20,6 +20,8 @@ export type PreflightResult = {
   /** Resolved Target branch name (configured override or default). */
   targetBranch: string;
   checks: PreflightCheck[];
+  /** Effective Worker profile after precedence, when configured. */
+  workerProfile?: ResolvedWorkerProfile;
 };
 
 /**
@@ -32,10 +34,42 @@ export type NextAction = {
   description: string;
 };
 
-/** Model + thinking level used by Implementation workers. */
+/**
+ * Model + thinking level used by Implementation workers.
+ * Distinct from the Workflow home session model.
+ */
 export type WorkerProfile = {
+  provider: string;
   modelId: string;
   thinkingLevel: string;
+};
+
+/**
+ * Where an effective Worker profile was resolved from.
+ * Precedence: workflow-snapshot → workflow-root → global.
+ */
+export type WorkerProfileSource =
+  | "global"
+  | "workflow-root"
+  | "workflow-snapshot";
+
+/** Effective Worker profile with the layer that supplied it. */
+export type ResolvedWorkerProfile = {
+  profile: WorkerProfile;
+  source: WorkerProfileSource;
+};
+
+/**
+ * An authenticated model from Pi’s available-model catalog.
+ * Thinking levels are those supported by the model.
+ */
+export type AvailableModel = {
+  provider: string;
+  modelId: string;
+  /** Human-readable label for menus (provider/id or display name). */
+  label: string;
+  /** Thinking levels supported by this model (always includes at least "off"). */
+  thinkingLevels: readonly string[];
 };
 
 /**
@@ -87,4 +121,39 @@ export type WorkflowCoordinator = {
    * Throws if the path is not in the discovered set.
    */
   selectRoot(rootPath: string): Promise<WorkflowRoot>;
+  /**
+   * Effective Worker profile after global → Workflow-root → snapshot precedence.
+   * `undefined` when no layer is configured.
+   */
+  getWorkerProfile(): Promise<ResolvedWorkerProfile | undefined>;
+  /** Configured global default Worker profile (no root/snapshot override). */
+  getGlobalWorkerProfile(): Promise<WorkerProfile | undefined>;
+  /** Configured Workflow-root Worker profile override for the current root. */
+  getRootWorkerProfile(): Promise<WorkerProfile | undefined>;
+  /**
+   * Persist a global default Worker profile.
+   * Does not change the Workflow home currently selected model.
+   * Thinking level must be supported by the selected model when the catalog is available.
+   */
+  setGlobalWorkerProfile(profile: WorkerProfile): Promise<void>;
+  /**
+   * Persist a Workflow-root Worker profile override for the current root.
+   * Does not change the Workflow home currently selected model.
+   */
+  setRootWorkerProfile(profile: WorkerProfile): Promise<void>;
+  /** Remove the Workflow-root Worker profile override (global default remains). */
+  clearRootWorkerProfile(): Promise<void>;
+  /**
+   * Authenticated available models from Pi’s catalog.
+   * Used by Worker profile menus; never mutates the home model.
+   */
+  listAvailableModels(): Promise<readonly AvailableModel[]>;
+  /**
+   * Thinking levels supported by a model in the available catalog.
+   * Returns `["off"]` when the model is unknown or has no reasoning support.
+   */
+  thinkingLevelsFor(
+    provider: string,
+    modelId: string,
+  ): Promise<readonly string[]>;
 };

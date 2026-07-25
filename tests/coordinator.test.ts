@@ -4,13 +4,14 @@ import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type {
   EnvironmentPort,
   GitTopologyPort,
+  ModelsPort,
   NestedGitRepository,
   PreferencesPort,
   RootScopedPorts,
   SkillsPort,
   WorkflowCoordinatorPorts,
 } from "../src/ports.js";
-import type { WorkerProfile } from "../src/types.js";
+import type { AvailableModel, WorkerProfile } from "../src/types.js";
 import {
   DEFAULT_TARGET_BRANCH,
   NO_GIT_REPOSITORY_REASON,
@@ -37,30 +38,64 @@ function createSkills(
   };
 }
 
-function createPreferences(
-  overrides: {
-    targetBranch?: string;
-    workerProfile?: WorkerProfile;
-  } = {},
-): PreferencesPort {
+type PrefState = {
+  targetBranch?: string;
+  globalWorkerProfile?: WorkerProfile;
+  rootWorkerProfile?: WorkerProfile;
+  snapshotWorkerProfile?: WorkerProfile;
+};
+
+function createPreferences(state: PrefState = {}): PreferencesPort {
+  const store: PrefState = { ...state };
   return {
-    getConfiguredTargetBranch: async () => overrides.targetBranch,
-    getWorkerProfile: async () => overrides.workerProfile,
+    getConfiguredTargetBranch: async () => store.targetBranch,
+    getGlobalWorkerProfile: async () => store.globalWorkerProfile,
+    getRootWorkerProfile: async () => store.rootWorkerProfile,
+    getWorkflowSnapshotWorkerProfile: async () => store.snapshotWorkerProfile,
+    setGlobalWorkerProfile: async (profile) => {
+      store.globalWorkerProfile = profile;
+    },
+    setRootWorkerProfile: async (profile) => {
+      store.rootWorkerProfile = profile;
+    },
+    clearRootWorkerProfile: async () => {
+      delete store.rootWorkerProfile;
+    },
   };
 }
 
 const defaultWorkerProfile: WorkerProfile = {
+  provider: "anthropic",
   modelId: "claude-sonnet-4",
   thinkingLevel: "medium",
 };
 
+const reasoningModel: AvailableModel = {
+  provider: "anthropic",
+  modelId: "claude-sonnet-4",
+  label: "anthropic/claude-sonnet-4",
+  thinkingLevels: ["off", "minimal", "low", "medium", "high"],
+};
+
+const noReasoningModel: AvailableModel = {
+  provider: "openai",
+  modelId: "gpt-4o",
+  label: "openai/gpt-4o",
+  thinkingLevels: ["off"],
+};
+
+function createModels(
+  models: readonly AvailableModel[] = [reasoningModel, noReasoningModel],
+): ModelsPort {
+  return {
+    listAvailableModels: async () => models,
+  };
+}
+
 type RootFixture = {
   environment?: Partial<EnvironmentPort>;
   skills?: readonly string[];
-  preferences?: {
-    targetBranch?: string;
-    workerProfile?: WorkerProfile;
-  };
+  preferences?: PrefState;
 };
 
 function createTopology(
@@ -82,6 +117,7 @@ function createPorts(
   overrides: {
     startPath?: string;
     topology?: GitTopologyPort;
+    models?: ModelsPort;
     /** Per-root fixture overrides keyed by absolute path. */
     roots?: Record<string, RootFixture>;
     defaultRoot?: RootFixture;
@@ -89,20 +125,23 @@ function createPorts(
 ): WorkflowCoordinatorPorts {
   const startPath = overrides.startPath ?? "/repo";
   const defaultRoot: RootFixture = overrides.defaultRoot ?? {
-    preferences: { workerProfile: defaultWorkerProfile },
+    preferences: { globalWorkerProfile: defaultWorkerProfile },
   };
   const roots = overrides.roots ?? {};
 
   return {
     startPath,
     topology: overrides.topology ?? createTopology({ nearest: "/repo" }),
+    models: overrides.models ?? createModels(),
     forRoot(rootPath: string): RootScopedPorts {
       const fixture = roots[rootPath] ?? defaultRoot;
       return {
         environment: createEnvironment(fixture.environment),
         skills: createSkills(fixture.skills),
         preferences: createPreferences(
-          fixture.preferences ?? { workerProfile: defaultWorkerProfile },
+          fixture.preferences ?? {
+            globalWorkerProfile: defaultWorkerProfile,
+          },
         ),
       };
     },
@@ -125,6 +164,10 @@ describe("Workflow coordinator preflight", () => {
       "worker-profile",
     ]);
     expect(result.checks.every((c) => c.ok)).toBe(true);
+    expect(result.workerProfile).toEqual({
+      profile: defaultWorkerProfile,
+      source: "global",
+    });
   });
 
   it("uses the configured Target branch override when present", async () => {
@@ -133,7 +176,7 @@ describe("Workflow coordinator preflight", () => {
         defaultRoot: {
           preferences: {
             targetBranch: "develop",
-            workerProfile: defaultWorkerProfile,
+            globalWorkerProfile: defaultWorkerProfile,
           },
         },
       }),
@@ -150,7 +193,7 @@ describe("Workflow coordinator preflight", () => {
       createPorts({
         defaultRoot: {
           environment: { hasGitHubRemote: async () => false },
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -169,7 +212,7 @@ describe("Workflow coordinator preflight", () => {
       createPorts({
         defaultRoot: {
           environment: { isGhAuthenticated: async () => false },
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -189,7 +232,7 @@ describe("Workflow coordinator preflight", () => {
           environment: {
             targetBranchExists: async (branch) => branch !== "main",
           },
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -211,7 +254,7 @@ describe("Workflow coordinator preflight", () => {
       createPorts({
         defaultRoot: {
           skills: ["to-spec", "implement"],
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -240,6 +283,246 @@ describe("Workflow coordinator preflight", () => {
     expect(result.ok).toBe(false);
     expect(check?.ok).toBe(false);
     expect(check?.guidance).toMatch(/Worker profile/i);
+    expect(result.workerProfile).toBeUndefined();
+  });
+
+  it("surfaces the effective Worker profile source in preflight guidance", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "anthropic",
+      modelId: "claude-sonnet-4",
+      thinkingLevel: "high",
+    };
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+          },
+        },
+      }),
+    );
+
+    const result = await coordinator.preflight();
+    const check = result.checks.find((c) => c.id === "worker-profile");
+
+    expect(result.ok).toBe(true);
+    expect(check?.guidance).toMatch(/source workflow-root/);
+    expect(result.workerProfile).toEqual({
+      profile: rootProfile,
+      source: "workflow-root",
+    });
+  });
+});
+
+describe("Workflow coordinator Worker profile precedence", () => {
+  it("resolves global default when no root or snapshot override exists", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+        },
+      }),
+    );
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: defaultWorkerProfile,
+      source: "global",
+    });
+  });
+
+  it("prefers Workflow-root override over global default", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+          },
+        },
+      }),
+    );
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: rootProfile,
+      source: "workflow-root",
+    });
+    await expect(coordinator.getGlobalWorkerProfile()).resolves.toEqual(
+      defaultWorkerProfile,
+    );
+    await expect(coordinator.getRootWorkerProfile()).resolves.toEqual(
+      rootProfile,
+    );
+  });
+
+  it("prefers workflow snapshot over Workflow-root and global", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const snapshotProfile: WorkerProfile = {
+      provider: "anthropic",
+      modelId: "claude-sonnet-4",
+      thinkingLevel: "high",
+    };
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+            snapshotWorkerProfile: snapshotProfile,
+          },
+        },
+      }),
+    );
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: snapshotProfile,
+      source: "workflow-snapshot",
+    });
+  });
+
+  it("sets a global default Worker profile through the coordinator seam", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await expect(coordinator.getWorkerProfile()).resolves.toBeUndefined();
+
+    await coordinator.setGlobalWorkerProfile(defaultWorkerProfile);
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: defaultWorkerProfile,
+      source: "global",
+    });
+    await expect(coordinator.preflight()).resolves.toMatchObject({ ok: true });
+  });
+
+  it("sets a Workflow-root override without changing the global default", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+        },
+      }),
+    );
+
+    await coordinator.setRootWorkerProfile(rootProfile);
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: rootProfile,
+      source: "workflow-root",
+    });
+    await expect(coordinator.getGlobalWorkerProfile()).resolves.toEqual(
+      defaultWorkerProfile,
+    );
+  });
+
+  it("clears the Workflow-root override so the global default becomes effective", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+          },
+        },
+      }),
+    );
+
+    await coordinator.clearRootWorkerProfile();
+
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: defaultWorkerProfile,
+      source: "global",
+    });
+    await expect(coordinator.getRootWorkerProfile()).resolves.toBeUndefined();
+  });
+
+  it("rejects a Worker profile whose thinking level the model does not support", async () => {
+    const coordinator = createWorkflowCoordinator(createPorts());
+
+    await expect(
+      coordinator.setGlobalWorkerProfile({
+        provider: "openai",
+        modelId: "gpt-4o",
+        thinkingLevel: "high",
+      }),
+    ).rejects.toThrow(/not supported/i);
+  });
+
+  it("rejects a Worker profile whose model is not in the available catalog", async () => {
+    const coordinator = createWorkflowCoordinator(createPorts());
+
+    await expect(
+      coordinator.setGlobalWorkerProfile({
+        provider: "anthropic",
+        modelId: "does-not-exist",
+        thinkingLevel: "medium",
+      }),
+    ).rejects.toThrow(/available-model catalog/i);
+  });
+
+  it("lists authenticated available models and their supported thinking levels", async () => {
+    const coordinator = createWorkflowCoordinator(createPorts());
+
+    await expect(coordinator.listAvailableModels()).resolves.toEqual([
+      reasoningModel,
+      noReasoningModel,
+    ]);
+    await expect(
+      coordinator.thinkingLevelsFor("anthropic", "claude-sonnet-4"),
+    ).resolves.toEqual(["off", "minimal", "low", "medium", "high"]);
+    await expect(
+      coordinator.thinkingLevelsFor("openai", "gpt-4o"),
+    ).resolves.toEqual(["off"]);
+    await expect(
+      coordinator.thinkingLevelsFor("missing", "model"),
+    ).resolves.toEqual(["off"]);
+  });
+
+  it("keeps Worker profile configuration independent of Workflow home model selection", async () => {
+    // Coordinator only writes preferences via the PreferencesPort. There is no
+    // home-model port — configuring workers cannot change the session model.
+    let homeModel = "workflow-home-model";
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await coordinator.setGlobalWorkerProfile(defaultWorkerProfile);
+    await coordinator.setRootWorkerProfile({
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    });
+
+    expect(homeModel).toBe("workflow-home-model");
+    homeModel = "still-workflow-home-model";
+    await expect(coordinator.getWorkerProfile()).resolves.toMatchObject({
+      source: "workflow-root",
+    });
+    expect(homeModel).toBe("still-workflow-home-model");
   });
 });
 
@@ -249,7 +532,7 @@ describe("Workflow coordinator Next actions", () => {
       createPorts({
         defaultRoot: {
           environment: { hasGitHubRemote: async () => false },
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -316,13 +599,13 @@ describe("Workflow coordinator root selection", () => {
         }),
         roots: {
           "/workspace": {
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/services/api": {
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/vendor/tool": {
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
         },
       }),
@@ -381,7 +664,7 @@ describe("Workflow coordinator root selection", () => {
         topology: createTopology({ nearest: "/gitlab-only" }),
         defaultRoot: {
           environment: { hasGitHubRemote: async () => false },
-          preferences: { workerProfile: defaultWorkerProfile },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
@@ -407,14 +690,14 @@ describe("Workflow coordinator root selection", () => {
         }),
         roots: {
           "/workspace": {
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/legacy-gitlab": {
             environment: { hasGitHubRemote: async () => false },
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/product": {
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
         },
       }),
@@ -441,12 +724,12 @@ describe("Workflow coordinator root selection", () => {
         roots: {
           "/workspace": {
             environment: { hasGitHubRemote: async () => false },
-            preferences: { workerProfile: defaultWorkerProfile },
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/services/api": {
             preferences: {
               targetBranch: "develop",
-              workerProfile: defaultWorkerProfile,
+              globalWorkerProfile: defaultWorkerProfile,
             },
           },
         },

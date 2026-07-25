@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { PreferencesPort } from "../ports.js";
@@ -21,10 +21,20 @@ async function readPreferencesFile(
   }
 }
 
+async function writePreferencesFile(
+  filePath: string,
+  next: PreferencesFile,
+): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
 function isWorkerProfile(value: unknown): value is WorkerProfile {
   if (!value || typeof value !== "object") return false;
   const profile = value as WorkerProfile;
   return (
+    typeof profile.provider === "string" &&
+    profile.provider.length > 0 &&
     typeof profile.modelId === "string" &&
     profile.modelId.length > 0 &&
     typeof profile.thinkingLevel === "string" &&
@@ -32,25 +42,34 @@ function isWorkerProfile(value: unknown): value is WorkerProfile {
   );
 }
 
+function preferencesPaths(workflowRoot: string): {
+  rootPrefsPath: string;
+  globalPrefsPath: string;
+} {
+  return {
+    rootPrefsPath: path.join(
+      workflowRoot,
+      ".pi",
+      "matt-auto",
+      "preferences.json",
+    ),
+    globalPrefsPath: path.join(
+      os.homedir(),
+      ".pi",
+      "agent",
+      "matt-auto",
+      "preferences.json",
+    ),
+  };
+}
+
 /**
  * Preferences from rebuildable Matt Auto local cache.
- * Precedence for Worker profile: Workflow-root override, then global default.
+ * Layers are stored separately; the Workflow coordinator resolves precedence.
  * Target branch is Workflow-root only (global default is handled by coordinator).
  */
 export function createPreferencesPort(workflowRoot: string): PreferencesPort {
-  const rootPrefsPath = path.join(
-    workflowRoot,
-    ".pi",
-    "matt-auto",
-    "preferences.json",
-  );
-  const globalPrefsPath = path.join(
-    os.homedir(),
-    ".pi",
-    "agent",
-    "matt-auto",
-    "preferences.json",
-  );
+  const { rootPrefsPath, globalPrefsPath } = preferencesPaths(workflowRoot);
 
   return {
     async getConfiguredTargetBranch() {
@@ -61,18 +80,64 @@ export function createPreferencesPort(workflowRoot: string): PreferencesPort {
       return undefined;
     },
 
-    async getWorkerProfile() {
-      const root = await readPreferencesFile(rootPrefsPath);
-      if (isWorkerProfile(root?.workerProfile)) {
-        return root.workerProfile;
-      }
-
+    async getGlobalWorkerProfile() {
       const global = await readPreferencesFile(globalPrefsPath);
       if (isWorkerProfile(global?.workerProfile)) {
         return global.workerProfile;
       }
-
       return undefined;
+    },
+
+    async getRootWorkerProfile() {
+      const root = await readPreferencesFile(rootPrefsPath);
+      if (isWorkerProfile(root?.workerProfile)) {
+        return root.workerProfile;
+      }
+      return undefined;
+    },
+
+    async getWorkflowSnapshotWorkerProfile() {
+      // Workflow-manifest snapshot lands with Create-spec / Active workflow tickets.
+      return undefined;
+    },
+
+    async setGlobalWorkerProfile(profile: WorkerProfile) {
+      if (!isWorkerProfile(profile)) {
+        throw new Error("Invalid Worker profile.");
+      }
+      const existing = (await readPreferencesFile(globalPrefsPath)) ?? {};
+      await writePreferencesFile(globalPrefsPath, {
+        ...existing,
+        workerProfile: {
+          provider: profile.provider,
+          modelId: profile.modelId,
+          thinkingLevel: profile.thinkingLevel,
+        },
+      });
+    },
+
+    async setRootWorkerProfile(profile: WorkerProfile) {
+      if (!isWorkerProfile(profile)) {
+        throw new Error("Invalid Worker profile.");
+      }
+      const existing = (await readPreferencesFile(rootPrefsPath)) ?? {};
+      await writePreferencesFile(rootPrefsPath, {
+        ...existing,
+        workerProfile: {
+          provider: profile.provider,
+          modelId: profile.modelId,
+          thinkingLevel: profile.thinkingLevel,
+        },
+      });
+    },
+
+    async clearRootWorkerProfile() {
+      const existing = await readPreferencesFile(rootPrefsPath);
+      if (!existing || existing.workerProfile === undefined) {
+        return;
+      }
+      const { workerProfile: _removed, ...rest } = existing;
+      await writePreferencesFile(rootPrefsPath, rest);
     },
   };
 }

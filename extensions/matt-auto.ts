@@ -3,12 +3,16 @@
  *
  * Product rules live in the Workflow coordinator. This file only wires Pi
  * commands/menus to coordinator ports.
+ *
+ * Worker profile menus read Pi’s authenticated available-model catalog and
+ * write Matt Auto preferences only — they never change the Workflow home model.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createEnvironmentPort,
   createGitTopologyPort,
+  createModelsPort,
   createPreferencesPort,
   createSkillsPort,
 } from "../src/adapters/index.js";
@@ -19,10 +23,14 @@ import {
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-function createCoordinatorFor(cwd: string) {
+function createCoordinatorFor(
+  cwd: string,
+  modelRegistry: Parameters<typeof createModelsPort>[0],
+) {
   return createWorkflowCoordinator({
     startPath: cwd,
     topology: createGitTopologyPort(),
+    models: createModelsPort(modelRegistry),
     forRoot(rootPath) {
       return {
         environment: createEnvironmentPort(rootPath),
@@ -33,11 +41,23 @@ function createCoordinatorFor(cwd: string) {
   });
 }
 
-function uiFrom(ctx: { ui: MattAutoUi }): MattAutoUi {
-  return {
+function uiFrom(ctx: {
+  ui: MattAutoUi & {
+    input?: (
+      title: string,
+      placeholder?: string,
+    ) => Promise<string | undefined>;
+  };
+}): MattAutoUi {
+  const ui: MattAutoUi = {
     select: (title, options) => ctx.ui.select(title, options),
     notify: (message, type) => ctx.ui.notify(message, type),
   };
+  if (ctx.ui.input) {
+    const input = ctx.ui.input.bind(ctx.ui);
+    ui.input = (title, placeholder) => input(title, placeholder);
+  }
+  return ui;
 }
 
 export default function mattAutoExtension(pi: ExtensionAPI) {
@@ -51,7 +71,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const subcommand = args.trim();
-      const coordinator = createCoordinatorFor(ctx.cwd);
+      const coordinator = createCoordinatorFor(ctx.cwd, ctx.modelRegistry);
       const ui = uiFrom(ctx);
 
       if (subcommand === "" || subcommand === "menu") {

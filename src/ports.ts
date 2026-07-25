@@ -1,4 +1,4 @@
-import type { WorkerProfile } from "./types.js";
+import type { AvailableModel, WorkerProfile } from "./types.js";
 
 /**
  * Environment facts for Workflow preflight on one Workflow root.
@@ -25,6 +25,9 @@ export type SkillsPort = {
 /**
  * Local preferences and rebuildable cache.
  * System boundary: `.pi/matt-auto/` and global Matt Auto prefs.
+ *
+ * Worker profile layers are stored separately; the Workflow coordinator
+ * resolves precedence (snapshot → root → global).
  */
 export type PreferencesPort = {
   /**
@@ -32,11 +35,31 @@ export type PreferencesPort = {
    * `undefined` means use the Matt Auto default (`main`).
    */
   getConfiguredTargetBranch(): Promise<string | undefined>;
+  /** Global default Worker profile, if set. */
+  getGlobalWorkerProfile(): Promise<WorkerProfile | undefined>;
+  /** Workflow-root Worker profile override, if set. */
+  getRootWorkerProfile(): Promise<WorkerProfile | undefined>;
   /**
-   * Effective Worker profile after global / root / snapshot precedence.
-   * `undefined` means no profile is configured yet.
+   * Worker profile snapshot captured by an Active workflow, if any.
+   * Later tickets populate this from the Workflow manifest.
    */
-  getWorkerProfile(): Promise<WorkerProfile | undefined>;
+  getWorkflowSnapshotWorkerProfile(): Promise<WorkerProfile | undefined>;
+  /** Persist the global default Worker profile. */
+  setGlobalWorkerProfile(profile: WorkerProfile): Promise<void>;
+  /** Persist the Workflow-root Worker profile override. */
+  setRootWorkerProfile(profile: WorkerProfile): Promise<void>;
+  /** Clear the Workflow-root Worker profile override. */
+  clearRootWorkerProfile(): Promise<void>;
+};
+
+/**
+ * Pi authenticated available-model catalog.
+ * System boundary: Pi ModelRegistry / model runtime.
+ * Never mutates the Workflow home currently selected model.
+ */
+export type ModelsPort = {
+  /** Models currently available under authenticated providers. */
+  listAvailableModels(): Promise<readonly AvailableModel[]>;
 };
 
 /**
@@ -81,6 +104,8 @@ export type WorkflowCoordinatorPorts = {
   /** Working directory used as the Root selection starting point. */
   startPath: string;
   topology: GitTopologyPort;
+  /** Pi available-model catalog (session-scoped, not root-scoped). */
+  models: ModelsPort;
   /** Create environment / skills / preferences bound to a Workflow root path. */
   forRoot(rootPath: string): RootScopedPorts;
 };
