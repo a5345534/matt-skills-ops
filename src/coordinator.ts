@@ -33,6 +33,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import { implementationWorktreePath } from "./adapters/workspace.js";
 import type {
   RootScopedPorts,
   TrackerTicket,
@@ -291,6 +292,117 @@ export function createWorkflowCoordinator(
   ): Promise<string> {
     const configured = await preferences.getConfiguredTargetBranch();
     return configured ?? DEFAULT_TARGET_BRANCH;
+  }
+
+  /**
+   * If the latest attempt for a ticket completed (Stage result / inferred) and
+   * was never dispositioned, restore pendingDisposition so the pipeline does
+   * not launch rN+1 for the same work.
+   */
+  async function recoverPendingDispositionFromTranscripts(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<void> {
+    if (pendingDisposition || activeWorker) return;
+    const ticketNumbers = active.tickets ?? [];
+    for (const ticketNumber of ticketNumbers) {
+      // Skip tickets already integrated or in recovery cooldown without success.
+      if (
+        (active.integratedTickets ?? []).some((t) => t.number === ticketNumber)
+      ) {
+        continue;
+      }
+      const attempt = await bound.workspace.latestAttempt(
+        active.workflowId,
+        ticketNumber,
+      );
+      if (attempt < 1) continue;
+
+      const events = await bound.transcripts.read({
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt,
+      });
+
+      let completed = false;
+      let summary: string | undefined;
+      let headSha: string | undefined;
+      for (const raw of events) {
+        if (!raw || typeof raw !== "object") continue;
+        const e = raw as Record<string, unknown>;
+        const type = e.type;
+        if (type === "disposition") {
+          completed = false;
+          summary = undefined;
+          headSha = undefined;
+          continue;
+        }
+        if (type === "compatibility-recovery" || type === "worker-aborted") {
+          completed = false;
+          summary = undefined;
+          headSha = undefined;
+          continue;
+        }
+        if (type === "stage-result") {
+          const outcome = e.outcome as Record<string, unknown> | undefined;
+          if (outcome?.status === "completed") {
+            completed = true;
+            if (typeof outcome.summary === "string") summary = outcome.summary;
+            if (typeof outcome.localCommitSha === "string") {
+              headSha = outcome.localCommitSha;
+            }
+          } else {
+            completed = false;
+            summary = undefined;
+            headSha = undefined;
+          }
+          continue;
+        }
+        if (type === "stage-result-inferred") {
+          completed = true;
+          if (typeof e.headSha === "string") headSha = e.headSha;
+          summary =
+            typeof e.reason === "string"
+              ? e.reason
+              : "Inferred completion from local commits";
+        }
+      }
+
+      if (!completed) continue;
+
+      const branchName = implementationBranchName(
+        active.workflowId,
+        ticketNumber,
+        attempt,
+      );
+      // Prefer bound root path for worktree layout; fall back via dirname of cwd.
+      const rootPath = selectedPath ?? ports.startPath;
+      const worktreePath = implementationWorktreePath(
+        rootPath,
+        active.workflowId,
+        ticketNumber,
+        attempt,
+      );
+
+      pendingDisposition = {
+        workerId: `recovered-${active.workflowId}-${ticketNumber}-r${attempt}`,
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt,
+        branchName,
+        worktreePath,
+        status: "needs-disposition",
+        receivedStageResult: true,
+        summary:
+          summary ??
+          (headSha
+            ? `Recovered completed attempt r${attempt} @ ${headSha.slice(0, 8)}`
+            : `Recovered completed attempt r${attempt}`),
+      };
+      // Clear recovery cooldown so disposition is offered.
+      implementationRecoveryCooldown.delete(ticketNumber);
+      return;
+    }
   }
 
   async function loadActiveWorkflow(
@@ -1011,6 +1123,12 @@ export function createWorkflowCoordinator(
       // While a worker runs, the passive panel owns progress.
       if (activeWorker || activeConflictWorker) {
         return [];
+      }
+
+      // New /matt-auto run loses in-memory pendingDisposition. Rebuild it from
+      // the latest transcript so we Auto-Close instead of re-Implementing.
+      if (!pendingDisposition) {
+        await recoverPendingDispositionFromTranscripts(bound, active);
       }
 
       // After success, offer the Implementation disposition Next action only.

@@ -2352,8 +2352,9 @@ function ticketsPublishedFixture(
     verification?: ReturnType<typeof createVerification>;
     remoteGit?: ReturnType<typeof createRemoteGit>;
     workspace?: ReturnType<typeof createWorkspace>;
+    transcripts?: ReturnType<typeof createTranscripts>;
     skills?: SkillsFixture;
-      ci?: ReturnType<typeof createCi>;
+    ci?: ReturnType<typeof createCi>;
   } = {},
 ) {
   const tracker = createTracker({
@@ -2373,7 +2374,7 @@ function ticketsPublishedFixture(
   });
   const workspace = options.workspace ?? createWorkspace("/repo");
   const workers = createWorkers();
-  const transcripts = createTranscripts();
+  const transcripts = options.transcripts ?? createTranscripts();
   const verification = options.verification ?? createVerification();
   const remoteGit = options.remoteGit ?? createRemoteGit();
   const ci = options.ci ?? createCi({ result: { status: "pending", summary: "CI pending" } });
@@ -2724,6 +2725,38 @@ describe("Workflow coordinator single Implementation worker path", () => {
           (e as { type?: string }).type === "stage-result-inferred",
       ),
     ).toBe(true);
+  });
+
+  it("recovers pending disposition from transcript after a new coordinator session", async () => {
+    const attempts = new Map<string, number>([["42:43", 5]]);
+    const workspace = createWorkspace("/repo", { attempts });
+    const transcripts = createTranscripts();
+    await transcripts.port.append(
+      { workflowId: 42, ticketNumber: 43, attempt: 5 },
+      {
+        type: "stage-result",
+        workerId: "implement-42-43-r5",
+        outcome: {
+          status: "completed",
+          summary: "docs landed",
+          localCommitSha: "c7632f7b",
+        },
+      },
+    );
+    await transcripts.port.append(
+      { workflowId: 42, ticketNumber: 43, attempt: 5 },
+      { type: "process-exit", workerId: "implement-42-43-r5", code: 0 },
+    );
+
+    // Fresh coordinator — no in-memory pendingDisposition.
+    const { coordinator } = ticketsPublishedFixture({
+      workspace,
+      transcripts,
+    });
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([dispositionActionId(43)]);
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
   });
 
   it("aborts the session-owned worker cleanly and leaves GitHub state recoverable", async () => {
