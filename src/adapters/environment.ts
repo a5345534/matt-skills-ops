@@ -34,6 +34,10 @@ async function run(
  * Real EnvironmentPort backed by git and gh in a Workflow root.
  * Does not create remotes, authenticate, or invent branches.
  */
+// Process-level caches so every /matt-auto open does not re-hit network.
+const ghAuthCache = new Map<string, { ok: boolean; at: number }>();
+const GH_AUTH_TTL_MS = 60_000;
+
 export function createEnvironmentPort(cwd: string): EnvironmentPort {
   return {
     async hasGitHubRemote() {
@@ -43,8 +47,14 @@ export function createEnvironmentPort(cwd: string): EnvironmentPort {
     },
 
     async isGhAuthenticated() {
+      const cached = ghAuthCache.get(cwd);
+      if (cached && Date.now() - cached.at < GH_AUTH_TTL_MS) {
+        return cached.ok;
+      }
       const result = await run(cwd, "gh", ["auth", "status"]);
-      return result.code === 0;
+      const ok = result.code === 0;
+      ghAuthCache.set(cwd, { ok, at: Date.now() });
+      return ok;
     },
 
     async targetBranchExists(branch: string) {
@@ -64,13 +74,9 @@ export function createEnvironmentPort(cwd: string): EnvironmentPort {
       ]);
       if (remoteRef.code === 0) return true;
 
-      const lsRemote = await run(cwd, "git", [
-        "ls-remote",
-        "--heads",
-        "origin",
-        branch,
-      ]);
-      return lsRemote.code === 0 && lsRemote.stdout.trim().length > 0;
+      // Avoid git ls-remote (network) on every menu open. If the branch is not
+      // known locally, treat it as missing and let the user fetch/create it.
+      return false;
     },
   };
 }

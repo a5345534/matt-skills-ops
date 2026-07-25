@@ -316,9 +316,11 @@ export type TrackerPort = {
   /**
    * Find the Active workflow for a Target branch, if any.
    * Reads GitHub issues + managed Workflow manifest comments.
+   * When `hintWorkflowId` is set, only that issue is loaded (fast path).
    */
   findActiveWorkflow(
     targetBranch: string,
+    hintWorkflowId?: number,
   ): Promise<ActiveWorkflow | undefined>;
   /**
    * Load ticket issues by number for frontier / progress computation.
@@ -391,6 +393,16 @@ export type PreferencesPort = {
   setRootWorkerProfile(profile: WorkerProfile): Promise<void>;
   /** Clear the Workflow-root Worker profile override. */
   clearRootWorkerProfile(): Promise<void>;
+  /**
+   * Rebuildable local pointer to the Active workflow id for a Target branch.
+   * GitHub remains authoritative; this avoids scanning every open issue on each menu open.
+   */
+  getActiveWorkflowId(targetBranch: string): Promise<number | undefined>;
+  setActiveWorkflowId(
+    targetBranch: string,
+    workflowId: number,
+  ): Promise<void>;
+  clearActiveWorkflowId(targetBranch: string): Promise<void>;
 };
 
 /**

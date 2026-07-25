@@ -772,10 +772,14 @@ type PrefState = {
   globalWorkerProfile?: WorkerProfile;
   rootWorkerProfile?: WorkerProfile;
   snapshotWorkerProfile?: WorkerProfile;
+  activeWorkflowIds?: Record<string, number>;
 };
 
 function createPreferences(state: PrefState = {}): PreferencesPort {
-  const store: PrefState = { ...state };
+  const store: PrefState = {
+    ...state,
+    activeWorkflowIds: { ...(state.activeWorkflowIds ?? {}) },
+  };
   return {
     getConfiguredTargetBranch: async () => store.targetBranch,
     getGlobalWorkerProfile: async () => store.globalWorkerProfile,
@@ -789,6 +793,19 @@ function createPreferences(state: PrefState = {}): PreferencesPort {
     },
     clearRootWorkerProfile: async () => {
       delete store.rootWorkerProfile;
+    },
+    getActiveWorkflowId: async (targetBranch) =>
+      store.activeWorkflowIds?.[targetBranch],
+    setActiveWorkflowId: async (targetBranch, workflowId) => {
+      store.activeWorkflowIds = {
+        ...(store.activeWorkflowIds ?? {}),
+        [targetBranch]: workflowId,
+      };
+    },
+    clearActiveWorkflowId: async (targetBranch) => {
+      if (!store.activeWorkflowIds?.[targetBranch]) return;
+      const { [targetBranch]: _removed, ...rest } = store.activeWorkflowIds;
+      store.activeWorkflowIds = rest;
     },
   };
 }

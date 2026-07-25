@@ -7,6 +7,8 @@ import type { WorkerProfile } from "../types.js";
 type PreferencesFile = {
   targetBranch?: string;
   workerProfile?: WorkerProfile;
+  /** Target branch → Active Workflow ID (rebuildable local cache). */
+  activeWorkflowIds?: Record<string, number>;
 };
 
 async function readPreferencesFile(
@@ -138,6 +140,39 @@ export function createPreferencesPort(workflowRoot: string): PreferencesPort {
       }
       const { workerProfile: _removed, ...rest } = existing;
       await writePreferencesFile(rootPrefsPath, rest);
+    },
+
+    async getActiveWorkflowId(targetBranch: string) {
+      const root = await readPreferencesFile(rootPrefsPath);
+      const id = root?.activeWorkflowIds?.[targetBranch];
+      return typeof id === "number" && Number.isInteger(id) && id > 0
+        ? id
+        : undefined;
+    },
+
+    async setActiveWorkflowId(targetBranch: string, workflowId: number) {
+      const existing = (await readPreferencesFile(rootPrefsPath)) ?? {};
+      await writePreferencesFile(rootPrefsPath, {
+        ...existing,
+        activeWorkflowIds: {
+          ...(existing.activeWorkflowIds ?? {}),
+          [targetBranch]: workflowId,
+        },
+      });
+    },
+
+    async clearActiveWorkflowId(targetBranch: string) {
+      const existing = await readPreferencesFile(rootPrefsPath);
+      if (!existing?.activeWorkflowIds?.[targetBranch]) return;
+      const { [targetBranch]: _removed, ...rest } =
+        existing.activeWorkflowIds;
+      const next: PreferencesFile = { ...existing };
+      if (Object.keys(rest).length === 0) {
+        delete next.activeWorkflowIds;
+      } else {
+        next.activeWorkflowIds = rest;
+      }
+      await writePreferencesFile(rootPrefsPath, next);
     },
   };
 }

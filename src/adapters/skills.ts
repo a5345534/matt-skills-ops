@@ -94,16 +94,28 @@ function skillSearchRoots(cwd: string): string[] {
  * Discover installed skill names and invoke Planning skills via an optional host.
  * Does not parse skill bodies for orchestration logic and never modifies SKILL.md.
  */
+const skillNameCache = new Map<
+  string,
+  { names: readonly string[]; at: number }
+>();
+const SKILL_NAME_TTL_MS = 60_000;
+
 export function createSkillsPort(
   cwd: string,
   host?: SkillsHost | CreateSpecHost,
 ): SkillsPort {
   async function installedSkillNames(): Promise<readonly string[]> {
+    const cached = skillNameCache.get(cwd);
+    if (cached && Date.now() - cached.at < SKILL_NAME_TTL_MS) {
+      return cached.names;
+    }
     const names = new Set<string>();
     for (const root of skillSearchRoots(cwd)) {
       await collectFromRoot(root, names);
     }
-    return [...names].sort();
+    const sorted = [...names].sort();
+    skillNameCache.set(cwd, { names: sorted, at: Date.now() });
+    return sorted;
   }
 
   return {

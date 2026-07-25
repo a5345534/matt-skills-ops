@@ -294,7 +294,21 @@ export function createWorkflowCoordinator(
     bound: RootScopedPorts,
   ): Promise<ActiveWorkflow | undefined> {
     const targetBranch = await resolveTargetBranch(bound.preferences);
-    return bound.tracker.findActiveWorkflow(targetBranch);
+    const hint = await bound.preferences.getActiveWorkflowId(targetBranch);
+    const active = await bound.tracker.findActiveWorkflow(
+      targetBranch,
+      hint,
+    );
+    // Keep / refresh the rebuildable local pointer for fast subsequent opens.
+    if (active) {
+      await bound.preferences.setActiveWorkflowId(
+        targetBranch,
+        active.workflowId,
+      );
+    } else if (hint !== undefined) {
+      await bound.preferences.clearActiveWorkflowId(targetBranch);
+    }
+    return active;
   }
 
   /**
@@ -846,8 +860,21 @@ export function createWorkflowCoordinator(
     }
   }
 
+  // Short-lived preflight cache — menu open calls preflight + nextActions back-to-back.
+  let preflightCache:
+    | { result: PreflightResult; at: number; rootPath: string }
+    | undefined;
+  const PREFLIGHT_TTL_MS = 5_000;
+
   async function preflight(): Promise<PreflightResult> {
     const bound = await requireScoped();
+    if (
+      preflightCache &&
+      preflightCache.rootPath === selectedPath &&
+      Date.now() - preflightCache.at < PREFLIGHT_TTL_MS
+    ) {
+      return preflightCache.result;
+    }
 
     const targetBranch = await resolveTargetBranch(bound.preferences);
 
@@ -918,6 +945,11 @@ export function createWorkflowCoordinator(
     if (workerProfile) {
       result.workerProfile = workerProfile;
     }
+    preflightCache = {
+      result,
+      at: Date.now(),
+      rootPath: selectedPath ?? ports.startPath,
+    };
     return result;
   }
 
@@ -1400,6 +1432,9 @@ export function createWorkflowCoordinator(
         reason: `Spec issue #${issueNumber} was created, but writing the Workflow manifest failed: ${message}. Inspect issue #${issueNumber} and recover the Workflow manifest before continuing.`,
       };
     }
+
+    // Rebuildable local pointer so later /matt-auto opens do not scan every issue.
+    await bound.preferences.setActiveWorkflowId(targetBranch, issueNumber);
 
     pending = undefined;
     return {
@@ -3163,6 +3198,7 @@ export function createWorkflowCoordinator(
       targetBranch: active.targetBranch,
       ...(active.title ? { title: active.title } : {}),
     };
+    await bound.preferences.clearActiveWorkflowId(active.targetBranch);
 
     return {
       status: "completed",
@@ -3537,9 +3573,21 @@ export function createWorkflowCoordinator(
     return ensureSelected();
   }
 
+  let rootsCache: { roots: WorkflowRoot[]; at: number; startPath: string } | undefined;
+  const ROOTS_TTL_MS = 30_000;
+
   async function listRoots(): Promise<WorkflowRoot[]> {
     await ensureSelected();
-    return discoverRoots();
+    if (
+      rootsCache &&
+      rootsCache.startPath === ports.startPath &&
+      Date.now() - rootsCache.at < ROOTS_TTL_MS
+    ) {
+      return rootsCache.roots;
+    }
+    const roots = await discoverRoots();
+    rootsCache = { roots, at: Date.now(), startPath: ports.startPath };
+    return roots;
   }
 
   async function selectRoot(rootPath: string): Promise<WorkflowRoot> {

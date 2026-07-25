@@ -373,20 +373,80 @@ export function createTrackerPort(cwd: string): TrackerPort {
       }
     },
 
-    async findActiveWorkflow(targetBranch) {
+    async findActiveWorkflow(targetBranch, hintWorkflowId) {
+      async function loadFromIssue(
+        issueNumber: number,
+        fallbackTitle?: string,
+      ): Promise<ActiveWorkflow | undefined> {
+        const viewed = await run(cwd, "gh", [
+          "issue",
+          "view",
+          String(issueNumber),
+          "--json",
+          "number,title,state,comments",
+        ]);
+        if (viewed.code !== 0) return undefined;
+
+        let detail: {
+          number: number;
+          title: string;
+          state?: string;
+          comments?: Array<{ body?: string }>;
+        };
+        try {
+          detail = JSON.parse(viewed.stdout) as typeof detail;
+        } catch {
+          return undefined;
+        }
+
+        let found: WorkflowManifest | undefined;
+        for (const comment of detail.comments ?? []) {
+          const manifest = parseWorkflowManifestComment(comment.body ?? "");
+          if (manifest) found = manifest;
+        }
+        if (!found) return undefined;
+        if (found.targetBranch !== targetBranch) return undefined;
+        if (found.workflowId !== issueNumber) return undefined;
+        if (found.stage === "completed") return undefined;
+
+        const active: ActiveWorkflow = {
+          workflowId: found.workflowId,
+          targetBranch: found.targetBranch,
+          stage: found.stage,
+          workerProfile: found.workerProfile,
+        };
+        if (found.tickets) active.tickets = [...found.tickets];
+        if (found.integrationBranch) {
+          active.integrationBranch = found.integrationBranch;
+        }
+        if (found.integratedTickets) {
+          active.integratedTickets = [...found.integratedTickets];
+        }
+        if (found.workflowPr) active.workflowPr = { ...found.workflowPr };
+        if (found.followUpOf !== undefined) active.followUpOf = found.followUpOf;
+        const title = detail.title ?? fallbackTitle;
+        if (title) active.title = title;
+        return active;
+      }
+
+      // Fast path: local preference points at the Active workflow issue.
+      if (typeof hintWorkflowId === "number" && hintWorkflowId > 0) {
+        const hinted = await loadFromIssue(hintWorkflowId);
+        if (hinted) return hinted;
+      }
+
+      // Slow fallback: scan a small window of open issues only (was 50 sequential views).
       const list = await run(cwd, "gh", [
         "issue",
         "list",
         "--state",
         "open",
         "--limit",
-        "50",
+        "10",
         "--json",
         "number,title",
       ]);
-      if (list.code !== 0) {
-        return undefined;
-      }
+      if (list.code !== 0) return undefined;
 
       let items: Array<{ number: number; title: string }>;
       try {
@@ -398,68 +458,11 @@ export function createTrackerPort(cwd: string): TrackerPort {
         return undefined;
       }
 
-      for (const issue of items) {
-        const viewed = await run(cwd, "gh", [
-          "issue",
-          "view",
-          String(issue.number),
-          "--json",
-          "number,title,comments",
-        ]);
-        if (viewed.code !== 0) continue;
-
-        let detail: {
-          number: number;
-          title: string;
-          comments?: Array<{ body?: string }>;
-        };
-        try {
-          detail = JSON.parse(viewed.stdout) as typeof detail;
-        } catch {
-          continue;
-        }
-
-        // Prefer the last managed manifest comment on the issue.
-        let found: WorkflowManifest | undefined;
-        for (const comment of detail.comments ?? []) {
-          const manifest = parseWorkflowManifestComment(comment.body ?? "");
-          if (manifest) found = manifest;
-        }
-        if (!found) continue;
-        if (found.targetBranch !== targetBranch) continue;
-        if (found.workflowId !== issue.number) continue;
-        // Completed workflows are no longer Active (cleanup finished).
-        if (found.stage === "completed") continue;
-
-        const active: ActiveWorkflow = {
-          workflowId: found.workflowId,
-          targetBranch: found.targetBranch,
-          stage: found.stage,
-          workerProfile: found.workerProfile,
-        };
-        if (found.tickets) {
-          active.tickets = [...found.tickets];
-        }
-        if (found.integrationBranch) {
-          active.integrationBranch = found.integrationBranch;
-        }
-        if (found.integratedTickets) {
-          active.integratedTickets = [...found.integratedTickets];
-        }
-        if (found.workflowPr) {
-          active.workflowPr = { ...found.workflowPr };
-        }
-        if (found.followUpOf !== undefined) {
-          active.followUpOf = found.followUpOf;
-        }
-        const title = detail.title ?? issue.title;
-        if (title) {
-          active.title = title;
-        }
-        return active;
-      }
-
-      return undefined;
+      // Parallelize the small window instead of serial gh issue view.
+      const loaded = await Promise.all(
+        items.map(async (issue) => loadFromIssue(issue.number, issue.title)),
+      );
+      return loaded.find((active) => active !== undefined);
     },
 
     async listTickets(issueNumbers) {
