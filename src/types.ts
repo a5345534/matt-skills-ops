@@ -35,10 +35,28 @@ export type NextAction = {
 };
 
 /** Planning / orchestration stage identifiers known to the coordinator. */
-export type StageId = "create-spec" | "create-tickets";
+export type StageId = "create-spec" | "create-tickets" | "implement";
 
 /** Stage confirmation choices after a reviewable artifact is produced. */
 export type StageConfirmationDecision = "publish" | "revise" | "cancel";
+
+/**
+ * Implementation disposition after a successful Implementation worker Stage result.
+ * Close initiates integration later; it does not close the GitHub ticket immediately.
+ */
+export type ImplementationDispositionDecision =
+  | "close"
+  | "leave-open"
+  | "investigate";
+
+/** Lifecycle of one session-owned Implementation worker attempt (panel / local state). */
+export type ImplementationWorkerStatus =
+  | "running"
+  | "needs-disposition"
+  | "completed"
+  | "failed"
+  | "aborted"
+  | "compatibility-recovery";
 
 /** Reviewable Create-spec draft produced by the Matt skills adapter. */
 export type SpecDraft = {
@@ -126,6 +144,60 @@ export type TicketProgressSummary = {
   }[];
 };
 
+/** Identity of one Implementation worker attempt (branch + worktree + transcript). */
+export type ImplementationAttemptRef = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  branchName: string;
+  worktreePath: string;
+  workerId: string;
+};
+
+/** Compact passive Workflow panel snapshot while background work is running. */
+export type WorkflowPanelState = {
+  workflowId: number;
+  /** Compact passive lines for a Pi TUI widget (not an interactive dashboard). */
+  lines: readonly string[];
+  workers: readonly {
+    ticketNumber: number;
+    attempt: number;
+    status: ImplementationWorkerStatus;
+    progress?: string;
+    branchName: string;
+  }[];
+  ticketProgress?: TicketProgressSummary;
+};
+
+/**
+ * Worker protocol events derived from a worker's Pi JSON event stream.
+ * Carries progress and Stage results only — no GitHub mutation authority.
+ */
+export type WorkerProtocolEvent =
+  | {
+      type: "progress";
+      workerId: string;
+      message: string;
+    }
+  | {
+      type: "stage-result";
+      workerId: string;
+      outcome:
+        | {
+            status: "completed";
+            summary?: string;
+            /** Local commit only; workers never push. */
+            localCommitSha?: string;
+          }
+        | { status: "failed"; reason: string };
+    }
+  | {
+      type: "process-exit";
+      workerId: string;
+      /** Process exit code; null when terminated by signal. */
+      code: number | null;
+    };
+
 /**
  * One-shot Stage result for completion, failure, confirmation, or recovery.
  * Matt Auto reacts to these; it does not poll for decisions.
@@ -144,6 +216,28 @@ export type StageResult =
       confirmationOptions: readonly StageConfirmationDecision[];
     }
   | {
+      status: "running";
+      stage: "implement";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      workerId: string;
+      branchName: string;
+      worktreePath: string;
+    }
+  | {
+      status: "needs-disposition";
+      stage: "implement";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      branchName: string;
+      worktreePath: string;
+      workerId: string;
+      summary?: string;
+      dispositionOptions: readonly ImplementationDispositionDecision[];
+    }
+  | {
       status: "completed";
       stage: StageId;
       workflowId: number;
@@ -151,6 +245,17 @@ export type StageResult =
       tickets?: readonly number[];
       /** Ticket progress snapshot after Create-tickets publish. */
       ticketProgress?: TicketProgressSummary;
+      /** Set when an Implementation disposition completes. */
+      ticketNumber?: number;
+      attempt?: number;
+      disposition?: ImplementationDispositionDecision;
+      /**
+       * When disposition is "close", integration is the next stage
+       * (Integration unit lands in a later ticket; ticket is not closed yet).
+       */
+      readyForIntegration?: boolean;
+      branchName?: string;
+      worktreePath?: string;
     }
   | {
       status: "cancelled";
@@ -160,11 +265,15 @@ export type StageResult =
       status: "failed";
       stage: StageId;
       reason: string;
+      ticketNumber?: number;
+      attempt?: number;
     }
   | {
       status: "compatibility-recovery";
       stage: StageId;
       reason: string;
+      ticketNumber?: number;
+      attempt?: number;
     };
 
 /**
@@ -309,4 +418,31 @@ export type WorkflowCoordinator = {
     provider: string,
     modelId: string,
   ): Promise<readonly string[]>;
+  /**
+   * Passive Workflow panel snapshot for the Active workflow.
+   * `undefined` when there is no Active workflow.
+   */
+  getPanelState(): Promise<WorkflowPanelState | undefined>;
+  /**
+   * Apply Implementation disposition (Close / Leave open / Investigate)
+   * after a successful Implementation worker Stage result.
+   * Close does not close the GitHub ticket; it marks work ready for Integration.
+   */
+  confirmDisposition(
+    decision: ImplementationDispositionDecision,
+  ): Promise<StageResult>;
+  /**
+   * Abort all session-owned Implementation workers.
+   * Used on Workflow home shutdown, reload, or Workflow-root switching.
+   * Leaves GitHub state recoverable (tickets remain open / ready).
+   */
+  abortWorkers(): Promise<void>;
+  /**
+   * Retained Worker transcript events for one attempt (local, uncommitted).
+   */
+  getWorkerTranscript(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+  }): Promise<readonly unknown[]>;
 };

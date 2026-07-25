@@ -3,7 +3,13 @@ import {
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
+  dispositionActionId,
+  IMPLEMENTATION_DISPOSITION_OPTIONS,
+  implementTicketActionId,
+  implementationBranchName,
   NO_GIT_REPOSITORY_REASON,
+  parseDispositionActionId,
+  parseImplementTicketActionId,
   REQUIRED_MATT_SKILLS,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
@@ -15,11 +21,14 @@ import {
 import type {
   RootScopedPorts,
   TrackerTicket,
+  WorkerEventSink,
   WorkflowCoordinatorPorts,
 } from "./ports.js";
 import type {
   ActiveWorkflow,
   AvailableModel,
+  ImplementationDispositionDecision,
+  ImplementationWorkerStatus,
   NextAction,
   PreflightCheck,
   PreflightResult,
@@ -32,8 +41,10 @@ import type {
   TicketProgressSummary,
   TicketsDraft,
   WorkerProfile,
+  WorkerProtocolEvent,
   WorkflowCoordinator,
   WorkflowManifest,
+  WorkflowPanelState,
   WorkflowRoot,
   WorkflowRootKind,
 } from "./types.js";
@@ -52,6 +63,20 @@ type PendingCreateTickets = {
 
 type PendingStage = PendingCreateSpec | PendingCreateTickets;
 
+type ActiveImplementationWorker = {
+  workerId: string;
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  branchName: string;
+  worktreePath: string;
+  status: ImplementationWorkerStatus;
+  progress?: string;
+  summary?: string;
+  /** True once a stage-result event was handled for this worker. */
+  receivedStageResult: boolean;
+};
+
 /**
  * Create the Workflow coordinator — the sole product seam for Matt Auto.
  *
@@ -66,6 +91,13 @@ export function createWorkflowCoordinator(
   let scoped: RootScopedPorts | undefined;
   /** Session-local pending Stage confirmation (never remote until Publish). */
   let pending: PendingStage | undefined;
+  /**
+   * Session-owned Implementation worker (single path for this ticket).
+   * Lifetime is bound to Workflow home; never durable across processes.
+   */
+  let activeWorker: ActiveImplementationWorker | undefined;
+  /** Pending Implementation disposition after a successful worker Stage result. */
+  let pendingDisposition: ActiveImplementationWorker | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -451,8 +483,40 @@ export function createWorkflowCoordinator(
     return {
       id: TICKET_PROGRESS_ACTION.id,
       label: `${TICKET_PROGRESS_ACTION.label}: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed`,
-      description: `Ready frontier: ${readyList}. Implementation workers land in a later Matt Auto ticket.`,
+      description: `Ready frontier: ${readyList}.`,
     };
+  }
+
+  function formatImplementAction(ticket: ReadyTicket): NextAction {
+    return {
+      id: implementTicketActionId(ticket.number),
+      label: `Implement #${ticket.number}`,
+      description: `${ticket.title}. Launch a session-owned Implementation worker in an isolated Implementation workspace.`,
+    };
+  }
+
+  function panelLines(
+    workflowId: number,
+    progress: TicketProgressSummary | undefined,
+    worker: ActiveImplementationWorker | undefined,
+  ): string[] {
+    const lines = [`Workflow #${workflowId}`];
+    if (progress) {
+      lines.push(
+        `Tickets: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed`,
+      );
+    }
+    if (worker) {
+      const progressText = worker.progress ? ` — ${worker.progress}` : "";
+      lines.push(
+        `Worker #${worker.ticketNumber} r${worker.attempt}: ${worker.status}${progressText}`,
+      );
+    } else if (pendingDisposition) {
+      lines.push(
+        `Worker #${pendingDisposition.ticketNumber} r${pendingDisposition.attempt}: needs-disposition`,
+      );
+    }
+    return lines;
   }
 
   async function invokeCreateSpec(
@@ -688,11 +752,32 @@ export function createWorkflowCoordinator(
     }
 
     if (active.stage === "tickets-published") {
+      // While a worker runs, the passive panel owns progress.
+      if (activeWorker) {
+        return [];
+      }
+
+      // After success, offer the Implementation disposition Next action only.
+      if (pendingDisposition) {
+        return [
+          {
+            id: dispositionActionId(pendingDisposition.ticketNumber),
+            label: `Disposition #${pendingDisposition.ticketNumber}`,
+            description:
+              pendingDisposition.summary ??
+              "Close / Leave open / Investigate after the Implementation worker Stage result.",
+          },
+        ];
+      }
+
       const progress = await loadTicketProgress(bound, active);
       if (!progress) {
         return [];
       }
-      return [formatTicketProgressAction(progress)];
+
+      const actions: NextAction[] = progress.ready.map(formatImplementAction);
+      actions.push(formatTicketProgressAction(progress));
+      return actions;
     }
 
     return [];
@@ -711,11 +796,51 @@ export function createWorkflowCoordinator(
       return showTicketProgress();
     }
 
+    const implementTicket = parseImplementTicketActionId(actionId);
+    if (implementTicket !== undefined) {
+      return startImplementation(implementTicket);
+    }
+
+    const dispositionTicket = parseDispositionActionId(actionId);
+    if (dispositionTicket !== undefined) {
+      return presentPendingDisposition(dispositionTicket);
+    }
+
     return {
       status: "failed",
       stage: "create-spec",
       reason: `Unknown Next action "${actionId}".`,
     };
+  }
+
+  async function presentPendingDisposition(
+    ticketNumber: number,
+  ): Promise<StageResult> {
+    if (!pendingDisposition || pendingDisposition.ticketNumber !== ticketNumber) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `No pending Implementation disposition for #${ticketNumber}.`,
+        ticketNumber,
+      };
+    }
+
+    const current = pendingDisposition;
+    const result: StageResult = {
+      status: "needs-disposition",
+      stage: "implement",
+      workflowId: current.workflowId,
+      ticketNumber: current.ticketNumber,
+      attempt: current.attempt,
+      branchName: current.branchName,
+      worktreePath: current.worktreePath,
+      workerId: current.workerId,
+      dispositionOptions: [...IMPLEMENTATION_DISPOSITION_OPTIONS],
+    };
+    if (current.summary) {
+      result.summary = current.summary;
+    }
+    return result;
   }
 
   async function startCreateSpec(): Promise<StageResult> {
@@ -1081,6 +1206,418 @@ export function createWorkflowCoordinator(
     return loadTicketProgress(bound, active);
   }
 
+  async function startImplementation(ticketNumber: number): Promise<StageResult> {
+    const bound = await requireScoped();
+    const preflightResult = await preflight();
+    if (!preflightResult.ok) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason:
+          "Workflow preflight is incomplete. Resolve preflight checks before launching an Implementation worker.",
+        ticketNumber,
+      };
+    }
+
+    if (pending) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason:
+          "A Stage confirmation is already pending. Finish Create-spec or Create-tickets before launching an Implementation worker.",
+        ticketNumber,
+      };
+    }
+
+    if (pendingDisposition) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `An Implementation disposition is pending for #${pendingDisposition.ticketNumber}. Choose Close, Leave open, or Investigate before launching another worker.`,
+        ticketNumber,
+      };
+    }
+
+    if (activeWorker) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `An Implementation worker is already running for #${activeWorker.ticketNumber} (r${activeWorker.attempt}). The single-worker path does not launch concurrent workers.`,
+        ticketNumber,
+      };
+    }
+
+    const active = await loadActiveWorkflow(bound);
+    if (!active || active.stage !== "tickets-published") {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason:
+          "Implementation workers require an Active workflow with published tickets.",
+        ticketNumber,
+      };
+    }
+
+    const progress = await loadTicketProgress(bound, active);
+    const ready = progress?.ready.find((t) => t.number === ticketNumber);
+    if (!ready) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Ticket #${ticketNumber} is not on the ready frontier (open with no open blockers).`,
+        ticketNumber,
+      };
+    }
+
+    const workerProfile = await resolveWorkerProfile(bound);
+    if (!workerProfile) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason:
+          "Cannot launch an Implementation worker without a Worker profile.",
+        ticketNumber,
+      };
+    }
+
+    const prepared = await bound.skills.prepareImplement({
+      ticketNumber,
+      title: ready.title,
+    });
+    if (!prepared.ok) {
+      return {
+        status: "compatibility-recovery",
+        stage: "implement",
+        reason: prepared.reason,
+        ticketNumber,
+      };
+    }
+
+    const latest = await bound.workspace.latestAttempt(
+      active.workflowId,
+      ticketNumber,
+    );
+    const attempt = latest + 1;
+    const targetBranch = await resolveTargetBranch(bound.preferences);
+
+    let workspace: { branchName: string; worktreePath: string };
+    try {
+      workspace = await bound.workspace.createImplementationWorkspace({
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt,
+        baseRef: targetBranch,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Failed to create Implementation workspace: ${message}`,
+        ticketNumber,
+        attempt,
+      };
+    }
+
+    // Expected branch naming is a product rule; surface mismatches fail closed.
+    const expectedBranch = implementationBranchName(
+      active.workflowId,
+      ticketNumber,
+      attempt,
+    );
+    if (workspace.branchName !== expectedBranch) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Implementation workspace branch "${workspace.branchName}" does not match expected "${expectedBranch}".`,
+        ticketNumber,
+        attempt,
+      };
+    }
+
+    // Workspaces must live outside the Workflow root (sibling layout).
+    const resolvedRoot = path.resolve(selectedPath ?? "");
+    const resolvedWorktree = path.resolve(workspace.worktreePath);
+    if (
+      resolvedWorktree === resolvedRoot ||
+      resolvedWorktree.startsWith(`${resolvedRoot}${path.sep}`)
+    ) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Implementation workspace must live outside the Workflow root. Received "${workspace.worktreePath}" under "${resolvedRoot}".`,
+        ticketNumber,
+        attempt,
+      };
+    }
+
+    const workerId = `implement-${active.workflowId}-${ticketNumber}-r${attempt}`;
+    const worker: ActiveImplementationWorker = {
+      workerId,
+      workflowId: active.workflowId,
+      ticketNumber,
+      attempt,
+      branchName: workspace.branchName,
+      worktreePath: workspace.worktreePath,
+      status: "running",
+      receivedStageResult: false,
+    };
+    activeWorker = worker;
+
+    const transcriptKey = {
+      workflowId: active.workflowId,
+      ticketNumber,
+      attempt,
+    };
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "worker-launch",
+      workerId,
+      branchName: workspace.branchName,
+      worktreePath: workspace.worktreePath,
+      skillCommand: prepared.skillCommand,
+    });
+
+    const sink: WorkerEventSink = {
+      onEvent: (event) => handleWorkerEvent(bound, event),
+    };
+
+    try {
+      await bound.workers.launch(
+        {
+          workerId,
+          workflowId: active.workflowId,
+          ticketNumber,
+          attempt,
+          worktreePath: workspace.worktreePath,
+          branchName: workspace.branchName,
+          workerProfile: workerProfile.profile,
+          ticketTitle: ready.title,
+          prompt: prepared.prompt,
+          skillCommand: prepared.skillCommand,
+        },
+        sink,
+      );
+    } catch (error) {
+      activeWorker = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      await bound.transcripts.append(transcriptKey, {
+        type: "worker-launch-failed",
+        reason: message,
+      });
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Failed to launch Implementation worker: ${message}`,
+        ticketNumber,
+        attempt,
+      };
+    }
+
+    // Workers never touch the issue tracker — only the coordinator does, and
+    // launch leaves GitHub recoverable (no issue mutation on start).
+    return {
+      status: "running",
+      stage: "implement",
+      workflowId: active.workflowId,
+      ticketNumber,
+      attempt,
+      workerId,
+      branchName: workspace.branchName,
+      worktreePath: workspace.worktreePath,
+    };
+  }
+
+  async function handleWorkerEvent(
+    bound: RootScopedPorts,
+    event: WorkerProtocolEvent,
+  ): Promise<void> {
+    const worker =
+      activeWorker?.workerId === event.workerId
+        ? activeWorker
+        : pendingDisposition?.workerId === event.workerId
+          ? pendingDisposition
+          : undefined;
+    if (!worker) {
+      return;
+    }
+
+    const transcriptKey = {
+      workflowId: worker.workflowId,
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+    };
+    await bound.transcripts.append(transcriptKey, event);
+
+    if (event.type === "progress") {
+      if (activeWorker?.workerId === worker.workerId) {
+        worker.progress = event.message;
+      }
+      return;
+    }
+
+    if (event.type === "stage-result") {
+      // Stage results only apply to the running worker, not a pending disposition.
+      if (activeWorker?.workerId !== worker.workerId) {
+        return;
+      }
+      worker.receivedStageResult = true;
+      if (event.outcome.status === "completed") {
+        worker.status = "needs-disposition";
+        if (event.outcome.summary) {
+          worker.summary = event.outcome.summary;
+        }
+        pendingDisposition = worker;
+        activeWorker = undefined;
+        return;
+      }
+
+      worker.status = "failed";
+      activeWorker = undefined;
+      return;
+    }
+
+    // process-exit
+    if (worker.receivedStageResult) {
+      // Stage result already settled the attempt; keep disposition if pending.
+      return;
+    }
+
+    // Fail closed: agent settled without a Stage result.
+    worker.status = "compatibility-recovery";
+    if (activeWorker?.workerId === worker.workerId) {
+      activeWorker = undefined;
+    }
+    await bound.transcripts.append(transcriptKey, {
+      type: "compatibility-recovery",
+      reason:
+        "Implementation worker process exited without a Stage result on the Worker protocol.",
+      code: event.code,
+    });
+  }
+
+  async function confirmDisposition(
+    decision: ImplementationDispositionDecision,
+  ): Promise<StageResult> {
+    if (!pendingDisposition) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason:
+          "No pending Implementation disposition. Wait for a successful Implementation worker Stage result first.",
+      };
+    }
+
+    if (
+      decision !== "close" &&
+      decision !== "leave-open" &&
+      decision !== "investigate"
+    ) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Unknown Implementation disposition "${String(decision)}".`,
+      };
+    }
+
+    const current = pendingDisposition;
+    const bound = await requireScoped();
+    const transcriptKey = {
+      workflowId: current.workflowId,
+      ticketNumber: current.ticketNumber,
+      attempt: current.attempt,
+    };
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "disposition",
+      decision,
+    });
+
+    pendingDisposition = undefined;
+    current.status = "completed";
+
+    // Disposition never closes the GitHub ticket and never pushes.
+    // Close only marks the attempt ready for the Integration stage (later ticket).
+    return {
+      status: "completed",
+      stage: "implement",
+      workflowId: current.workflowId,
+      ticketNumber: current.ticketNumber,
+      attempt: current.attempt,
+      disposition: decision,
+      readyForIntegration: decision === "close",
+      branchName: current.branchName,
+      worktreePath: current.worktreePath,
+    };
+  }
+
+  async function abortWorkers(): Promise<void> {
+    const bound = scoped ?? (await requireScoped());
+    const worker = activeWorker;
+
+    try {
+      await bound.workers.abortAll();
+    } catch {
+      // Best-effort abort; session teardown still clears local worker state.
+    }
+
+    if (worker) {
+      worker.status = "aborted";
+      await bound.transcripts.append(
+        {
+          workflowId: worker.workflowId,
+          ticketNumber: worker.ticketNumber,
+          attempt: worker.attempt,
+        },
+        { type: "worker-aborted" },
+      );
+    }
+
+    // Clear session-owned worker state. GitHub tickets remain open/ready.
+    activeWorker = undefined;
+    // Pending disposition is a completed local attempt awaiting user choice;
+    // abort of running workers does not discard it.
+  }
+
+  async function getPanelState(): Promise<WorkflowPanelState | undefined> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (!active) return undefined;
+
+    const progress = await loadTicketProgress(bound, active);
+    const worker = activeWorker ?? pendingDisposition;
+    const workers = worker
+      ? [
+          {
+            ticketNumber: worker.ticketNumber,
+            attempt: worker.attempt,
+            status: worker.status,
+            branchName: worker.branchName,
+            ...(worker.progress ? { progress: worker.progress } : {}),
+          },
+        ]
+      : [];
+
+    const state: WorkflowPanelState = {
+      workflowId: active.workflowId,
+      lines: panelLines(active.workflowId, progress, worker),
+      workers,
+    };
+    if (progress) {
+      state.ticketProgress = progress;
+    }
+    return state;
+  }
+
+  async function getWorkerTranscript(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+  }): Promise<readonly unknown[]> {
+    const bound = await requireScoped();
+    return bound.transcripts.read(input);
+  }
+
   async function currentRoot(): Promise<WorkflowRoot> {
     return ensureSelected();
   }
@@ -1099,6 +1636,12 @@ export function createWorkflowCoordinator(
         `Path "${rootPath}" is not a discovered Workflow root. Choose a root from listRoots().`,
       );
     }
+
+    // Session-owned workers abort cleanly on Workflow-root switching.
+    if (scoped && selectedPath && path.resolve(selectedPath) !== resolved) {
+      await abortWorkers();
+    }
+
     bindRoot(match.path);
     return match;
   }
@@ -1168,5 +1711,9 @@ export function createWorkflowCoordinator(
     clearRootWorkerProfile,
     listAvailableModels,
     thinkingLevelsFor,
+    getPanelState,
+    confirmDisposition,
+    abortWorkers,
+    getWorkerTranscript,
   };
 }

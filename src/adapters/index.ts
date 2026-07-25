@@ -18,3 +18,9 @@ export {
   parseWorkflowManifestComment,
 } from "./tracker.js";
 export { createGitTopologyPort } from "./topology.js";
+export {
+  createWorkspacePort,
+  implementationWorktreePath,
+} from "./workspace.js";
+export { createWorkersPort } from "./workers.js";
+export { createTranscriptPort } from "./transcripts.js";

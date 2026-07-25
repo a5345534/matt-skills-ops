@@ -8,6 +8,9 @@
  * skills adapter invokes installed skills via a host without modifying skill
  * definitions, then Stage confirmation (Publish / Revise / Cancel) gates remote
  * publication through the coordinator.
+ *
+ * Implementation workers are session-owned: the WorkersPort and coordinator
+ * live for the Pi session and abort cleanly on session_shutdown.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,9 +21,13 @@ import {
   createPreferencesPort,
   createSkillsPort,
   createTrackerPort,
+  createTranscriptPort,
+  createWorkersPort,
+  createWorkspacePort,
   type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
+import type { WorkflowCoordinator } from "../src/types.js";
 import {
   captureCreateSpecDraft,
   captureCreateTicketsDraft,
@@ -29,9 +36,17 @@ import {
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-function createSkillsHost(ui: MattAutoUi): SkillsHost {
+function createSkillsHost(getUi: () => MattAutoUi | undefined): SkillsHost {
   return {
     async runCreateSpec() {
+      const ui = getUi();
+      if (!ui) {
+        return {
+          ok: false,
+          reason:
+            "Create-spec Planning host has no active UI. Retry from /matt-auto.",
+        };
+      }
       // Orchestration wrapper around installed to-spec:
       // capture a reviewable draft only — never publish (coordinator owns that).
       const draft = await captureCreateSpecDraft(ui);
@@ -46,6 +61,14 @@ function createSkillsHost(ui: MattAutoUi): SkillsHost {
     },
 
     async runCreateTickets(input) {
+      const ui = getUi();
+      if (!ui) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets Planning host has no active UI. Retry from /matt-auto.",
+        };
+      }
       // Orchestration wrapper around installed to-tickets:
       // capture a reviewable breakdown only — never publish (coordinator owns that).
       const draft = await captureCreateTicketsDraft(ui, input);
@@ -59,27 +82,6 @@ function createSkillsHost(ui: MattAutoUi): SkillsHost {
       return { ok: true, draft };
     },
   };
-}
-
-function createCoordinatorFor(
-  cwd: string,
-  modelRegistry: Parameters<typeof createModelsPort>[0],
-  ui: MattAutoUi,
-) {
-  const skillsHost = createSkillsHost(ui);
-  return createWorkflowCoordinator({
-    startPath: cwd,
-    topology: createGitTopologyPort(),
-    models: createModelsPort(modelRegistry),
-    forRoot(rootPath) {
-      return {
-        environment: createEnvironmentPort(rootPath),
-        skills: createSkillsPort(rootPath, skillsHost),
-        preferences: createPreferencesPort(rootPath),
-        tracker: createTrackerPort(rootPath),
-      };
-    },
-  });
 }
 
 function uiFrom(ctx: {
@@ -107,6 +109,67 @@ function uiFrom(ctx: {
 }
 
 export default function mattAutoExtension(pi: ExtensionAPI) {
+  // Session-scoped resources: workers and coordinator survive across commands.
+  const workers = createWorkersPort();
+  let activeUi: MattAutoUi | undefined;
+  let coordinator: WorkflowCoordinator | undefined;
+  let boundCwd: string | undefined;
+  let boundModelRegistry: Parameters<typeof createModelsPort>[0] | undefined;
+
+  const skillsHost = createSkillsHost(() => activeUi);
+
+  function ensureCoordinator(
+    cwd: string,
+    modelRegistry: Parameters<typeof createModelsPort>[0],
+    ui: MattAutoUi,
+  ): WorkflowCoordinator {
+    activeUi = ui;
+
+    const sameSession =
+      coordinator &&
+      boundCwd === cwd &&
+      boundModelRegistry === modelRegistry;
+    if (sameSession && coordinator) {
+      return coordinator;
+    }
+
+    // Cwd or model registry change: abort prior session-owned workers first.
+    if (coordinator) {
+      void coordinator.abortWorkers();
+    }
+
+    coordinator = createWorkflowCoordinator({
+      startPath: cwd,
+      topology: createGitTopologyPort(),
+      models: createModelsPort(modelRegistry),
+      forRoot(rootPath) {
+        return {
+          environment: createEnvironmentPort(rootPath),
+          skills: createSkillsPort(rootPath, skillsHost),
+          preferences: createPreferencesPort(rootPath),
+          tracker: createTrackerPort(rootPath),
+          workspace: createWorkspacePort(rootPath),
+          workers,
+          transcripts: createTranscriptPort(rootPath),
+        };
+      },
+    });
+    boundCwd = cwd;
+    boundModelRegistry = modelRegistry;
+    return coordinator;
+  }
+
+  pi.on("session_shutdown", async () => {
+    // Session-owned workers abort cleanly; GitHub state remains recoverable.
+    if (coordinator) {
+      await coordinator.abortWorkers();
+    }
+    coordinator = undefined;
+    boundCwd = undefined;
+    boundModelRegistry = undefined;
+    activeUi = undefined;
+  });
+
   pi.registerCommand("matt-auto", {
     description:
       "Matt Auto: stage-gated workflow menus and Next actions",
@@ -118,15 +181,15 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const subcommand = args.trim();
       const ui = uiFrom(ctx);
-      const coordinator = createCoordinatorFor(ctx.cwd, ctx.modelRegistry, ui);
+      const active = ensureCoordinator(ctx.cwd, ctx.modelRegistry, ui);
 
       if (subcommand === "" || subcommand === "menu") {
-        await presentMainMenu(coordinator, ui);
+        await presentMainMenu(active, ui);
         return;
       }
 
       if (subcommand === "next") {
-        await presentNextActions(coordinator, ui);
+        await presentNextActions(active, ui);
         return;
       }
 

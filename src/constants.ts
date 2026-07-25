@@ -67,3 +67,68 @@ export const TICKET_PROGRESS_ACTION = {
   description:
     "Show ready frontier and ticket progress for the Active workflow.",
 } as const;
+
+/** Prefix for Next actions that launch one ready ticket as an Implementation worker. */
+export const IMPLEMENT_TICKET_ACTION_PREFIX = "implement-ticket:" as const;
+
+/** Prefix for Next actions that resolve a pending Implementation disposition. */
+export const DISPOSITION_ACTION_PREFIX = "disposition:" as const;
+
+/** Implementation disposition choices after a successful worker Stage result. */
+export const IMPLEMENTATION_DISPOSITION_OPTIONS = [
+  "close",
+  "leave-open",
+  "investigate",
+] as const;
+
+/**
+ * Branch name for one Implementation workspace attempt.
+ * Format: matt-auto/<Workflow ID>/ticket-<n>/r<attempt>
+ */
+export function implementationBranchName(
+  workflowId: number,
+  ticketNumber: number,
+  attempt: number,
+): string {
+  return `matt-auto/${workflowId}/ticket-${ticketNumber}/r${attempt}`;
+}
+
+/** Build the Next action id for implementing one ready ticket. */
+export function implementTicketActionId(ticketNumber: number): string {
+  return `${IMPLEMENT_TICKET_ACTION_PREFIX}${ticketNumber}`;
+}
+
+/** Parse an implement-ticket Next action id. */
+export function parseImplementTicketActionId(
+  actionId: string,
+): number | undefined {
+  if (!actionId.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) {
+    return undefined;
+  }
+  const raw = actionId.slice(IMPLEMENT_TICKET_ACTION_PREFIX.length);
+  const number = Number(raw);
+  if (!Number.isInteger(number) || number <= 0) {
+    return undefined;
+  }
+  return number;
+}
+
+/** Build the Next action id for a pending Implementation disposition. */
+export function dispositionActionId(ticketNumber: number): string {
+  return `${DISPOSITION_ACTION_PREFIX}${ticketNumber}`;
+}
+
+/** Parse a disposition Next action id. */
+export function parseDispositionActionId(
+  actionId: string,
+): number | undefined {
+  if (!actionId.startsWith(DISPOSITION_ACTION_PREFIX)) {
+    return undefined;
+  }
+  const raw = actionId.slice(DISPOSITION_ACTION_PREFIX.length);
+  const number = Number(raw);
+  if (!Number.isInteger(number) || number <= 0) {
+    return undefined;
+  }
+  return number;
+}

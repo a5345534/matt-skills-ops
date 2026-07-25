@@ -1,5 +1,6 @@
 import type {
   AvailableModel,
+  ImplementationDispositionDecision,
   NextAction,
   PreflightCheck,
   PreflightResult,
@@ -12,6 +13,7 @@ import type {
   TicketsDraft,
   WorkerProfile,
   WorkflowCoordinator,
+  WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
 
@@ -51,6 +53,11 @@ const BACK_ITEM = "← Back";
 const PUBLISH_ITEM = "Publish";
 const REVISE_ITEM = "Revise";
 const CANCEL_ITEM = "Cancel";
+
+const DISPOSITION_CLOSE = "Close (start Integration later)";
+const DISPOSITION_LEAVE_OPEN = "Leave open";
+const DISPOSITION_INVESTIGATE = "Investigate";
+const PANEL_HEADER = "--- Workflow panel ---";
 
 const CREATE_SPEC_EDITOR_TITLE =
   "Create-spec draft (to-spec synthesis; Matt Auto publishes only after Stage confirmation)";
@@ -159,6 +166,11 @@ export function formatTicketProgressLines(
   ];
 }
 
+/** Compact passive Workflow panel lines (not an interactive dashboard). */
+export function formatPanelLines(panel: WorkflowPanelState): string[] {
+  return [...panel.lines];
+}
+
 /** Build bare `/matt-auto` menu lines from coordinator state. */
 export function buildMainMenuItems(
   preflight: PreflightResult,
@@ -166,6 +178,7 @@ export function buildMainMenuItems(
   currentRoot: WorkflowRoot,
   rootCount: number,
   ticketProgress?: TicketProgressSummary,
+  panel?: WorkflowPanelState,
 ): string[] {
   const nextLines =
     nextActions.length > 0
@@ -180,6 +193,10 @@ export function buildMainMenuItems(
     PREFLIGHT_HEADER,
     ...preflight.checks.map(formatCheckLine),
   ];
+
+  if (panel && panel.workers.length > 0) {
+    items.push(PANEL_HEADER, ...formatPanelLines(panel));
+  }
 
   if (ticketProgress) {
     items.push(TICKET_PROGRESS_HEADER, ...formatTicketProgressLines(ticketProgress));
@@ -214,12 +231,14 @@ export async function presentMainMenu(
     const preflight = await coordinator.preflight();
     const nextActions = await coordinator.nextActions();
     const ticketProgress = await coordinator.getTicketProgress();
+    const panel = await coordinator.getPanelState();
     const items = buildMainMenuItems(
       preflight,
       nextActions,
       currentRoot,
       roots.length,
       ticketProgress,
+      panel,
     );
     const selected = await ui.select("Matt Auto", items);
 
@@ -229,9 +248,14 @@ export async function presentMainMenu(
     if (
       selected.startsWith("Tickets:") ||
       selected.startsWith("Ready frontier:") ||
-      selected.startsWith("Blocked:")
+      selected.startsWith("Blocked:") ||
+      selected.startsWith("Workflow #") ||
+      selected.startsWith("Worker #")
     ) {
-      if (ticketProgress) {
+      // Passive panel / progress rows — show detail, no actions.
+      if (panel && (selected.startsWith("Workflow #") || selected.startsWith("Worker #"))) {
+        ui.notify(formatPanelLines(panel).join("\n"), "info");
+      } else if (ticketProgress) {
         ui.notify(formatTicketProgressLines(ticketProgress).join("\n"), "info");
       }
       continue;
@@ -286,7 +310,7 @@ export async function presentMainMenu(
   }
 }
 
-/** Run a Next action and drive Stage confirmation when required. */
+/** Run a Next action and drive Stage confirmation / disposition when required. */
 export async function handleNextAction(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
@@ -316,7 +340,68 @@ async function resolveStageResult(
     result = await coordinator.confirmStage(decision);
   }
 
+  if (result.status === "running" && result.stage === "implement") {
+    ui.notify(
+      [
+        `Implementation worker running for #${result.ticketNumber} (r${result.attempt}).`,
+        `Workspace: ${result.worktreePath}`,
+        `Branch: ${result.branchName}`,
+        "Watch the Workflow panel for progress. Disposition appears when the worker completes.",
+      ].join("\n"),
+      "info",
+    );
+    return result;
+  }
+
+  if (result.status === "needs-disposition") {
+    result = await resolveDisposition(coordinator, ui, result);
+  }
+
   return result;
+}
+
+async function resolveDisposition(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  pending: Extract<StageResult, { status: "needs-disposition" }>,
+): Promise<StageResult> {
+  const decision = await presentImplementationDisposition(ui, pending);
+  if (!decision) {
+    // Leaving the menu keeps the disposition pending for a later Next action refresh.
+    ui.notify(
+      `Implementation disposition for #${pending.ticketNumber} is still pending (Close / Leave open / Investigate).`,
+      "warning",
+    );
+    return pending;
+  }
+  return coordinator.confirmDisposition(decision);
+}
+
+/** Implementation disposition menu: Close / Leave open / Investigate. */
+export async function presentImplementationDisposition(
+  ui: MattAutoUi,
+  pending: {
+    ticketNumber: number;
+    attempt: number;
+    summary?: string;
+    branchName: string;
+  },
+): Promise<ImplementationDispositionDecision | undefined> {
+  const summary = pending.summary ? `\n${pending.summary}` : "";
+  ui.notify(
+    `Implementation disposition for #${pending.ticketNumber} (r${pending.attempt}) on ${pending.branchName}.${summary}\nClose starts Integration later and does not close the GitHub ticket yet.`,
+    "info",
+  );
+
+  const selected = await ui.select("Implementation disposition", [
+    DISPOSITION_CLOSE,
+    DISPOSITION_LEAVE_OPEN,
+    DISPOSITION_INVESTIGATE,
+  ]);
+  if (selected === DISPOSITION_CLOSE) return "close";
+  if (selected === DISPOSITION_LEAVE_OPEN) return "leave-open";
+  if (selected === DISPOSITION_INVESTIGATE) return "investigate";
+  return undefined;
 }
 
 /** Stage confirmation menu for Create-spec: Publish / Revise / Cancel. */
@@ -379,6 +464,17 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
         );
         return;
       }
+      if (result.stage === "implement") {
+        const disposition = result.disposition ?? "unknown";
+        const integration = result.readyForIntegration
+          ? " Marked ready for Integration (ticket remains open until Integration + CI succeed)."
+          : "";
+        ui.notify(
+          `Implementation disposition "${disposition}" for #${result.ticketNumber} (r${result.attempt}).${integration}`,
+          "info",
+        );
+        return;
+      }
       if (result.ticketProgress) {
         ui.notify(
           [
@@ -397,7 +493,7 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
       return;
     case "cancelled":
       ui.notify(
-        `${result.stage === "create-tickets" ? "Create-tickets" : "Create-spec"} cancelled. No remote publication was made.`,
+        `${result.stage === "create-tickets" ? "Create-tickets" : result.stage === "implement" ? "Implement" : "Create-spec"} cancelled. No remote publication was made.`,
         "info",
       );
       return;
@@ -409,6 +505,15 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
       return;
     case "failed":
       ui.notify(result.reason, "error");
+      return;
+    case "running":
+      // Already notified in resolveStageResult.
+      return;
+    case "needs-disposition":
+      ui.notify(
+        `Implementation #${result.ticketNumber} is waiting for disposition (Close / Leave open / Investigate).`,
+        "warning",
+      );
       return;
     case "needs-confirmation":
       // Should have been resolved by resolveStageResult.

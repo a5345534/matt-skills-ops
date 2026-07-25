@@ -101,8 +101,20 @@ When an Active workflow is in stage `spec-published`, Next actions include **Cre
 5. After publish, the coordinator computes the **ready frontier** from GitHub issue state (open tickets with no open blockers).
 6. Next actions and the Matt Auto menu show a **ticket-progress summary** (ready / open / closed + frontier).
 
-Implementation workers that launch frontier tickets land in later tickets.
+## Single Implementation worker path
+
+When tickets are published and the ready frontier is non-empty, Next actions include **Implement #N** for each ready ticket:
+
+1. Matt Auto creates an **Implementation workspace** outside the Workflow root (sibling `matt-auto-workspaces/…` worktree) on branch `matt-auto/<Workflow ID>/ticket-<n>/r<attempt>`.
+2. A **session-owned Implementation worker** runs `/implement` via the Matt skills adapter in that workspace (Worker profile model + thinking level).
+3. Progress streams over the **Worker protocol** (Pi JSON event stream → Stage results). The passive **Workflow panel** shows running status; it is not an interactive dashboard.
+4. A local **Worker transcript** is retained under `.pi/matt-auto/transcripts/` for the attempt.
+5. On success, **Implementation disposition** offers Close / Leave open / Investigate. **Close** marks work ready for Integration later and does **not** close the GitHub ticket yet.
+6. Workers only commit locally. The Workflow coordinator remains the only remote writer (launch/disposition/abort perform no GitHub mutations).
+7. Shutdown, reload, or Workflow-root switching **aborts** the worker cleanly; GitHub tickets stay open/ready for retry.
+
+Frontier multi-select, concurrency, and Integration units land in later tickets.
 
 ## Status
 
-Tickets #2–#6 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, and frontier discovery. Implementation workers, integration, CI, and Workflow PR land in later tickets.
+Tickets #2–#7 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, frontier discovery, and the single Implementation worker path (panel, transcript, disposition). Multi-worker concurrency, integration, CI, and Workflow PR land in later tickets.

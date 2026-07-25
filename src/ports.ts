@@ -4,6 +4,7 @@ import type {
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
+  WorkerProtocolEvent,
   WorkflowManifest,
 } from "./types.js";
 
@@ -59,6 +60,109 @@ export type SkillsPort = {
     workflowId: number;
     title?: string;
   }): Promise<CreateTicketsSkillOutcome>;
+  /**
+   * Prepare an Implementation worker invocation for the installed `implement` skill.
+   * Returns the prompt/command the worker process should run in the Implementation workspace.
+   * Does not start a process and does not modify skill definitions.
+   */
+  prepareImplement(input: {
+    ticketNumber: number;
+    title: string;
+  }): Promise<PrepareImplementOutcome>;
+};
+
+/** Outcome of preparing the installed `implement` skill for a worker. */
+export type PrepareImplementOutcome =
+  | {
+      ok: true;
+      /** Slash command / skill entrypoint, e.g. `/implement`. */
+      skillCommand: string;
+      /** Full prompt delivered to the worker process. */
+      prompt: string;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Local Implementation workspace (branch + worktree) operations.
+ * System boundary: git worktree/branch layout outside the Workflow root.
+ * Never pushes remotes — workers and workspace setup stay local.
+ */
+export type WorkspacePort = {
+  /**
+   * Create an isolated Implementation workspace as a sibling of the Workflow root.
+   * Branch: matt-auto/<Workflow ID>/ticket-<n>/r<attempt>
+   */
+  createImplementationWorkspace(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    /** Base ref to branch from (Target branch until an Integration branch exists). */
+    baseRef: string;
+  }): Promise<{ branchName: string; worktreePath: string }>;
+  /**
+   * Highest existing attempt number for a ticket under this Workflow ID, or 0 if none.
+   */
+  latestAttempt(workflowId: number, ticketNumber: number): Promise<number>;
+};
+
+/** Launch parameters for one session-owned Implementation worker. */
+export type WorkerLaunchInput = {
+  workerId: string;
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  worktreePath: string;
+  branchName: string;
+  workerProfile: WorkerProfile;
+  ticketTitle: string;
+  /** Prompt produced by the Matt skills adapter for `/implement`. */
+  prompt: string;
+  skillCommand: string;
+};
+
+/**
+ * Sink for Worker protocol events mapped from the worker's Pi JSON event stream.
+ * The Workflow coordinator processes Stage results and progress; the sink carries
+ * no GitHub mutation authority.
+ */
+export type WorkerEventSink = {
+  onEvent(event: WorkerProtocolEvent): void | Promise<void>;
+};
+
+/**
+ * Session-owned Implementation worker processes.
+ * System boundary: Pi child process / JSON event stream.
+ * Workers only modify, test, and commit inside local worktrees.
+ */
+export type WorkersPort = {
+  /**
+   * Start a session-owned Implementation worker that runs `/implement` in the workspace.
+   * Lifetime is bound to Workflow home; abort on shutdown/reload/root switch.
+   */
+  launch(input: WorkerLaunchInput, sink: WorkerEventSink): Promise<void>;
+  /** Abort one worker cleanly. */
+  abort(workerId: string): Promise<void>;
+  /** Abort all workers owned by this session. */
+  abortAll(): Promise<void>;
+};
+
+/** Key for a retained Worker transcript attempt. */
+export type TranscriptKey = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+};
+
+/**
+ * Local Worker transcript storage.
+ * System boundary: rebuildable Matt Auto run storage under `.pi/matt-auto/`.
+ * Transcripts are local and uncommitted; never published to GitHub.
+ */
+export type TranscriptPort = {
+  /** Append one structured JSON event for a Worker attempt. */
+  append(key: TranscriptKey, event: unknown): Promise<void>;
+  /** Read retained transcript events for an attempt (empty when none). */
+  read(key: TranscriptKey): Promise<readonly unknown[]>;
 };
 
 /**
@@ -198,6 +302,9 @@ export type RootScopedPorts = {
   skills: SkillsPort;
   preferences: PreferencesPort;
   tracker: TrackerPort;
+  workspace: WorkspacePort;
+  workers: WorkersPort;
+  transcripts: TranscriptPort;
 };
 
 /** Ports injected into the Workflow coordinator. */

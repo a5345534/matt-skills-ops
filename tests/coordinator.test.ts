@@ -9,10 +9,16 @@ import type {
   ModelsPort,
   NestedGitRepository,
   PreferencesPort,
+  PrepareImplementOutcome,
   RootScopedPorts,
   SkillsPort,
   TrackerPort,
   TrackerTicket,
+  TranscriptPort,
+  WorkerEventSink,
+  WorkerLaunchInput,
+  WorkersPort,
+  WorkspacePort,
   WorkflowCoordinatorPorts,
 } from "../src/ports.js";
 import type {
@@ -21,12 +27,16 @@ import type {
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
+  WorkerProtocolEvent,
   WorkflowManifest,
 } from "../src/types.js";
 import {
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
+  IMPLEMENTATION_DISPOSITION_OPTIONS,
+  implementTicketActionId,
+  implementationBranchName,
   NO_GIT_REPOSITORY_REASON,
   REQUIRED_MATT_SKILLS,
   SPEC_ISSUE_LABEL,
@@ -82,8 +92,14 @@ type SkillsFixture = {
   createSpecOutcomes?: CreateSpecSkillOutcome[];
   /** Sequential outcomes for runCreateTickets (last value repeats). */
   createTicketsOutcomes?: CreateTicketsSkillOutcome[];
+  /** prepareImplement outcome override. */
+  prepareImplementOutcome?: PrepareImplementOutcome;
   /** Invocations recorded for assertions. */
-  calls?: { runCreateSpec: number; runCreateTickets: number };
+  calls?: {
+    runCreateSpec: number;
+    runCreateTickets: number;
+    prepareImplement?: number;
+  };
 };
 
 function createSkills(fixture: SkillsFixture = {}): SkillsPort {
@@ -96,7 +112,20 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
   ];
   let specIndex = 0;
   let ticketsIndex = 0;
-  const calls = fixture.calls ?? { runCreateSpec: 0, runCreateTickets: 0 };
+  const calls = fixture.calls ?? {
+    runCreateSpec: 0,
+    runCreateTickets: 0,
+    prepareImplement: 0,
+  };
+  // Older fixtures may omit prepareImplement on the calls bag.
+  const callBag = calls as {
+    runCreateSpec: number;
+    runCreateTickets: number;
+    prepareImplement?: number;
+  };
+  if (callBag.prepareImplement === undefined) {
+    callBag.prepareImplement = 0;
+  }
 
   return {
     installedSkillNames: async () => names,
@@ -125,6 +154,167 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
         };
       }
       return outcome;
+    },
+    prepareImplement: async (input) => {
+      callBag.prepareImplement = (callBag.prepareImplement ?? 0) + 1;
+      if (fixture.prepareImplementOutcome) {
+        return fixture.prepareImplementOutcome;
+      }
+      if (!names.includes("implement")) {
+        return {
+          ok: false,
+          reason: "Installed skill implement is missing.",
+        };
+      }
+      return {
+        ok: true,
+        skillCommand: "/implement",
+        prompt: `/implement\n\nImplement #${input.ticketNumber}: ${input.title}`,
+      };
+    },
+  };
+}
+
+type WorkspaceState = {
+  creates: Array<{
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    baseRef: string;
+    branchName: string;
+    worktreePath: string;
+  }>;
+  attempts: Map<string, number>;
+  failCreate?: boolean;
+};
+
+function createWorkspace(
+  workflowRoot = "/repo",
+  initial: { attempts?: Map<string, number>; failCreate?: boolean } = {},
+): { port: WorkspacePort; state: WorkspaceState } {
+  const state: WorkspaceState = {
+    creates: [],
+    attempts: initial.attempts ?? new Map(),
+    ...(initial.failCreate !== undefined
+      ? { failCreate: initial.failCreate }
+      : {}),
+  };
+
+  const port: WorkspacePort = {
+    latestAttempt: async (workflowId, ticketNumber) => {
+      return state.attempts.get(`${workflowId}:${ticketNumber}`) ?? 0;
+    },
+    createImplementationWorkspace: async (input) => {
+      if (state.failCreate) {
+        throw new Error("worktree create failed");
+      }
+      const branchName = implementationBranchName(
+        input.workflowId,
+        input.ticketNumber,
+        input.attempt,
+      );
+      // Sibling of Workflow root — outside the root path.
+      const worktreePath = path.join(
+        path.dirname(workflowRoot),
+        "matt-auto-workspaces",
+        String(input.workflowId),
+        `ticket-${input.ticketNumber}`,
+        `r${input.attempt}`,
+      );
+      state.creates.push({
+        ...input,
+        branchName,
+        worktreePath,
+      });
+      state.attempts.set(
+        `${input.workflowId}:${input.ticketNumber}`,
+        input.attempt,
+      );
+      return { branchName, worktreePath };
+    },
+  };
+
+  return { port, state };
+}
+
+type WorkersState = {
+  launches: WorkerLaunchInput[];
+  aborts: string[];
+  abortAllCount: number;
+  sinks: Map<string, WorkerEventSink>;
+  failLaunch?: boolean;
+};
+
+function createWorkers(
+  initial: { failLaunch?: boolean } = {},
+): {
+  port: WorkersPort;
+  state: WorkersState;
+  emit: (workerId: string, event: WorkerProtocolEvent) => Promise<void>;
+} {
+  const state: WorkersState = {
+    launches: [],
+    aborts: [],
+    abortAllCount: 0,
+    sinks: new Map(),
+    ...(initial.failLaunch !== undefined
+      ? { failLaunch: initial.failLaunch }
+      : {}),
+  };
+
+  const port: WorkersPort = {
+    launch: async (input, sink) => {
+      if (state.failLaunch) {
+        throw new Error("worker launch failed");
+      }
+      state.launches.push(input);
+      state.sinks.set(input.workerId, sink);
+    },
+    abort: async (workerId) => {
+      state.aborts.push(workerId);
+    },
+    abortAll: async () => {
+      state.abortAllCount += 1;
+      for (const id of state.sinks.keys()) {
+        state.aborts.push(id);
+      }
+    },
+  };
+
+  return {
+    port,
+    state,
+    emit: async (workerId, event) => {
+      const sink = state.sinks.get(workerId);
+      if (!sink) {
+        throw new Error(`No sink for worker ${workerId}`);
+      }
+      await sink.onEvent(event);
+    },
+  };
+}
+
+function createTranscripts(): {
+  port: TranscriptPort;
+  state: Map<string, unknown[]>;
+} {
+  const state = new Map<string, unknown[]>();
+  const keyOf = (key: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+  }) => `${key.workflowId}:${key.ticketNumber}:r${key.attempt}`;
+
+  return {
+    state,
+    port: {
+      append: async (key, event) => {
+        const k = keyOf(key);
+        const list = state.get(k) ?? [];
+        list.push(event);
+        state.set(k, list);
+      },
+      read: async (key) => state.get(keyOf(key)) ?? [],
     },
   };
 }
@@ -362,6 +552,9 @@ type RootFixture = {
   skillNames?: readonly string[];
   preferences?: PrefState;
   tracker?: ReturnType<typeof createTracker>;
+  workspace?: ReturnType<typeof createWorkspace>;
+  workers?: ReturnType<typeof createWorkers>;
+  transcripts?: ReturnType<typeof createTranscripts>;
 };
 
 function createTopology(
@@ -391,6 +584,9 @@ function createPorts(
 ): WorkflowCoordinatorPorts & {
   /** Default-root tracker state when the fixture provided one. */
   __defaultTracker?: ReturnType<typeof createTracker>;
+  __defaultWorkspace?: ReturnType<typeof createWorkspace>;
+  __defaultWorkers?: ReturnType<typeof createWorkers>;
+  __defaultTranscripts?: ReturnType<typeof createTranscripts>;
 } {
   const startPath = overrides.startPath ?? "/repo";
   const defaultRoot: RootFixture = overrides.defaultRoot ?? {
@@ -398,12 +594,18 @@ function createPorts(
   };
   const roots = overrides.roots ?? {};
   const defaultTracker = defaultRoot.tracker ?? createTracker();
+  const defaultWorkspace = defaultRoot.workspace ?? createWorkspace("/repo");
+  const defaultWorkers = defaultRoot.workers ?? createWorkers();
+  const defaultTranscripts = defaultRoot.transcripts ?? createTranscripts();
 
   return {
     startPath,
     topology: overrides.topology ?? createTopology({ nearest: "/repo" }),
     models: overrides.models ?? createModels(),
     __defaultTracker: defaultTracker,
+    __defaultWorkspace: defaultWorkspace,
+    __defaultWorkers: defaultWorkers,
+    __defaultTranscripts: defaultTranscripts,
     forRoot(rootPath: string): RootScopedPorts {
       const fixture = roots[rootPath] ?? defaultRoot;
       const skillsFixture: SkillsFixture = fixture.skills
@@ -412,6 +614,17 @@ function createPorts(
           ? { names: fixture.skillNames }
           : {};
       const tracker = fixture.tracker ?? defaultTracker;
+      const workspace =
+        fixture.workspace ??
+        (fixture === defaultRoot
+          ? defaultWorkspace
+          : createWorkspace(rootPath));
+      const workers =
+        fixture.workers ??
+        (fixture === defaultRoot ? defaultWorkers : createWorkers());
+      const transcripts =
+        fixture.transcripts ??
+        (fixture === defaultRoot ? defaultTranscripts : createTranscripts());
       return {
         environment: createEnvironment(fixture.environment),
         skills: createSkills(skillsFixture),
@@ -421,6 +634,9 @@ function createPorts(
           },
         ),
         tracker: tracker.port,
+        workspace: workspace.port,
+        workers: workers.port,
+        transcripts: transcripts.port,
       };
     },
   };
@@ -1586,11 +1802,16 @@ describe("Workflow coordinator Create-tickets Planning stage", () => {
     await coordinator.confirmStage("publish");
 
     const actions = await coordinator.nextActions();
-    expect(actions).toHaveLength(1);
-    expect(actions[0]?.id).toBe(TICKET_PROGRESS_ACTION.id);
-    expect(actions[0]?.label).toMatch(/2 ready \/ 3 open \/ 0 closed/);
-    expect(actions[0]?.description).toMatch(/#43/);
-    expect(actions[0]?.description).toMatch(/#44/);
+    // Ready tickets become Implement actions; progress summary remains available.
+    expect(actions.map((a) => a.id)).toEqual([
+      implementTicketActionId(43),
+      implementTicketActionId(44),
+      TICKET_PROGRESS_ACTION.id,
+    ]);
+    const progressAction = actions.find((a) => a.id === TICKET_PROGRESS_ACTION.id);
+    expect(progressAction?.label).toMatch(/2 ready \/ 3 open \/ 0 closed/);
+    expect(progressAction?.description).toMatch(/#43/);
+    expect(progressAction?.description).toMatch(/#44/);
 
     const viewed = await coordinator.runNextAction(TICKET_PROGRESS_ACTION.id);
     expect(viewed.status).toBe("completed");
@@ -1803,5 +2024,432 @@ describe("Workflow coordinator Create-tickets Planning stage", () => {
     const actions = await coordinator.nextActions();
     expect(actions.map((a) => a.id)).toEqual([CREATE_TICKETS_ACTION.id]);
     expect(actions.some((a) => /worker|implement/i.test(a.id))).toBe(false);
+  });
+});
+
+describe("Workflow coordinator single Implementation worker path", () => {
+  function ticketsPublishedFixture() {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "tickets-published",
+        workerProfile: defaultWorkerProfile,
+        title: "Existing spec",
+        tickets: [43, 44, 45],
+      },
+      tickets: [
+        { number: 43, title: "Ship core path", blockedBy: [] },
+        { number: 44, title: "Ship parallel path", blockedBy: [] },
+        { number: 45, title: "Ship dependent path", blockedBy: [43] },
+      ],
+    });
+    const workspace = createWorkspace("/repo");
+    const workers = createWorkers();
+    const transcripts = createTranscripts();
+    const skillsCalls = {
+      runCreateSpec: 0,
+      runCreateTickets: 0,
+      prepareImplement: 0,
+    };
+    const ports = createPorts({
+      defaultRoot: {
+        preferences: { globalWorkerProfile: defaultWorkerProfile },
+        tracker,
+        workspace,
+        workers,
+        transcripts,
+        skills: { calls: skillsCalls },
+      },
+    });
+    const coordinator = createWorkflowCoordinator(ports);
+    return {
+      coordinator,
+      tracker,
+      workspace,
+      workers,
+      transcripts,
+      skillsCalls,
+    };
+  }
+
+  it("offers Implement Next actions for each ready frontier ticket", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([
+      implementTicketActionId(43),
+      implementTicketActionId(44),
+      TICKET_PROGRESS_ACTION.id,
+    ]);
+    expect(actions[0]).toMatchObject({
+      label: "Implement #43",
+      description: expect.stringContaining("Ship core path"),
+    });
+    // Blocked ticket is not offered.
+    expect(actions.some((a) => a.id === implementTicketActionId(45))).toBe(
+      false,
+    );
+  });
+
+  it("creates an Implementation workspace outside the Workflow root with agreed branch naming and launches a session-owned worker via /implement", async () => {
+    const { coordinator, workspace, workers, skillsCalls, tracker } =
+      ticketsPublishedFixture();
+    const remoteWritesBefore = {
+      create: tracker.state.createIssueCalls,
+      manifest: tracker.state.writeManifestCalls,
+      blockedBy: tracker.state.addBlockedByCalls.length,
+    };
+
+    const result = await coordinator.runNextAction(implementTicketActionId(43));
+
+    expect(result).toEqual({
+      status: "running",
+      stage: "implement",
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+      workerId: "implement-42-43-r1",
+      branchName: "matt-auto/42/ticket-43/r1",
+      worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
+    });
+
+    expect(workspace.state.creates).toEqual([
+      {
+        workflowId: 42,
+        ticketNumber: 43,
+        attempt: 1,
+        baseRef: DEFAULT_TARGET_BRANCH,
+        branchName: "matt-auto/42/ticket-43/r1",
+        worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
+      },
+    ]);
+    // Outside Workflow root /repo
+    expect(workspace.state.creates[0]?.worktreePath.startsWith("/repo")).toBe(
+      false,
+    );
+
+    expect(skillsCalls.prepareImplement).toBe(1);
+    expect(workers.state.launches).toHaveLength(1);
+    expect(workers.state.launches[0]).toMatchObject({
+      workerId: "implement-42-43-r1",
+      worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
+      branchName: "matt-auto/42/ticket-43/r1",
+      skillCommand: "/implement",
+      workerProfile: defaultWorkerProfile,
+      ticketTitle: "Ship core path",
+    });
+    expect(workers.state.launches[0]?.prompt).toMatch(/\/implement/);
+    expect(workers.state.launches[0]?.prompt).toMatch(/#43/);
+
+    // Workers / launch path must not mutate GitHub.
+    expect(tracker.state.createIssueCalls).toBe(remoteWritesBefore.create);
+    expect(tracker.state.writeManifestCalls).toBe(remoteWritesBefore.manifest);
+    expect(tracker.state.addBlockedByCalls).toHaveLength(
+      remoteWritesBefore.blockedBy,
+    );
+  });
+
+  it("shows running progress on the passive Workflow panel and retains the Worker transcript", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "progress",
+      workerId: "implement-42-43-r1",
+      message: "Running tests",
+    });
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workflowId).toBe(42);
+    expect(panel?.workers).toEqual([
+      {
+        ticketNumber: 43,
+        attempt: 1,
+        status: "running",
+        progress: "Running tests",
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+    expect(panel?.lines.some((l) => /Worker #43 r1: running/.test(l))).toBe(
+      true,
+    );
+    expect(panel?.lines.some((l) => /Running tests/.test(l))).toBe(true);
+    // Passive: panel is a summary, not an interactive action menu.
+    expect(panel?.lines.join("\n")).not.toMatch(/\[x\]|click|button/i);
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript[0]).toMatchObject({ type: "worker-launch" });
+    expect(transcript).toContainEqual({
+      type: "progress",
+      workerId: "implement-42-43-r1",
+      message: "Running tests",
+    });
+
+    // No Next actions while the worker runs — panel owns progress.
+    await expect(coordinator.nextActions()).resolves.toEqual([]);
+  });
+
+  it("receives Stage results over the Worker protocol and offers Implementation disposition", async () => {
+    const { coordinator, workers, tracker } = ticketsPublishedFixture();
+    const writesBefore = tracker.state.writeManifestCalls;
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: {
+        status: "completed",
+        summary: "Core path implemented",
+        localCommitSha: "abc123",
+      },
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workers[0]?.status).toBe("needs-disposition");
+
+    // Still no remote writes from the worker path.
+    expect(tracker.state.writeManifestCalls).toBe(writesBefore);
+    expect(tracker.state.createIssueCalls).toBe(0);
+
+    // Disposition is pending — offered as the only Next action.
+    const actions = await coordinator.nextActions();
+    expect(actions).toEqual([
+      {
+        id: `disposition:43`,
+        label: "Disposition #43",
+        description: "Core path implemented",
+      },
+    ]);
+
+    const needsDisposition = await coordinator.runNextAction("disposition:43");
+    expect(needsDisposition.status).toBe("needs-disposition");
+    if (needsDisposition.status === "needs-disposition") {
+      expect(needsDisposition.dispositionOptions).toEqual([
+        "close",
+        "leave-open",
+        "investigate",
+      ]);
+    }
+
+    const closed = await coordinator.confirmDisposition("close");
+    expect(closed).toEqual({
+      status: "completed",
+      stage: "implement",
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+      disposition: "close",
+      readyForIntegration: true,
+      branchName: "matt-auto/42/ticket-43/r1",
+      worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
+    });
+
+    // Close does not close the GitHub ticket (Integration lands later).
+    const ticket = tracker.state.issues.find((i) => i.number === 43);
+    expect(ticket?.state).toBe("OPEN");
+    expect(tracker.state.writeManifestCalls).toBe(writesBefore);
+  });
+
+  it("supports Leave open and Investigate dispositions without remote writes", async () => {
+    const { coordinator, workers, tracker } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(44));
+    await workers.emit("implement-42-44-r1", {
+      type: "stage-result",
+      workerId: "implement-42-44-r1",
+      outcome: { status: "completed", summary: "Parallel done" },
+    });
+
+    const leftOpen = await coordinator.confirmDisposition("leave-open");
+    expect(leftOpen).toMatchObject({
+      status: "completed",
+      disposition: "leave-open",
+      readyForIntegration: false,
+      ticketNumber: 44,
+    });
+    expect(tracker.state.issues.find((i) => i.number === 44)?.state).toBe("OPEN");
+
+    // Launch again (r2) for investigate path.
+    await coordinator.runNextAction(implementTicketActionId(44));
+    await workers.emit("implement-42-44-r2", {
+      type: "stage-result",
+      workerId: "implement-42-44-r2",
+      outcome: { status: "completed" },
+    });
+
+    const investigated = await coordinator.confirmDisposition("investigate");
+    expect(investigated).toMatchObject({
+      status: "completed",
+      disposition: "investigate",
+      readyForIntegration: false,
+      attempt: 2,
+    });
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 44,
+      attempt: 2,
+    });
+    expect(transcript).toContainEqual({
+      type: "disposition",
+      decision: "investigate",
+    });
+
+    expect(IMPLEMENTATION_DISPOSITION_OPTIONS).toEqual([
+      "close",
+      "leave-open",
+      "investigate",
+    ]);
+  });
+
+  it("enters Compatibility recovery when the worker exits without a Stage result", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(
+      transcript.some(
+        (e) =>
+          typeof e === "object" &&
+          e !== null &&
+          (e as { type?: string }).type === "compatibility-recovery",
+      ),
+    ).toBe(true);
+
+    // Recoverable: ticket remains ready and can be launched again.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toContain(implementTicketActionId(43));
+  });
+
+  it("aborts the session-owned worker cleanly and leaves GitHub state recoverable", async () => {
+    const { coordinator, workers, tracker } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.abortWorkers();
+
+    expect(workers.state.abortAllCount).toBe(1);
+    expect(workers.state.aborts).toContain("implement-42-43-r1");
+
+    // GitHub ticket still open and ready.
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+    const progress = await coordinator.getTicketProgress();
+    expect(progress?.ready.map((t) => t.number)).toContain(43);
+
+    // Can relaunch after abort (attempt 2).
+    const relaunch = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    expect(relaunch).toMatchObject({
+      status: "running",
+      attempt: 2,
+      branchName: "matt-auto/42/ticket-43/r2",
+    });
+  });
+
+  it("aborts workers when switching Workflow root", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "tickets-published",
+        workerProfile: defaultWorkerProfile,
+        tickets: [43],
+      },
+      tickets: [{ number: 43, title: "Only", blockedBy: [] }],
+    });
+    const workers = createWorkers();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        startPath: "/workspace",
+        topology: createTopology({
+          nearest: "/workspace",
+          nested: [{ path: "/workspace/services/api", isSubmodule: false }],
+        }),
+        roots: {
+          "/workspace": {
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
+            tracker,
+            workers,
+            workspace: createWorkspace("/workspace"),
+            transcripts: createTranscripts(),
+          },
+          "/workspace/services/api": {
+            preferences: { globalWorkerProfile: defaultWorkerProfile },
+            workspace: createWorkspace("/workspace/services/api"),
+            workers: createWorkers(),
+            transcripts: createTranscripts(),
+          },
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.selectRoot("/workspace/services/api");
+
+    expect(workers.state.abortAllCount).toBe(1);
+  });
+
+  it("fails closed when launching a ticket that is not on the ready frontier", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    const result = await coordinator.runNextAction(implementTicketActionId(45));
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/ready frontier/i);
+    }
+    expect(workers.state.launches).toHaveLength(0);
+  });
+
+  it("rejects a second concurrent launch on the single-worker path", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    const second = await coordinator.runNextAction(implementTicketActionId(44));
+
+    expect(second.status).toBe("failed");
+    if (second.status === "failed") {
+      expect(second.reason).toMatch(/already running/i);
+    }
+  });
+
+  it("numbers rework attempts without reusing a completed workspace identity", async () => {
+    const { coordinator, workers, workspace } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed" },
+    });
+    await coordinator.confirmDisposition("leave-open");
+
+    const second = await coordinator.runNextAction(implementTicketActionId(43));
+    expect(second).toMatchObject({
+      status: "running",
+      attempt: 2,
+      branchName: "matt-auto/42/ticket-43/r2",
+      worktreePath: "/matt-auto-workspaces/42/ticket-43/r2",
+    });
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 2]);
   });
 });

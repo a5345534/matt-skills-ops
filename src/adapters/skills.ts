@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
   CreateSpecSkillOutcome,
   CreateTicketsSkillOutcome,
+  PrepareImplementOutcome,
   SkillsPort,
 } from "../ports.js";
 
@@ -11,6 +12,9 @@ import type {
  * Optional host that performs Create-spec / Create-tickets skill invocation.
  * The adapter discovers installed skills and delegates invocation without
  * modifying skill definitions. When omitted, run methods fail closed.
+ *
+ * `prepareImplement` is optional; the adapter can build a default `/implement`
+ * prompt when the skill is installed.
  */
 export type SkillsHost = {
   runCreateSpec?(): Promise<CreateSpecSkillOutcome>;
@@ -18,6 +22,10 @@ export type SkillsHost = {
     workflowId: number;
     title?: string;
   }): Promise<CreateTicketsSkillOutcome>;
+  prepareImplement?(input: {
+    ticketNumber: number;
+    title: string;
+  }): Promise<PrepareImplementOutcome>;
 };
 
 /** @deprecated Prefer SkillsHost; kept for existing Create-spec wiring. */
@@ -139,6 +147,38 @@ export function createSkillsPort(
 
       // Host invokes the installed skill capability; definitions stay untouched.
       return ticketsHost.runCreateTickets(input);
+    },
+
+    async prepareImplement(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("implement")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill implement is missing. Install it into a Pi skill location and retry Implementation.",
+        };
+      }
+
+      const implementHost = host as SkillsHost | undefined;
+      if (implementHost?.prepareImplement) {
+        // Host may customize the worker prompt; skill definitions stay untouched.
+        return implementHost.prepareImplement(input);
+      }
+
+      // Default orchestration wrapper: run /implement for the ticket in the worker.
+      return {
+        ok: true,
+        skillCommand: "/implement",
+        prompt: [
+          `/implement`,
+          "",
+          `Implement GitHub issue #${input.ticketNumber}: ${input.title}`,
+          "",
+          "Work only in this Implementation workspace. Commit locally when done.",
+          "Do not push, edit GitHub issues, or mutate remote workflow state.",
+          "When finished, emit a Stage result on the Worker protocol (completed or failed).",
+        ].join("\n"),
+      };
     },
   };
 }
