@@ -31,6 +31,23 @@ export function parseIssueNumberFromCreateOutput(
   return Number.isInteger(number) && number > 0 ? number : undefined;
 }
 
+/**
+ * Parse `gh pr create` stdout. Older gh (e.g. 2.45) does not support
+ * `gh pr create --json` and prints only the PR URL:
+ *   https://github.com/owner/repo/pull/13
+ */
+export function parsePullRequestFromCreateOutput(stdout: string):
+  | { number: number; url: string }
+  | undefined {
+  const match = stdout.match(
+    /(https?:\/\/[^\s]+\/pull\/(\d+))\b/,
+  );
+  if (!match?.[1] || !match[2]) return undefined;
+  const number = Number(match[2]);
+  if (!Number.isInteger(number) || number <= 0) return undefined;
+  return { number, url: match[1] };
+}
+
 async function run(
   cwd: string,
   command: string,
@@ -632,39 +649,40 @@ export function createTrackerPort(cwd: string): TrackerPort {
     },
 
     async createPullRequest(input) {
-      const result = await run(cwd, "gh", [
-        "pr",
-        "create",
-        "--base",
-        input.base,
-        "--head",
-        input.head,
-        "--title",
-        input.title,
-        "--body",
-        input.body,
-        "--json",
-        "number,url",
-      ]);
-      if (result.code !== 0) {
-        throw new Error(
-          result.stderr.trim() ||
-            `gh pr create failed with exit code ${result.code}`,
-        );
-      }
-      let parsed: { number?: number; url?: string };
+      // Older gh (e.g. 2.45) does not support `gh pr create --json`.
+      // Write body via file and parse the PR URL from stdout.
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "matt-auto-pr-"));
+      const bodyFile = path.join(tmpDir, "body.md");
       try {
-        parsed = JSON.parse(result.stdout) as { number?: number; url?: string };
-      } catch {
-        throw new Error("gh pr create returned non-JSON output.");
+        await writeFile(bodyFile, input.body, "utf8");
+        const result = await run(cwd, "gh", [
+          "pr",
+          "create",
+          "--base",
+          input.base,
+          "--head",
+          input.head,
+          "--title",
+          input.title,
+          "--body-file",
+          bodyFile,
+        ]);
+        if (result.code !== 0) {
+          throw new Error(
+            result.stderr.trim() ||
+              `gh pr create failed with exit code ${result.code}`,
+          );
+        }
+        const parsed = parsePullRequestFromCreateOutput(result.stdout);
+        if (!parsed) {
+          throw new Error(
+            `gh pr create did not return a recognizable pull request URL. Output: ${result.stdout.trim()}`,
+          );
+        }
+        return { number: parsed.number, url: parsed.url };
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
       }
-      if (typeof parsed.number !== "number") {
-        throw new Error("gh pr create did not return a pull request number.");
-      }
-      return {
-        number: parsed.number,
-        ...(parsed.url ? { url: parsed.url } : {}),
-      };
     },
 
     async mergePullRequest(input) {
