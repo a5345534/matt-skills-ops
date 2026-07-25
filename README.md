@@ -6,7 +6,7 @@ Matt Auto is a reusable Pi package. From Workflow home (after grilling), run:
 
 - `/matt-auto` — interactive menu (Workflow preflight + Next actions)
 - `/matt-auto next` — only currently available Next actions
-- `/matt-auto run` — post-grill pipeline: real `/skill:to-spec` → `/skill:to-tickets` → implement/integrate… (stage confirmation still gates GitHub publish)
+- `/matt-auto run` — post-grill **auto-advance** pipeline: `/skill:to-spec` → auto-publish → `/skill:to-tickets` → auto-publish → implement… (auto-Close starts Integration). Manual menu actions still prompt.
 
 V1 is stage-gated and menu-driven. Planning stages invoke the **installed** Matt skills in Workflow home (skill definitions are not modified). Product behavior is owned by the **Workflow coordinator** seam.
 
@@ -88,9 +88,9 @@ When Workflow preflight passes and there is no Active workflow, Next actions inc
 1. Matt Auto sends `/skill:to-spec` in **this Workflow home session** so the prior grill conversation stays in context.
 2. The skill is instructed **not** to publish to GitHub; it must emit a Matt Auto draft marker block.
 3. Empty / placeholder drafts are rejected (Compatibility recovery).
-4. The draft reaches one **Stage confirmation** menu: Publish / Revise / Cancel.
-5. **Publish** creates a GitHub spec issue (Workflow ID) and writes a managed **Workflow manifest** comment on that issue.
-6. **Cancel** leaves no remote publication. **Revise** re-invokes `/skill:to-spec` without publishing.
+4. **Manual menu**: Stage confirmation Publish / Revise / Cancel.
+5. **`/matt-auto run`**: auto-Publishes (no human Publish click).
+6. Publish creates a GitHub spec issue (Workflow ID) + Workflow manifest comment.
 7. After publish, Next actions advance to **Create tickets** (`/matt-auto run` continues automatically).
 
 ## Create-tickets Planning stage and frontier discovery
