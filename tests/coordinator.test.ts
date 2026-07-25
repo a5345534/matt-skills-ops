@@ -6,15 +6,18 @@ import type {
   CreateTicketsSkillOutcome,
   EnvironmentPort,
   GitTopologyPort,
+  LocalVerificationResult,
   ModelsPort,
   NestedGitRepository,
   PreferencesPort,
   PrepareImplementOutcome,
+  RemoteGitPort,
   RootScopedPorts,
   SkillsPort,
   TrackerPort,
   TrackerTicket,
   TranscriptPort,
+  VerificationPort,
   WorkerEventSink,
   WorkerLaunchInput,
   WorkersPort,
@@ -37,6 +40,8 @@ import {
   IMPLEMENTATION_DISPOSITION_OPTIONS,
   implementTicketActionId,
   implementationBranchName,
+  integrateTicketActionId,
+  integrationBranchName,
   NO_GIT_REPOSITORY_REASON,
   REQUIRED_MATT_SKILLS,
   SPEC_ISSUE_LABEL,
@@ -184,19 +189,46 @@ type WorkspaceState = {
     branchName: string;
     worktreePath: string;
   }>;
+  integrationEnsures: Array<{
+    workflowId: number;
+    baseRef: string;
+    branchName: string;
+    worktreePath: string;
+  }>;
+  merges: Array<{
+    workflowId: number;
+    ticketBranch: string;
+  }>;
   attempts: Map<string, number>;
   failCreate?: boolean;
+  failEnsureIntegration?: boolean;
+  mergeResult?:
+    | { ok: true; mergeCommitSha?: string }
+    | { ok: false; reason: "conflict" | "error"; message: string };
 };
 
 function createWorkspace(
   workflowRoot = "/repo",
-  initial: { attempts?: Map<string, number>; failCreate?: boolean } = {},
+  initial: {
+    attempts?: Map<string, number>;
+    failCreate?: boolean;
+    failEnsureIntegration?: boolean;
+    mergeResult?: WorkspaceState["mergeResult"];
+  } = {},
 ): { port: WorkspacePort; state: WorkspaceState } {
   const state: WorkspaceState = {
     creates: [],
+    integrationEnsures: [],
+    merges: [],
     attempts: initial.attempts ?? new Map(),
     ...(initial.failCreate !== undefined
       ? { failCreate: initial.failCreate }
+      : {}),
+    ...(initial.failEnsureIntegration !== undefined
+      ? { failEnsureIntegration: initial.failEnsureIntegration }
+      : {}),
+    ...(initial.mergeResult !== undefined
+      ? { mergeResult: initial.mergeResult }
       : {}),
   };
 
@@ -232,9 +264,86 @@ function createWorkspace(
       );
       return { branchName, worktreePath };
     },
+    ensureIntegrationWorkspace: async (input) => {
+      if (state.failEnsureIntegration) {
+        throw new Error("integration worktree create failed");
+      }
+      const branchName = integrationBranchName(input.workflowId);
+      const worktreePath = path.join(
+        path.dirname(workflowRoot),
+        "matt-auto-workspaces",
+        String(input.workflowId),
+        "integration",
+      );
+      state.integrationEnsures.push({
+        workflowId: input.workflowId,
+        baseRef: input.baseRef,
+        branchName,
+        worktreePath,
+      });
+      return { branchName, worktreePath };
+    },
+    mergeIntoIntegration: async (input) => {
+      state.merges.push({
+        workflowId: input.workflowId,
+        ticketBranch: input.ticketBranch,
+      });
+      if (state.mergeResult) {
+        return state.mergeResult;
+      }
+      return { ok: true, mergeCommitSha: "merge-sha-1" };
+    },
   };
 
   return { port, state };
+}
+
+type VerificationState = {
+  calls: string[];
+  result: LocalVerificationResult;
+};
+
+function createVerification(
+  initial: { result?: LocalVerificationResult } = {},
+): { port: VerificationPort; state: VerificationState } {
+  const state: VerificationState = {
+    calls: [],
+    result: initial.result ?? { ok: true, commands: ["npm test"] },
+  };
+  return {
+    state,
+    port: {
+      runLocalVerification: async (worktreePath) => {
+        state.calls.push(worktreePath);
+        return state.result;
+      },
+    },
+  };
+}
+
+type RemoteGitState = {
+  pushes: string[];
+  failPush?: boolean;
+};
+
+function createRemoteGit(
+  initial: { failPush?: boolean } = {},
+): { port: RemoteGitPort; state: RemoteGitState } {
+  const state: RemoteGitState = {
+    pushes: [],
+    ...(initial.failPush !== undefined ? { failPush: initial.failPush } : {}),
+  };
+  return {
+    state,
+    port: {
+      pushBranch: async (branchName) => {
+        if (state.failPush) {
+          throw new Error(`push failed for ${branchName}`);
+        }
+        state.pushes.push(branchName);
+      },
+    },
+  };
 }
 
 type WorkersState = {
@@ -438,6 +547,12 @@ function createTracker(
           if (manifest.tickets) {
             active.tickets = [...manifest.tickets];
           }
+          if (manifest.integrationBranch) {
+            active.integrationBranch = manifest.integrationBranch;
+          }
+          if (manifest.integratedTickets) {
+            active.integratedTickets = [...manifest.integratedTickets];
+          }
           if (issue?.title) {
             active.title = issue.title;
           }
@@ -555,6 +670,8 @@ type RootFixture = {
   workspace?: ReturnType<typeof createWorkspace>;
   workers?: ReturnType<typeof createWorkers>;
   transcripts?: ReturnType<typeof createTranscripts>;
+  verification?: ReturnType<typeof createVerification>;
+  remoteGit?: ReturnType<typeof createRemoteGit>;
 };
 
 function createTopology(
@@ -597,6 +714,8 @@ function createPorts(
   const defaultWorkspace = defaultRoot.workspace ?? createWorkspace("/repo");
   const defaultWorkers = defaultRoot.workers ?? createWorkers();
   const defaultTranscripts = defaultRoot.transcripts ?? createTranscripts();
+  const defaultVerification = defaultRoot.verification ?? createVerification();
+  const defaultRemoteGit = defaultRoot.remoteGit ?? createRemoteGit();
 
   return {
     startPath,
@@ -625,6 +744,12 @@ function createPorts(
       const transcripts =
         fixture.transcripts ??
         (fixture === defaultRoot ? defaultTranscripts : createTranscripts());
+      const verification =
+        fixture.verification ??
+        (fixture === defaultRoot ? defaultVerification : createVerification());
+      const remoteGit =
+        fixture.remoteGit ??
+        (fixture === defaultRoot ? defaultRemoteGit : createRemoteGit());
       return {
         environment: createEnvironment(fixture.environment),
         skills: createSkills(skillsFixture),
@@ -637,6 +762,8 @@ function createPorts(
         workspace: workspace.port,
         workers: workers.port,
         transcripts: transcripts.port,
+        verification: verification.port,
+        remoteGit: remoteGit.port,
       };
     },
   };
@@ -2027,52 +2154,64 @@ describe("Workflow coordinator Create-tickets Planning stage", () => {
   });
 });
 
-describe("Workflow coordinator single Implementation worker path", () => {
-  function ticketsPublishedFixture() {
-    const tracker = createTracker({
-      active: {
-        workflowId: 42,
-        targetBranch: DEFAULT_TARGET_BRANCH,
-        stage: "tickets-published",
-        workerProfile: defaultWorkerProfile,
-        title: "Existing spec",
-        tickets: [43, 44, 45],
-      },
-      tickets: [
-        { number: 43, title: "Ship core path", blockedBy: [] },
-        { number: 44, title: "Ship parallel path", blockedBy: [] },
-        { number: 45, title: "Ship dependent path", blockedBy: [43] },
-      ],
-    });
-    const workspace = createWorkspace("/repo");
-    const workers = createWorkers();
-    const transcripts = createTranscripts();
-    const skillsCalls = {
-      runCreateSpec: 0,
-      runCreateTickets: 0,
-      prepareImplement: 0,
-    };
-    const ports = createPorts({
-      defaultRoot: {
-        preferences: { globalWorkerProfile: defaultWorkerProfile },
-        tracker,
-        workspace,
-        workers,
-        transcripts,
-        skills: { calls: skillsCalls },
-      },
-    });
-    const coordinator = createWorkflowCoordinator(ports);
-    return {
-      coordinator,
+function ticketsPublishedFixture(
+  options: {
+    verification?: ReturnType<typeof createVerification>;
+    remoteGit?: ReturnType<typeof createRemoteGit>;
+    workspace?: ReturnType<typeof createWorkspace>;
+  } = {},
+) {
+  const tracker = createTracker({
+    active: {
+      workflowId: 42,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      stage: "tickets-published",
+      workerProfile: defaultWorkerProfile,
+      title: "Existing spec",
+      tickets: [43, 44, 45],
+    },
+    tickets: [
+      { number: 43, title: "Ship core path", blockedBy: [] },
+      { number: 44, title: "Ship parallel path", blockedBy: [] },
+      { number: 45, title: "Ship dependent path", blockedBy: [43] },
+    ],
+  });
+  const workspace = options.workspace ?? createWorkspace("/repo");
+  const workers = createWorkers();
+  const transcripts = createTranscripts();
+  const verification = options.verification ?? createVerification();
+  const remoteGit = options.remoteGit ?? createRemoteGit();
+  const skillsCalls = {
+    runCreateSpec: 0,
+    runCreateTickets: 0,
+    prepareImplement: 0,
+  };
+  const ports = createPorts({
+    defaultRoot: {
+      preferences: { globalWorkerProfile: defaultWorkerProfile },
       tracker,
       workspace,
       workers,
       transcripts,
-      skillsCalls,
-    };
-  }
+      verification,
+      remoteGit,
+      skills: { calls: skillsCalls },
+    },
+  });
+  const coordinator = createWorkflowCoordinator(ports);
+  return {
+    coordinator,
+    tracker,
+    workspace,
+    workers,
+    transcripts,
+    verification,
+    remoteGit,
+    skillsCalls,
+  };
+}
 
+describe("Workflow coordinator single Implementation worker path", () => {
   it("offers Implement Next actions for each ready frontier ticket", async () => {
     const { coordinator } = ticketsPublishedFixture();
 
@@ -2244,20 +2383,25 @@ describe("Workflow coordinator single Implementation worker path", () => {
     const closed = await coordinator.confirmDisposition("close");
     expect(closed).toEqual({
       status: "completed",
-      stage: "implement",
+      stage: "integrate",
       workflowId: 42,
       ticketNumber: 43,
       attempt: 1,
       disposition: "close",
-      readyForIntegration: true,
+      integrated: true,
+      integrationBranch: "matt-auto/42",
+      integrationWorktreePath: "/matt-auto-workspaces/42/integration",
+      localVerification: { ok: true, commands: ["npm test"] },
+      pushedBranches: ["matt-auto/42", "matt-auto/42/ticket-43/r1"],
       branchName: "matt-auto/42/ticket-43/r1",
       worktreePath: "/matt-auto-workspaces/42/ticket-43/r1",
     });
 
-    // Close does not close the GitHub ticket (Integration lands later).
+    // Close does not close the GitHub ticket (CI gate lands later).
     const ticket = tracker.state.issues.find((i) => i.number === 43);
     expect(ticket?.state).toBe("OPEN");
-    expect(tracker.state.writeManifestCalls).toBe(writesBefore);
+    // Coordinator updates the Workflow manifest after Local verification + push.
+    expect(tracker.state.writeManifestCalls).toBe(writesBefore + 1);
   });
 
   it("supports Leave open and Investigate dispositions without remote writes", async () => {
@@ -2274,7 +2418,7 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(leftOpen).toMatchObject({
       status: "completed",
       disposition: "leave-open",
-      readyForIntegration: false,
+      integrated: false,
       ticketNumber: 44,
     });
     expect(tracker.state.issues.find((i) => i.number === 44)?.state).toBe("OPEN");
@@ -2291,7 +2435,7 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(investigated).toMatchObject({
       status: "completed",
       disposition: "investigate",
-      readyForIntegration: false,
+      integrated: false,
       attempt: 2,
     });
 
@@ -2451,5 +2595,232 @@ describe("Workflow coordinator single Implementation worker path", () => {
       worktreePath: "/matt-auto-workspaces/42/ticket-43/r2",
     });
     expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 2]);
+  });
+});
+
+describe("Workflow coordinator Integration unit", () => {
+  async function completeWorker(
+    coordinator: ReturnType<typeof createWorkflowCoordinator>,
+    workers: ReturnType<typeof createWorkers>,
+    ticketNumber: number,
+    attempt = 1,
+  ) {
+    await coordinator.runNextAction(implementTicketActionId(ticketNumber));
+    const workerId = `implement-42-${ticketNumber}-r${attempt}`;
+    await workers.emit(workerId, {
+      type: "stage-result",
+      workerId,
+      outcome: { status: "completed", summary: `Done #${ticketNumber}` },
+    });
+  }
+
+  it("Close starts a serialized Integration unit in a dedicated Integration workspace", async () => {
+    const { coordinator, workers, workspace, remoteGit, tracker } =
+      ticketsPublishedFixture();
+
+    await completeWorker(coordinator, workers, 43);
+    const result = await coordinator.confirmDisposition("close");
+
+    expect(result.status).toBe("completed");
+    if (result.status === "completed") {
+      expect(result.stage).toBe("integrate");
+      expect(result.integrated).toBe(true);
+      expect(result.integrationBranch).toBe("matt-auto/42");
+      expect(result.integrationWorktreePath).toBe(
+        "/matt-auto-workspaces/42/integration",
+      );
+    }
+
+    expect(workspace.state.integrationEnsures).toEqual([
+      {
+        workflowId: 42,
+        baseRef: DEFAULT_TARGET_BRANCH,
+        branchName: "matt-auto/42",
+        worktreePath: "/matt-auto-workspaces/42/integration",
+      },
+    ]);
+    // Outside Workflow root
+    expect(
+      workspace.state.integrationEnsures[0]?.worktreePath.startsWith("/repo"),
+    ).toBe(false);
+
+    expect(workspace.state.merges).toEqual([
+      { workflowId: 42, ticketBranch: "matt-auto/42/ticket-43/r1" },
+    ]);
+    expect(remoteGit.state.pushes).toEqual([
+      "matt-auto/42",
+      "matt-auto/42/ticket-43/r1",
+    ]);
+
+    const manifest = tracker.state.manifests.get(42);
+    expect(manifest?.integrationBranch).toBe("matt-auto/42");
+    expect(manifest?.integratedTickets).toEqual([
+      {
+        number: 43,
+        attempt: 1,
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+    // Ticket remains open (CI gate later).
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+  });
+
+  it("runs Local verification before push and fails closed with no remote advancement", async () => {
+    const verification = createVerification({
+      result: {
+        ok: false,
+        reason: "npm test failed",
+        commands: ["npm test"],
+      },
+    });
+    const { coordinator, workers, remoteGit, tracker, workspace } =
+      ticketsPublishedFixture({ verification });
+    const manifestBefore = tracker.state.writeManifestCalls;
+
+    await completeWorker(coordinator, workers, 43);
+    const result = await coordinator.confirmDisposition("close");
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.stage).toBe("integrate");
+      expect(result.reason).toMatch(/Local verification failed/i);
+    }
+
+    // Merge happened locally; verification ran; no push / no manifest write.
+    expect(workspace.state.merges).toHaveLength(1);
+    expect(verification.state.calls).toEqual([
+      "/matt-auto-workspaces/42/integration",
+    ]);
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(manifestBefore);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+
+    // Fail-closed retry is the only Next action.
+    const actions = await coordinator.nextActions();
+    expect(actions).toEqual([
+      {
+        id: integrateTicketActionId(43),
+        label: "Retry Integration #43",
+        description: expect.stringMatching(/Local verification failed/i),
+      },
+    ]);
+  });
+
+  it("retries a failed Integration unit through the coordinator seam", async () => {
+    const verification = createVerification({
+      result: {
+        ok: false,
+        reason: "npm test failed",
+        commands: ["npm test"],
+      },
+    });
+    const { coordinator, workers, remoteGit, tracker } =
+      ticketsPublishedFixture({ verification });
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+    expect(remoteGit.state.pushes).toEqual([]);
+
+    // Fix verification and retry.
+    verification.state.result = { ok: true, commands: ["npm test"] };
+    const retried = await coordinator.runNextAction(integrateTicketActionId(43));
+    expect(retried).toMatchObject({
+      status: "completed",
+      stage: "integrate",
+      integrated: true,
+      ticketNumber: 43,
+    });
+    expect(remoteGit.state.pushes).toEqual([
+      "matt-auto/42",
+      "matt-auto/42/ticket-43/r1",
+    ]);
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
+      {
+        number: 43,
+        attempt: 1,
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+  });
+
+  it("fails closed on merge conflict with no remote advancement", async () => {
+    const workspace = createWorkspace("/repo", {
+      mergeResult: {
+        ok: false,
+        reason: "conflict",
+        message: "CONFLICT (content): merge conflict in src/app.ts",
+      },
+    });
+    const { coordinator, workers, remoteGit, tracker } =
+      ticketsPublishedFixture({ workspace });
+    const manifestBefore = tracker.state.writeManifestCalls;
+
+    await completeWorker(coordinator, workers, 43);
+    const result = await coordinator.confirmDisposition("close");
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/Merge conflict/i);
+    }
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(manifestBefore);
+  });
+
+  it("branches dependent Implementation workspaces from the Integration branch after success", async () => {
+    const { coordinator, workers, workspace } = ticketsPublishedFixture();
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    // Ticket 45 was blocked by 43; still blocked until ticket close/CI.
+    // Launch another ready ticket (#44) — should base on Integration branch.
+    await coordinator.runNextAction(implementTicketActionId(44));
+    const launch = workspace.state.creates.find((c) => c.ticketNumber === 44);
+    expect(launch?.baseRef).toBe("matt-auto/42");
+  });
+
+  it("processes Integration units one completed ticket at a time", async () => {
+    // After one unit fails closed, another Close cannot start until resolved.
+    const verification = createVerification({
+      result: {
+        ok: false,
+        reason: "broken",
+        commands: ["npm test"],
+      },
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({ verification });
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    // While pending integration for 43, launching another implement is blocked
+    // only by pending integration Next action surface — retry is sole action.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+    expect(actions.some((a) => a.id === implementTicketActionId(44))).toBe(
+      false,
+    );
+  });
+
+  it("records Integration unit transitions in the Worker transcript", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "integration-unit-start" }),
+    );
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "local-verification" }),
+    );
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "integration-unit-completed" }),
+    );
   });
 });

@@ -93,6 +93,37 @@ export function implementationBranchName(
   return `matt-auto/${workflowId}/ticket-${ticketNumber}/r${attempt}`;
 }
 
+/**
+ * Branch name for the workflow Integration branch.
+ * Format: matt-auto/<Workflow ID>
+ */
+export function integrationBranchName(workflowId: number): string {
+  return `matt-auto/${workflowId}`;
+}
+
+/** Prefix for Next actions that retry a failed Integration unit. */
+export const INTEGRATE_TICKET_ACTION_PREFIX = "integrate-ticket:" as const;
+
+/** Build the Next action id for integrating (or retrying) one ticket. */
+export function integrateTicketActionId(ticketNumber: number): string {
+  return `${INTEGRATE_TICKET_ACTION_PREFIX}${ticketNumber}`;
+}
+
+/** Parse an integrate-ticket Next action id. */
+export function parseIntegrateTicketActionId(
+  actionId: string,
+): number | undefined {
+  if (!actionId.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) {
+    return undefined;
+  }
+  const raw = actionId.slice(INTEGRATE_TICKET_ACTION_PREFIX.length);
+  const number = Number(raw);
+  if (!Number.isInteger(number) || number <= 0) {
+    return undefined;
+  }
+  return number;
+}
+
 /** Build the Next action id for implementing one ready ticket. */
 export function implementTicketActionId(ticketNumber: number): string {
   return `${IMPLEMENT_TICKET_ACTION_PREFIX}${ticketNumber}`;

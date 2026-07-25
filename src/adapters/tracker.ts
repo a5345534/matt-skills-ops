@@ -68,6 +68,30 @@ function isTicketNumberList(value: unknown): value is number[] {
   );
 }
 
+function isIntegratedTicketList(
+  value: unknown,
+): value is NonNullable<WorkflowManifest["integratedTickets"]> {
+  if (!Array.isArray(value)) return false;
+  return value.every((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const item = entry as {
+      number?: unknown;
+      attempt?: unknown;
+      branchName?: unknown;
+    };
+    return (
+      typeof item.number === "number" &&
+      Number.isInteger(item.number) &&
+      item.number > 0 &&
+      typeof item.attempt === "number" &&
+      Number.isInteger(item.attempt) &&
+      item.attempt > 0 &&
+      typeof item.branchName === "string" &&
+      item.branchName.length > 0
+    );
+  });
+}
+
 /** Serialize a Workflow manifest into the managed GitHub comment body. */
 export function formatWorkflowManifestComment(
   manifest: WorkflowManifest,
@@ -109,6 +133,15 @@ export function parseWorkflowManifestComment(
     };
     if (isTicketNumberList(parsed.tickets)) {
       manifest.tickets = parsed.tickets;
+    }
+    if (
+      typeof parsed.integrationBranch === "string" &&
+      parsed.integrationBranch.length > 0
+    ) {
+      manifest.integrationBranch = parsed.integrationBranch;
+    }
+    if (isIntegratedTicketList(parsed.integratedTickets)) {
+      manifest.integratedTickets = [...parsed.integratedTickets];
     }
     return manifest;
   } catch {
@@ -343,6 +376,12 @@ export function createTrackerPort(cwd: string): TrackerPort {
         };
         if (found.tickets) {
           active.tickets = [...found.tickets];
+        }
+        if (found.integrationBranch) {
+          active.integrationBranch = found.integrationBranch;
+        }
+        if (found.integratedTickets) {
+          active.integratedTickets = [...found.integratedTickets];
         }
         const title = detail.title ?? issue.title;
         if (title) {

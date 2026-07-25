@@ -21,6 +21,12 @@ export { createGitTopologyPort } from "./topology.js";
 export {
   createWorkspacePort,
   implementationWorktreePath,
+  integrationWorktreePath,
 } from "./workspace.js";
 export { createWorkersPort } from "./workers.js";
 export { createTranscriptPort } from "./transcripts.js";
+export {
+  createVerificationPort,
+  discoverLocalVerificationCommands,
+} from "./verification.js";
+export { createRemoteGitPort } from "./remote-git.js";

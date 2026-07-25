@@ -82,8 +82,13 @@ export type PrepareImplementOutcome =
     }
   | { ok: false; reason: string };
 
+/** Outcome of a local merge into the Integration branch. */
+export type IntegrationMergeResult =
+  | { ok: true; mergeCommitSha?: string }
+  | { ok: false; reason: "conflict" | "error"; message: string };
+
 /**
- * Local Implementation workspace (branch + worktree) operations.
+ * Local Implementation / Integration workspace (branch + worktree) operations.
  * System boundary: git worktree/branch layout outside the Workflow root.
  * Never pushes remotes — workers and workspace setup stay local.
  */
@@ -96,13 +101,67 @@ export type WorkspacePort = {
     workflowId: number;
     ticketNumber: number;
     attempt: number;
-    /** Base ref to branch from (Target branch until an Integration branch exists). */
+    /**
+     * Base ref to branch from.
+     * Target branch until an Integration branch exists; Integration branch after
+     * successful Integration units so dependents see integrated code.
+     */
     baseRef: string;
   }): Promise<{ branchName: string; worktreePath: string }>;
   /**
    * Highest existing attempt number for a ticket under this Workflow ID, or 0 if none.
    */
   latestAttempt(workflowId: number, ticketNumber: number): Promise<number>;
+  /**
+   * Ensure the dedicated Integration workspace exists for this Workflow ID.
+   * Branch: matt-auto/<Workflow ID>. Worktree is a sibling outside the Workflow root.
+   * Creates the Integration branch from baseRef when it does not yet exist.
+   * Local only — never pushes.
+   */
+  ensureIntegrationWorkspace(input: {
+    workflowId: number;
+    /** Base ref used only when creating the Integration branch for the first time. */
+    baseRef: string;
+  }): Promise<{ branchName: string; worktreePath: string }>;
+  /**
+   * Merge a ticket branch into the Integration branch inside the Integration workspace.
+   * Local only — never pushes. On conflict, leaves no remote advancement.
+   */
+  mergeIntoIntegration(input: {
+    workflowId: number;
+    ticketBranch: string;
+  }): Promise<IntegrationMergeResult>;
+};
+
+/** Outcome of Local verification in the Integration workspace. */
+export type LocalVerificationResult =
+  | { ok: true; commands: readonly string[] }
+  | { ok: false; reason: string; commands: readonly string[] };
+
+/**
+ * Project-discoverable Local verification checks.
+ * System boundary: package scripts / project tooling inside a worktree.
+ * Runs only after a local Integration unit merge and before any remote push.
+ */
+export type VerificationPort = {
+  /**
+   * Discover and run project checks in the given worktree (Integration workspace).
+   * Empty discovery is success (nothing to fail). Command failure fails closed.
+   */
+  runLocalVerification(worktreePath: string): Promise<LocalVerificationResult>;
+};
+
+/**
+ * Remote Git writes owned exclusively by the Workflow coordinator.
+ * System boundary: `git push` to the Workflow root remote.
+ * Workers never receive this port.
+ */
+export type RemoteGitPort = {
+  /**
+   * Push a local branch to the Workflow root remote.
+   * Only the Workflow coordinator may call this after Local verification succeeds.
+   */
+  pushBranch(branchName: string): Promise<void>;
 };
 
 /** Launch parameters for one session-owned Implementation worker. */
@@ -305,6 +364,10 @@ export type RootScopedPorts = {
   workspace: WorkspacePort;
   workers: WorkersPort;
   transcripts: TranscriptPort;
+  /** Project-discoverable Local verification (Integration workspace). */
+  verification: VerificationPort;
+  /** Coordinator-only remote Git writes (push). */
+  remoteGit: RemoteGitPort;
 };
 
 /** Ports injected into the Workflow coordinator. */

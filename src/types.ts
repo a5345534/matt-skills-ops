@@ -35,14 +35,19 @@ export type NextAction = {
 };
 
 /** Planning / orchestration stage identifiers known to the coordinator. */
-export type StageId = "create-spec" | "create-tickets" | "implement";
+export type StageId =
+  | "create-spec"
+  | "create-tickets"
+  | "implement"
+  | "integrate";
 
 /** Stage confirmation choices after a reviewable artifact is produced. */
 export type StageConfirmationDecision = "publish" | "revise" | "cancel";
 
 /**
  * Implementation disposition after a successful Implementation worker Stage result.
- * Close initiates integration later; it does not close the GitHub ticket immediately.
+ * Close starts a serialized Integration unit; the GitHub ticket closes only after
+ * Integration + CI succeed (CI gate is a later ticket).
  */
 export type ImplementationDispositionDecision =
   | "close"
@@ -91,6 +96,16 @@ export type TicketsDraft = {
 export type WorkflowStage = "spec-published" | "tickets-published";
 
 /**
+ * One ticket whose Integration unit has been merged, verified, and pushed.
+ * The GitHub ticket remains open until the CI gate succeeds (later ticket).
+ */
+export type IntegratedTicketRef = {
+  number: number;
+  attempt: number;
+  branchName: string;
+};
+
+/**
  * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
  * Does not alter the spec body.
  */
@@ -103,6 +118,10 @@ export type WorkflowManifest = {
   workerProfile: WorkerProfile;
   /** Published ticket issue numbers for this Workflow ID (after Create-tickets). */
   tickets?: readonly number[];
+  /** Integration branch name once the first Integration unit has succeeded. */
+  integrationBranch?: string;
+  /** Tickets whose Integration units have been merged, verified, and pushed. */
+  integratedTickets?: readonly IntegratedTicketRef[];
 };
 
 /**
@@ -117,6 +136,10 @@ export type ActiveWorkflow = {
   title?: string;
   /** Published ticket issue numbers when Create-tickets has completed. */
   tickets?: readonly number[];
+  /** Integration branch when at least one Integration unit has succeeded. */
+  integrationBranch?: string;
+  /** Tickets already integrated (ticket issues stay open until CI gate). */
+  integratedTickets?: readonly IntegratedTicketRef[];
 };
 
 /** A ticket that is open and has no open blockers — ready for Implementation. */
@@ -167,6 +190,14 @@ export type WorkflowPanelState = {
     branchName: string;
   }[];
   ticketProgress?: TicketProgressSummary;
+  /** Compact Integration unit status when one is pending retry after fail-closed. */
+  integration?: {
+    ticketNumber: number;
+    attempt: number;
+    status: "pending-retry";
+    branchName: string;
+    reason?: string;
+  };
 };
 
 /**
@@ -245,15 +276,26 @@ export type StageResult =
       tickets?: readonly number[];
       /** Ticket progress snapshot after Create-tickets publish. */
       ticketProgress?: TicketProgressSummary;
-      /** Set when an Implementation disposition completes. */
+      /** Set when an Implementation disposition or Integration unit completes. */
       ticketNumber?: number;
       attempt?: number;
       disposition?: ImplementationDispositionDecision;
       /**
-       * When disposition is "close", integration is the next stage
-       * (Integration unit lands in a later ticket; ticket is not closed yet).
+       * True when Close ran a successful Integration unit.
+       * The GitHub ticket remains open until the CI gate (later ticket).
        */
-      readyForIntegration?: boolean;
+      integrated?: boolean;
+      /** Integration branch after a successful Integration unit. */
+      integrationBranch?: string;
+      /** Integration workspace path after a successful Integration unit. */
+      integrationWorktreePath?: string;
+      /** Local verification summary after a successful Integration unit. */
+      localVerification?: {
+        ok: true;
+        commands: readonly string[];
+      };
+      /** Branches pushed by the Workflow coordinator (never by workers). */
+      pushedBranches?: readonly string[];
       branchName?: string;
       worktreePath?: string;
     }
@@ -426,7 +468,8 @@ export type WorkflowCoordinator = {
   /**
    * Apply Implementation disposition (Close / Leave open / Investigate)
    * after a successful Implementation worker Stage result.
-   * Close does not close the GitHub ticket; it marks work ready for Integration.
+   * Close starts a serialized Integration unit (merge + Local verification +
+   * coordinator remote writes). The GitHub ticket is not closed yet.
    */
   confirmDisposition(
     decision: ImplementationDispositionDecision,

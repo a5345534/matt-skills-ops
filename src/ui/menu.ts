@@ -54,7 +54,7 @@ const PUBLISH_ITEM = "Publish";
 const REVISE_ITEM = "Revise";
 const CANCEL_ITEM = "Cancel";
 
-const DISPOSITION_CLOSE = "Close (start Integration later)";
+const DISPOSITION_CLOSE = "Close (start Integration)";
 const DISPOSITION_LEAVE_OPEN = "Leave open";
 const DISPOSITION_INVESTIGATE = "Investigate";
 const PANEL_HEADER = "--- Workflow panel ---";
@@ -464,10 +464,28 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
         );
         return;
       }
+      if (result.stage === "integrate") {
+        ui.notify(
+          [
+            `Integration unit completed for #${result.ticketNumber} (r${result.attempt}).`,
+            result.integrationBranch
+              ? `Integration branch: ${result.integrationBranch}.`
+              : undefined,
+            result.pushedBranches?.length
+              ? `Pushed: ${result.pushedBranches.join(", ")}.`
+              : undefined,
+            "Ticket remains open until CI succeeds.",
+          ]
+            .filter(Boolean)
+            .join(" "),
+          "info",
+        );
+        return;
+      }
       if (result.stage === "implement") {
         const disposition = result.disposition ?? "unknown";
-        const integration = result.readyForIntegration
-          ? " Marked ready for Integration (ticket remains open until Integration + CI succeed)."
+        const integration = result.integrated
+          ? " Integrated (ticket remains open until CI succeeds)."
           : "";
         ui.notify(
           `Implementation disposition "${disposition}" for #${result.ticketNumber} (r${result.attempt}).${integration}`,

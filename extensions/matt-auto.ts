@@ -19,9 +19,11 @@ import {
   createGitTopologyPort,
   createModelsPort,
   createPreferencesPort,
+  createRemoteGitPort,
   createSkillsPort,
   createTrackerPort,
   createTranscriptPort,
+  createVerificationPort,
   createWorkersPort,
   createWorkspacePort,
   type SkillsHost,
@@ -151,6 +153,8 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           workspace: createWorkspacePort(rootPath),
           workers,
           transcripts: createTranscriptPort(rootPath),
+          verification: createVerificationPort(),
+          remoteGit: createRemoteGitPort(rootPath),
         };
       },
     });

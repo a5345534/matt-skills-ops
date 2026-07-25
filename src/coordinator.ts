@@ -7,9 +7,12 @@ import {
   IMPLEMENTATION_DISPOSITION_OPTIONS,
   implementTicketActionId,
   implementationBranchName,
+  integrateTicketActionId,
+  integrationBranchName,
   NO_GIT_REPOSITORY_REASON,
   parseDispositionActionId,
   parseImplementTicketActionId,
+  parseIntegrateTicketActionId,
   REQUIRED_MATT_SKILLS,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
@@ -78,6 +81,19 @@ type ActiveImplementationWorker = {
 };
 
 /**
+ * One completed ticket waiting for (or retrying) a serialized Integration unit.
+ * Only one Integration unit runs at a time; tickets do not close yet.
+ */
+type PendingIntegration = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  branchName: string;
+  worktreePath: string;
+  lastFailure?: string;
+};
+
+/**
  * Create the Workflow coordinator — the sole product seam for Matt Auto.
  *
  * Product rules (root selection, preflight, Worker profile precedence, Next
@@ -98,6 +114,13 @@ export function createWorkflowCoordinator(
   let activeWorker: ActiveImplementationWorker | undefined;
   /** Pending Implementation disposition after a successful worker Stage result. */
   let pendingDisposition: ActiveImplementationWorker | undefined;
+  /**
+   * Pending Integration unit after Close disposition (or a fail-closed retry).
+   * Serialized: at most one ticket at a time.
+   */
+  let pendingIntegration: PendingIntegration | undefined;
+  /** Guard against re-entrant Integration unit execution. */
+  let integrationInProgress = false;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -516,6 +539,14 @@ export function createWorkflowCoordinator(
         `Worker #${pendingDisposition.ticketNumber} r${pendingDisposition.attempt}: needs-disposition`,
       );
     }
+    if (pendingIntegration) {
+      const failure = pendingIntegration.lastFailure
+        ? ` — ${pendingIntegration.lastFailure}`
+        : "";
+      lines.push(
+        `Integration #${pendingIntegration.ticketNumber} r${pendingIntegration.attempt}: pending-retry${failure}`,
+      );
+    }
     return lines;
   }
 
@@ -770,6 +801,19 @@ export function createWorkflowCoordinator(
         ];
       }
 
+      // Fail-closed Integration unit retry (one ticket at a time).
+      if (pendingIntegration) {
+        return [
+          {
+            id: integrateTicketActionId(pendingIntegration.ticketNumber),
+            label: `Retry Integration #${pendingIntegration.ticketNumber}`,
+            description:
+              pendingIntegration.lastFailure ??
+              "Retry the serialized Integration unit (merge, Local verification, coordinator push).",
+          },
+        ];
+      }
+
       const progress = await loadTicketProgress(bound, active);
       if (!progress) {
         return [];
@@ -804,6 +848,11 @@ export function createWorkflowCoordinator(
     const dispositionTicket = parseDispositionActionId(actionId);
     if (dispositionTicket !== undefined) {
       return presentPendingDisposition(dispositionTicket);
+    }
+
+    const integrateTicket = parseIntegrateTicketActionId(actionId);
+    if (integrateTicket !== undefined) {
+      return retryIntegration(integrateTicket);
     }
 
     return {
@@ -1299,6 +1348,8 @@ export function createWorkflowCoordinator(
     );
     const attempt = latest + 1;
     const targetBranch = await resolveTargetBranch(bound.preferences);
+    // Dependents branch from the Integration branch after successful units.
+    const baseRef = active.integrationBranch ?? targetBranch;
 
     let workspace: { branchName: string; worktreePath: string };
     try {
@@ -1306,7 +1357,7 @@ export function createWorkflowCoordinator(
         workflowId: active.workflowId,
         ticketNumber,
         attempt,
-        baseRef: targetBranch,
+        baseRef,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1536,19 +1587,359 @@ export function createWorkflowCoordinator(
     pendingDisposition = undefined;
     current.status = "completed";
 
-    // Disposition never closes the GitHub ticket and never pushes.
-    // Close only marks the attempt ready for the Integration stage (later ticket).
-    return {
-      status: "completed",
-      stage: "implement",
+    // Leave open / Investigate: no Integration unit, no remote writes, ticket stays open.
+    if (decision !== "close") {
+      return {
+        status: "completed",
+        stage: "implement",
+        workflowId: current.workflowId,
+        ticketNumber: current.ticketNumber,
+        attempt: current.attempt,
+        disposition: decision,
+        integrated: false,
+        branchName: current.branchName,
+        worktreePath: current.worktreePath,
+      };
+    }
+
+    // Close starts a serialized Integration unit; ticket is not closed yet.
+    if (pendingIntegration) {
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason: `An Integration unit is already pending for #${pendingIntegration.ticketNumber}. Integration units process one completed ticket at a time.`,
+        ticketNumber: current.ticketNumber,
+        attempt: current.attempt,
+      };
+    }
+
+    pendingIntegration = {
       workflowId: current.workflowId,
       ticketNumber: current.ticketNumber,
       attempt: current.attempt,
-      disposition: decision,
-      readyForIntegration: decision === "close",
       branchName: current.branchName,
       worktreePath: current.worktreePath,
     };
+
+    return runIntegrationUnit(bound, pendingIntegration);
+  }
+
+  async function retryIntegration(ticketNumber: number): Promise<StageResult> {
+    if (!pendingIntegration || pendingIntegration.ticketNumber !== ticketNumber) {
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason: `No pending Integration unit for #${ticketNumber}.`,
+        ticketNumber,
+      };
+    }
+
+    const bound = await requireScoped();
+    return runIntegrationUnit(bound, pendingIntegration);
+  }
+
+  /**
+   * Serialized Integration unit:
+   * 1. Ensure Integration workspace (dedicated worktree, not Workflow home)
+   * 2. Merge ticket branch into Integration branch (local only)
+   * 3. Local verification (project-discoverable checks)
+   * 4. Coordinator remote writes (push + Workflow manifest update)
+   *
+   * Fail closed: no remote advancement on merge or verification failure.
+   * Tickets stay open until the CI gate (later ticket).
+   */
+  async function runIntegrationUnit(
+    bound: RootScopedPorts,
+    unit: PendingIntegration,
+  ): Promise<StageResult> {
+    if (integrationInProgress) {
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason:
+          "An Integration unit is already in progress. Integration units process one completed ticket at a time.",
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+
+    integrationInProgress = true;
+    const transcriptKey = {
+      workflowId: unit.workflowId,
+      ticketNumber: unit.ticketNumber,
+      attempt: unit.attempt,
+    };
+
+    try {
+      await bound.transcripts.append(transcriptKey, {
+        type: "integration-unit-start",
+        ticketBranch: unit.branchName,
+      });
+
+      const active = await loadActiveWorkflow(bound);
+      if (!active || active.workflowId !== unit.workflowId) {
+        const reason =
+          "No Active workflow matches this Integration unit. Recover Workflow state before retrying.";
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      // Already integrated (e.g. recovered from manifest) — do not re-merge.
+      if (active.integratedTickets?.some((t) => t.number === unit.ticketNumber)) {
+        pendingIntegration = undefined;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-skipped",
+          reason: "Ticket already recorded as integrated on the Workflow manifest.",
+        });
+        return {
+          status: "completed",
+          stage: "integrate",
+          workflowId: unit.workflowId,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          disposition: "close",
+          integrated: true,
+          integrationBranch:
+            active.integrationBranch ?? integrationBranchName(unit.workflowId),
+          branchName: unit.branchName,
+          worktreePath: unit.worktreePath,
+        };
+      }
+
+      const targetBranch = await resolveTargetBranch(bound.preferences);
+      const expectedIntegrationBranch = integrationBranchName(unit.workflowId);
+
+      let integrationWorkspace: { branchName: string; worktreePath: string };
+      try {
+        integrationWorkspace = await bound.workspace.ensureIntegrationWorkspace({
+          workflowId: unit.workflowId,
+          baseRef: active.integrationBranch ?? targetBranch,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `Failed to create Integration workspace: ${message}`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      if (integrationWorkspace.branchName !== expectedIntegrationBranch) {
+        const reason = `Integration workspace branch "${integrationWorkspace.branchName}" does not match expected "${expectedIntegrationBranch}".`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      // Integration workspace must live outside the Workflow root.
+      const resolvedRoot = path.resolve(selectedPath ?? "");
+      const resolvedIntegration = path.resolve(integrationWorkspace.worktreePath);
+      if (
+        resolvedIntegration === resolvedRoot ||
+        resolvedIntegration.startsWith(`${resolvedRoot}${path.sep}`)
+      ) {
+        const reason = `Integration workspace must live outside the Workflow root. Received "${integrationWorkspace.worktreePath}" under "${resolvedRoot}".`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      // Local merge only — no push yet.
+      const mergeResult = await bound.workspace.mergeIntoIntegration({
+        workflowId: unit.workflowId,
+        ticketBranch: unit.branchName,
+      });
+      if (!mergeResult.ok) {
+        const reason =
+          mergeResult.reason === "conflict"
+            ? `Merge conflict integrating ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`
+            : `Failed to merge ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "merge",
+        });
+        // Fail closed: no remote advancement.
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      await bound.transcripts.append(transcriptKey, {
+        type: "integration-unit-merged",
+        integrationBranch: expectedIntegrationBranch,
+        mergeCommitSha: mergeResult.mergeCommitSha,
+      });
+
+      // Local verification before any remote write.
+      const verification = await bound.verification.runLocalVerification(
+        integrationWorkspace.worktreePath,
+      );
+      if (!verification.ok) {
+        const reason = `Local verification failed in the Integration workspace: ${verification.reason}`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "local-verification",
+          commands: verification.commands,
+        });
+        // Fail closed: no push, no manifest update.
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      await bound.transcripts.append(transcriptKey, {
+        type: "local-verification",
+        commands: verification.commands,
+      });
+
+      // Coordinator-only remote writes: push Integration + ticket branches.
+      const pushedBranches: string[] = [];
+      try {
+        await bound.remoteGit.pushBranch(expectedIntegrationBranch);
+        pushedBranches.push(expectedIntegrationBranch);
+        await bound.remoteGit.pushBranch(unit.branchName);
+        pushedBranches.push(unit.branchName);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `Coordinator remote push failed after Local verification: ${message}`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "push",
+          pushedBranches,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      const integratedTickets = [
+        ...(active.integratedTickets ?? []),
+        {
+          number: unit.ticketNumber,
+          attempt: unit.attempt,
+          branchName: unit.branchName,
+        },
+      ];
+
+      const manifest: WorkflowManifest = {
+        schema: WORKFLOW_MANIFEST_SCHEMA,
+        version: 1,
+        workflowId: active.workflowId,
+        targetBranch: active.targetBranch,
+        stage: active.stage,
+        workerProfile: active.workerProfile,
+        integrationBranch: expectedIntegrationBranch,
+        integratedTickets,
+      };
+      if (active.tickets) {
+        manifest.tickets = [...active.tickets];
+      }
+
+      try {
+        await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `Pushed ${pushedBranches.join(", ")} but writing the Workflow manifest failed: ${message}. Recover the Workflow manifest on #${active.workflowId} before continuing.`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "manifest",
+          pushedBranches,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+
+      pendingIntegration = undefined;
+
+      await bound.transcripts.append(transcriptKey, {
+        type: "integration-unit-completed",
+        integrationBranch: expectedIntegrationBranch,
+        pushedBranches,
+      });
+
+      // Ticket remains open — CI gate and close land in a later ticket.
+      return {
+        status: "completed",
+        stage: "integrate",
+        workflowId: unit.workflowId,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+        disposition: "close",
+        integrated: true,
+        integrationBranch: expectedIntegrationBranch,
+        integrationWorktreePath: integrationWorkspace.worktreePath,
+        localVerification: {
+          ok: true,
+          commands: verification.commands,
+        },
+        pushedBranches,
+        branchName: unit.branchName,
+        worktreePath: unit.worktreePath,
+      };
+    } finally {
+      integrationInProgress = false;
+    }
   }
 
   async function abortWorkers(): Promise<void> {
@@ -1605,6 +1996,17 @@ export function createWorkflowCoordinator(
     };
     if (progress) {
       state.ticketProgress = progress;
+    }
+    if (pendingIntegration) {
+      state.integration = {
+        ticketNumber: pendingIntegration.ticketNumber,
+        attempt: pendingIntegration.attempt,
+        status: "pending-retry",
+        branchName: pendingIntegration.branchName,
+        ...(pendingIntegration.lastFailure
+          ? { reason: pendingIntegration.lastFailure }
+          : {}),
+      };
     }
     return state;
   }
