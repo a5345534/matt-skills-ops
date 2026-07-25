@@ -1,25 +1,40 @@
 import path from "node:path";
 import {
+  CREATE_SPEC_ACTION,
+  CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
   NO_GIT_REPOSITORY_REASON,
   REQUIRED_MATT_SKILLS,
+  SPEC_ISSUE_LABEL,
+  STAGE_CONFIRMATION_OPTIONS,
   UNSUPPORTED_TRACKER_REASON,
+  WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import type {
   RootScopedPorts,
   WorkflowCoordinatorPorts,
 } from "./ports.js";
 import type {
+  ActiveWorkflow,
   AvailableModel,
   NextAction,
   PreflightCheck,
   PreflightResult,
   ResolvedWorkerProfile,
+  SpecDraft,
+  StageConfirmationDecision,
+  StageResult,
   WorkerProfile,
   WorkflowCoordinator,
+  WorkflowManifest,
   WorkflowRoot,
   WorkflowRootKind,
 } from "./types.js";
+
+type PendingCreateSpec = {
+  stage: "create-spec";
+  draft: SpecDraft;
+};
 
 /**
  * Create the Workflow coordinator — the sole product seam for Matt Auto.
@@ -33,6 +48,8 @@ export function createWorkflowCoordinator(
 ): WorkflowCoordinator {
   let selectedPath: string | undefined;
   let scoped: RootScopedPorts | undefined;
+  /** Session-local pending Stage confirmation (never remote until Publish). */
+  let pending: PendingCreateSpec | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -130,26 +147,86 @@ export function createWorkflowCoordinator(
     return scoped;
   }
 
+  async function resolveTargetBranch(
+    preferences: RootScopedPorts["preferences"],
+  ): Promise<string> {
+    const configured = await preferences.getConfiguredTargetBranch();
+    return configured ?? DEFAULT_TARGET_BRANCH;
+  }
+
+  async function loadActiveWorkflow(
+    bound: RootScopedPorts,
+  ): Promise<ActiveWorkflow | undefined> {
+    const targetBranch = await resolveTargetBranch(bound.preferences);
+    return bound.tracker.findActiveWorkflow(targetBranch);
+  }
+
   /**
    * Worker profile precedence: workflow-snapshot → workflow-root → global.
-   * Later layers win; later changes do not rewrite earlier layers.
+   * Snapshot comes from local cache or the Active workflow manifest on GitHub.
    */
   async function resolveWorkerProfile(
-    preferences: RootScopedPorts["preferences"],
+    bound: RootScopedPorts,
   ): Promise<ResolvedWorkerProfile | undefined> {
-    const snapshot = await preferences.getWorkflowSnapshotWorkerProfile();
+    const snapshot = await bound.preferences.getWorkflowSnapshotWorkerProfile();
     if (snapshot) {
       return { profile: snapshot, source: "workflow-snapshot" };
     }
-    const root = await preferences.getRootWorkerProfile();
+
+    const active = await loadActiveWorkflow(bound);
+    if (active?.workerProfile) {
+      return { profile: active.workerProfile, source: "workflow-snapshot" };
+    }
+
+    const root = await bound.preferences.getRootWorkerProfile();
     if (root) {
       return { profile: root, source: "workflow-root" };
     }
-    const global = await preferences.getGlobalWorkerProfile();
+    const global = await bound.preferences.getGlobalWorkerProfile();
     if (global) {
       return { profile: global, source: "global" };
     }
     return undefined;
+  }
+
+  function isUsableDraft(draft: SpecDraft): boolean {
+    return draft.title.trim().length > 0 && draft.body.trim().length > 0;
+  }
+
+  async function invokeCreateSpec(
+    bound: RootScopedPorts,
+  ): Promise<StageResult> {
+    const outcome = await bound.skills.runCreateSpec();
+    if (!outcome.ok) {
+      pending = undefined;
+      return {
+        status: "compatibility-recovery",
+        stage: "create-spec",
+        reason: outcome.reason,
+      };
+    }
+
+    if (!isUsableDraft(outcome.draft)) {
+      pending = undefined;
+      return {
+        status: "compatibility-recovery",
+        stage: "create-spec",
+        reason:
+          "Create-spec skill returned a draft missing a non-empty title or body. Matt Auto entered Compatibility recovery rather than publishing.",
+      };
+    }
+
+    const draft: SpecDraft = {
+      title: outcome.draft.title.trim(),
+      body: outcome.draft.body,
+    };
+    pending = { stage: "create-spec", draft };
+    return {
+      status: "needs-confirmation",
+      stage: "create-spec",
+      draft,
+      confirmationOptions: [...STAGE_CONFIRMATION_OPTIONS],
+    };
   }
 
   async function findAvailableModel(
@@ -204,9 +281,7 @@ export function createWorkflowCoordinator(
   async function preflight(): Promise<PreflightResult> {
     const bound = await requireScoped();
 
-    const configuredTarget =
-      await bound.preferences.getConfiguredTargetBranch();
-    const targetBranch = configuredTarget ?? DEFAULT_TARGET_BRANCH;
+    const targetBranch = await resolveTargetBranch(bound.preferences);
 
     const [
       hasGitHubRemote,
@@ -219,7 +294,7 @@ export function createWorkflowCoordinator(
       bound.environment.isGhAuthenticated(),
       bound.environment.targetBranchExists(targetBranch),
       bound.skills.installedSkillNames(),
-      resolveWorkerProfile(bound.preferences),
+      resolveWorkerProfile(bound),
     ]);
 
     const installed = new Set(installedSkills);
@@ -284,9 +359,180 @@ export function createWorkflowCoordinator(
       return [];
     }
 
-    // Planning and Implementation stages are added by later tickets.
-    // Preflight-complete environments currently have no available Next actions.
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+
+    if (!active) {
+      return [
+        {
+          id: CREATE_SPEC_ACTION.id,
+          label: CREATE_SPEC_ACTION.label,
+          description: CREATE_SPEC_ACTION.description,
+        },
+      ];
+    }
+
+    if (active.stage === "spec-published") {
+      return [
+        {
+          id: CREATE_TICKETS_ACTION.id,
+          label: CREATE_TICKETS_ACTION.label,
+          description: CREATE_TICKETS_ACTION.description,
+        },
+      ];
+    }
+
     return [];
+  }
+
+  async function runNextAction(actionId: string): Promise<StageResult> {
+    if (actionId === CREATE_SPEC_ACTION.id) {
+      return startCreateSpec();
+    }
+
+    if (actionId === CREATE_TICKETS_ACTION.id) {
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason:
+          "Create-tickets Planning stage is not implemented yet. It lands in a later Matt Auto ticket.",
+      };
+    }
+
+    return {
+      status: "failed",
+      stage: "create-spec",
+      reason: `Unknown Next action "${actionId}".`,
+    };
+  }
+
+  async function startCreateSpec(): Promise<StageResult> {
+    const bound = await requireScoped();
+    const preflightResult = await preflight();
+    if (!preflightResult.ok) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason:
+          "Workflow preflight is incomplete. Resolve preflight checks before running Create-spec.",
+      };
+    }
+
+    const active = await loadActiveWorkflow(bound);
+    if (active) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Create-spec is unavailable until that workflow completes.`,
+      };
+    }
+
+    if (pending) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason:
+          "A Stage confirmation is already pending. Choose Publish, Revise, or Cancel before starting Create-spec again.",
+      };
+    }
+
+    // Planning stage: invoke installed to-spec in Workflow home; never publish here.
+    return invokeCreateSpec(bound);
+  }
+
+  async function confirmStage(
+    decision: StageConfirmationDecision,
+  ): Promise<StageResult> {
+    if (!pending || pending.stage !== "create-spec") {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason:
+          "No pending Stage confirmation. Run Create-spec first and wait for a reviewable draft.",
+      };
+    }
+
+    if (decision === "cancel") {
+      pending = undefined;
+      return {
+        status: "cancelled",
+        stage: "create-spec",
+      };
+    }
+
+    const bound = await requireScoped();
+
+    if (decision === "revise") {
+      // Re-invoke to-spec without any remote writes.
+      pending = undefined;
+      return invokeCreateSpec(bound);
+    }
+
+    // decision === "publish"
+    const draft = pending.draft;
+    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const workerProfile = await resolveWorkerProfile(bound);
+    if (!workerProfile) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason:
+          "Cannot publish Create-spec without a Worker profile. Configure one and retry Stage confirmation Publish.",
+      };
+    }
+
+    // Remote writes only on Publish, owned by the Workflow coordinator.
+    let issueNumber: number;
+    try {
+      const created = await bound.tracker.createIssue({
+        title: draft.title,
+        body: draft.body,
+        labels: [SPEC_ISSUE_LABEL],
+      });
+      issueNumber = created.number;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: `Failed to create the GitHub spec issue: ${message}`,
+      };
+    }
+
+    const manifest: WorkflowManifest = {
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: issueNumber,
+      targetBranch,
+      stage: "spec-published",
+      workerProfile: workerProfile.profile,
+    };
+
+    try {
+      await bound.tracker.writeWorkflowManifest(issueNumber, manifest);
+    } catch (error) {
+      // Issue already exists remotely — drop the session pending draft so a retry
+      // cannot create a second spec issue for the same Stage confirmation.
+      pending = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: `Spec issue #${issueNumber} was created, but writing the Workflow manifest failed: ${message}. Inspect issue #${issueNumber} and recover the Workflow manifest before continuing.`,
+      };
+    }
+
+    pending = undefined;
+    return {
+      status: "completed",
+      stage: "create-spec",
+      workflowId: issueNumber,
+    };
+  }
+
+  async function getActiveWorkflow(): Promise<ActiveWorkflow | undefined> {
+    const bound = await requireScoped();
+    return loadActiveWorkflow(bound);
   }
 
   async function currentRoot(): Promise<WorkflowRoot> {
@@ -315,7 +561,7 @@ export function createWorkflowCoordinator(
     ResolvedWorkerProfile | undefined
   > {
     const bound = await requireScoped();
-    return resolveWorkerProfile(bound.preferences);
+    return resolveWorkerProfile(bound);
   }
 
   async function getGlobalWorkerProfile(): Promise<WorkerProfile | undefined> {
@@ -361,6 +607,9 @@ export function createWorkflowCoordinator(
   return {
     preflight,
     nextActions,
+    runNextAction,
+    confirmStage,
+    getActiveWorkflow,
     currentRoot,
     listRoots,
     selectRoot,

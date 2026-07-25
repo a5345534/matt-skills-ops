@@ -1,11 +1,18 @@
 export { createWorkflowCoordinator } from "./coordinator.js";
 export {
+  CREATE_SPEC_ACTION,
+  CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
   NO_GIT_REPOSITORY_REASON,
   REQUIRED_MATT_SKILLS,
+  SPEC_ISSUE_LABEL,
+  STAGE_CONFIRMATION_OPTIONS,
   UNSUPPORTED_TRACKER_REASON,
+  WORKFLOW_MANIFEST_MARKER,
+  WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 export type {
+  CreateSpecSkillOutcome,
   EnvironmentPort,
   GitTopologyPort,
   ModelsPort,
@@ -13,19 +20,27 @@ export type {
   PreferencesPort,
   RootScopedPorts,
   SkillsPort,
+  TrackerPort,
   WorkflowCoordinatorPorts,
 } from "./ports.js";
 export type {
+  ActiveWorkflow,
   AvailableModel,
   NextAction,
   PreflightCheck,
   PreflightCheckId,
   PreflightResult,
   ResolvedWorkerProfile,
+  SpecDraft,
+  StageConfirmationDecision,
+  StageId,
+  StageResult,
   WorkerProfile,
   WorkerProfileSource,
   WorkflowCoordinator,
+  WorkflowManifest,
   WorkflowRoot,
   WorkflowRootKind,
   WorkflowRootStatus,
+  WorkflowStage,
 } from "./types.js";

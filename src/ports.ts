@@ -1,4 +1,10 @@
-import type { AvailableModel, WorkerProfile } from "./types.js";
+import type {
+  ActiveWorkflow,
+  AvailableModel,
+  SpecDraft,
+  WorkerProfile,
+  WorkflowManifest,
+} from "./types.js";
 
 /**
  * Environment facts for Workflow preflight on one Workflow root.
@@ -14,12 +20,57 @@ export type EnvironmentPort = {
 };
 
 /**
- * Installed Matt skill discovery.
- * System boundary: skill filesystem / Pi skill catalog.
+ * Outcome of invoking the installed `to-spec` skill as a Planning capability.
+ * The adapter never publishes; it only returns a reviewable draft or a failure reason.
+ */
+export type CreateSpecSkillOutcome =
+  | { ok: true; draft: SpecDraft }
+  | { ok: false; reason: string };
+
+/**
+ * Matt skills adapter port.
+ * System boundary: skill filesystem / Pi skill catalog / runtime invocation.
+ * Discovers and invokes installed skills without modifying their definitions.
  */
 export type SkillsPort = {
   /** Skill names currently installed and discoverable. */
   installedSkillNames(): Promise<readonly string[]>;
+  /**
+   * Invoke installed `to-spec` as a Create-spec Planning-stage capability.
+   * Must not publish to the issue tracker — the Workflow coordinator owns remote writes.
+   * Does not modify, bundle, or pin skill definitions.
+   */
+  runCreateSpec(): Promise<CreateSpecSkillOutcome>;
+};
+
+/**
+ * GitHub issue-tracker operations owned by the Workflow coordinator.
+ * System boundary: `gh` / GitHub remote writes and reads.
+ */
+export type TrackerPort = {
+  /**
+   * Create a GitHub issue. For Create-spec publish, the issue number becomes the Workflow ID.
+   */
+  createIssue(input: {
+    title: string;
+    body: string;
+    labels: readonly string[];
+  }): Promise<{ number: number }>;
+  /**
+   * Write the managed Workflow manifest comment on a spec issue.
+   * Replaces a previous managed manifest comment when one exists.
+   */
+  writeWorkflowManifest(
+    issueNumber: number,
+    manifest: WorkflowManifest,
+  ): Promise<void>;
+  /**
+   * Find the Active workflow for a Target branch, if any.
+   * Reads GitHub issues + managed Workflow manifest comments.
+   */
+  findActiveWorkflow(
+    targetBranch: string,
+  ): Promise<ActiveWorkflow | undefined>;
 };
 
 /**
@@ -97,6 +148,7 @@ export type RootScopedPorts = {
   environment: EnvironmentPort;
   skills: SkillsPort;
   preferences: PreferencesPort;
+  tracker: TrackerPort;
 };
 
 /** Ports injected into the Workflow coordinator. */

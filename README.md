@@ -80,6 +80,16 @@ Example preferences:
 }
 ```
 
+## Create-spec Planning stage
+
+When Workflow preflight passes and there is no Active workflow, Next actions include **Create spec**:
+
+1. Matt Auto invokes the installed `to-spec` skill as a Planning stage in Workflow home (skill definitions are not modified).
+2. The draft reaches one **Stage confirmation** menu: Publish / Revise / Cancel.
+3. **Publish** creates a GitHub spec issue (Workflow ID) and writes a managed **Workflow manifest** comment on that issue.
+4. **Cancel** leaves no remote publication. **Revise** re-invokes `to-spec` without publishing.
+5. After publish, Next actions advance to **Create tickets**.
+
 ## Status
 
-Tickets #2–#4 establish the package shell, coordinator seam, preflight menus, Workflow root selection, and Worker profile defaults. Planning stages, workers, integration, CI, and Workflow PR land in later tickets.
+Tickets #2–#5 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, and Create-spec Planning stage with Stage confirmation and Workflow manifest. Create-tickets, workers, integration, CI, and Workflow PR land in later tickets.

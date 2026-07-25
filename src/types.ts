@@ -34,6 +34,80 @@ export type NextAction = {
   description: string;
 };
 
+/** Planning / orchestration stage identifiers known to the coordinator. */
+export type StageId = "create-spec" | "create-tickets";
+
+/** Stage confirmation choices after a reviewable artifact is produced. */
+export type StageConfirmationDecision = "publish" | "revise" | "cancel";
+
+/** Reviewable Create-spec draft produced by the Matt skills adapter. */
+export type SpecDraft = {
+  title: string;
+  body: string;
+};
+
+/**
+ * Durable orchestration stage recorded on the Workflow manifest.
+ * Extended by later tickets as the workflow advances.
+ */
+export type WorkflowStage = "spec-published";
+
+/**
+ * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
+ * Does not alter the spec body.
+ */
+export type WorkflowManifest = {
+  schema: "matt-auto/workflow-manifest";
+  version: 1;
+  workflowId: number;
+  targetBranch: string;
+  stage: WorkflowStage;
+  workerProfile: WorkerProfile;
+};
+
+/**
+ * Active workflow recovered from GitHub (spec issue + Workflow manifest).
+ * Workflow ID is the published spec issue number.
+ */
+export type ActiveWorkflow = {
+  workflowId: number;
+  targetBranch: string;
+  stage: WorkflowStage;
+  workerProfile: WorkerProfile;
+  title?: string;
+};
+
+/**
+ * One-shot Stage result for completion, failure, confirmation, or recovery.
+ * Matt Auto reacts to these; it does not poll for decisions.
+ */
+export type StageResult =
+  | {
+      status: "needs-confirmation";
+      stage: StageId;
+      draft: SpecDraft;
+      confirmationOptions: readonly StageConfirmationDecision[];
+    }
+  | {
+      status: "completed";
+      stage: StageId;
+      workflowId: number;
+    }
+  | {
+      status: "cancelled";
+      stage: StageId;
+    }
+  | {
+      status: "failed";
+      stage: StageId;
+      reason: string;
+    }
+  | {
+      status: "compatibility-recovery";
+      stage: StageId;
+      reason: string;
+    };
+
 /**
  * Model + thinking level used by Implementation workers.
  * Distinct from the Workflow home session model.
@@ -107,6 +181,21 @@ export type WorkflowCoordinator = {
    * Empty when preflight fails or no stage is available yet.
    */
   nextActions(): Promise<NextAction[]>;
+  /**
+   * Run a Next action by id (for example Create-spec Planning stage).
+   * Planning stages execute in Workflow home and never publish silently.
+   */
+  runNextAction(actionId: string): Promise<StageResult>;
+  /**
+   * Apply Stage confirmation (Publish / Revise / Cancel) for a pending stage.
+   * Publish is the only path that performs remote publication.
+   */
+  confirmStage(decision: StageConfirmationDecision): Promise<StageResult>;
+  /**
+   * Active workflow for the current Target branch, if any.
+   * Recovered from GitHub (Workflow ID + Workflow manifest).
+   */
+  getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
   /**
    * Currently selected Workflow root (defaults to nearest enclosing Git root).
    */

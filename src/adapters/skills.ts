@@ -1,7 +1,16 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { SkillsPort } from "../ports.js";
+import type { CreateSpecSkillOutcome, SkillsPort } from "../ports.js";
+
+/**
+ * Optional host that performs the actual Create-spec skill invocation.
+ * The adapter discovers installed skills and delegates invocation without
+ * modifying skill definitions. When omitted, runCreateSpec fails closed.
+ */
+export type CreateSpecHost = {
+  runCreateSpec(): Promise<CreateSpecSkillOutcome>;
+};
 
 async function isDirectory(candidate: string): Promise<boolean> {
   try {
@@ -56,17 +65,44 @@ function skillSearchRoots(cwd: string): string[] {
 }
 
 /**
- * Discover installed skill names from standard Pi / agents skill locations.
- * Does not parse skill bodies for orchestration logic.
+ * Discover installed skill names and invoke Create-spec via an optional host.
+ * Does not parse skill bodies for orchestration logic and never modifies SKILL.md.
  */
-export function createSkillsPort(cwd: string): SkillsPort {
+export function createSkillsPort(
+  cwd: string,
+  host?: CreateSpecHost,
+): SkillsPort {
+  async function installedSkillNames(): Promise<readonly string[]> {
+    const names = new Set<string>();
+    for (const root of skillSearchRoots(cwd)) {
+      await collectFromRoot(root, names);
+    }
+    return [...names].sort();
+  }
+
   return {
-    async installedSkillNames() {
-      const names = new Set<string>();
-      for (const root of skillSearchRoots(cwd)) {
-        await collectFromRoot(root, names);
+    installedSkillNames,
+
+    async runCreateSpec() {
+      const names = await installedSkillNames();
+      if (!names.includes("to-spec")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill to-spec is missing. Install it into a Pi skill location and retry Create-spec.",
+        };
       }
-      return [...names].sort();
+
+      if (!host) {
+        return {
+          ok: false,
+          reason:
+            "Create-spec Planning host is not wired. Matt Auto cannot invoke to-spec without a Workflow-home host.",
+        };
+      }
+
+      // Host invokes the installed skill capability; definitions stay untouched.
+      return host.runCreateSpec();
     },
   };
 }

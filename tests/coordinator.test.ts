@@ -2,6 +2,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type {
+  CreateSpecSkillOutcome,
   EnvironmentPort,
   GitTopologyPort,
   ModelsPort,
@@ -9,14 +10,26 @@ import type {
   PreferencesPort,
   RootScopedPorts,
   SkillsPort,
+  TrackerPort,
   WorkflowCoordinatorPorts,
 } from "../src/ports.js";
-import type { AvailableModel, WorkerProfile } from "../src/types.js";
+import type {
+  ActiveWorkflow,
+  AvailableModel,
+  SpecDraft,
+  WorkerProfile,
+  WorkflowManifest,
+} from "../src/types.js";
 import {
+  CREATE_SPEC_ACTION,
+  CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
   NO_GIT_REPOSITORY_REASON,
   REQUIRED_MATT_SKILLS,
+  SPEC_ISSUE_LABEL,
+  STAGE_CONFIRMATION_OPTIONS,
   UNSUPPORTED_TRACKER_REASON,
+  WORKFLOW_MANIFEST_SCHEMA,
 } from "../src/constants.js";
 
 function createEnvironment(
@@ -30,12 +43,130 @@ function createEnvironment(
   };
 }
 
-function createSkills(
-  names: readonly string[] = [...REQUIRED_MATT_SKILLS],
-): SkillsPort {
+const defaultSpecDraft: SpecDraft = {
+  title: "Ship feature X",
+  body: "## Problem Statement\n\nUsers need X.\n",
+};
+
+type SkillsFixture = {
+  names?: readonly string[];
+  /** Sequential outcomes for runCreateSpec (last value repeats). */
+  createSpecOutcomes?: CreateSpecSkillOutcome[];
+  /** Invocations recorded for assertions. */
+  calls?: { runCreateSpec: number };
+};
+
+function createSkills(fixture: SkillsFixture = {}): SkillsPort {
+  const names = fixture.names ?? [...REQUIRED_MATT_SKILLS];
+  const outcomes = fixture.createSpecOutcomes ?? [
+    { ok: true as const, draft: defaultSpecDraft },
+  ];
+  let outcomeIndex = 0;
+  const calls = fixture.calls ?? { runCreateSpec: 0 };
+
   return {
     installedSkillNames: async () => names,
+    runCreateSpec: async () => {
+      calls.runCreateSpec += 1;
+      const index = Math.min(outcomeIndex, outcomes.length - 1);
+      outcomeIndex += 1;
+      const outcome = outcomes[index];
+      if (!outcome) {
+        return {
+          ok: false,
+          reason: "No Create-spec skill outcome configured.",
+        };
+      }
+      return outcome;
+    },
   };
+}
+
+type TrackerState = {
+  issues: Array<{
+    number: number;
+    title: string;
+    body: string;
+    labels: string[];
+  }>;
+  manifests: Map<number, WorkflowManifest>;
+  createIssueCalls: number;
+  writeManifestCalls: number;
+  nextNumber: number;
+};
+
+function createTracker(
+  initial: {
+    active?: ActiveWorkflow;
+    failCreate?: boolean;
+  } = {},
+): { port: TrackerPort; state: TrackerState } {
+  const state: TrackerState = {
+    issues: [],
+    manifests: new Map(),
+    createIssueCalls: 0,
+    writeManifestCalls: 0,
+    nextNumber: 100,
+  };
+
+  if (initial.active) {
+    state.manifests.set(initial.active.workflowId, {
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: initial.active.workflowId,
+      targetBranch: initial.active.targetBranch,
+      stage: initial.active.stage,
+      workerProfile: initial.active.workerProfile,
+    });
+    state.issues.push({
+      number: initial.active.workflowId,
+      title: initial.active.title ?? "Existing workflow",
+      body: "spec",
+      labels: [SPEC_ISSUE_LABEL],
+    });
+    state.nextNumber = initial.active.workflowId + 1;
+  }
+
+  const port: TrackerPort = {
+    createIssue: async (input) => {
+      state.createIssueCalls += 1;
+      if (initial.failCreate) {
+        throw new Error("GitHub createIssue failed");
+      }
+      const number = state.nextNumber++;
+      state.issues.push({
+        number,
+        title: input.title,
+        body: input.body,
+        labels: [...input.labels],
+      });
+      return { number };
+    },
+    writeWorkflowManifest: async (issueNumber, manifest) => {
+      state.writeManifestCalls += 1;
+      state.manifests.set(issueNumber, manifest);
+    },
+    findActiveWorkflow: async (targetBranch) => {
+      for (const manifest of state.manifests.values()) {
+        if (manifest.targetBranch === targetBranch) {
+          const issue = state.issues.find((i) => i.number === manifest.workflowId);
+          const active: ActiveWorkflow = {
+            workflowId: manifest.workflowId,
+            targetBranch: manifest.targetBranch,
+            stage: manifest.stage,
+            workerProfile: manifest.workerProfile,
+          };
+          if (issue?.title) {
+            active.title = issue.title;
+          }
+          return active;
+        }
+      }
+      return undefined;
+    },
+  };
+
+  return { port, state };
 }
 
 type PrefState = {
@@ -94,8 +225,11 @@ function createModels(
 
 type RootFixture = {
   environment?: Partial<EnvironmentPort>;
-  skills?: readonly string[];
+  skills?: SkillsFixture;
+  /** Shorthand for skills.names when only installed names matter. */
+  skillNames?: readonly string[];
   preferences?: PrefState;
+  tracker?: ReturnType<typeof createTracker>;
 };
 
 function createTopology(
@@ -122,27 +256,39 @@ function createPorts(
     roots?: Record<string, RootFixture>;
     defaultRoot?: RootFixture;
   } = {},
-): WorkflowCoordinatorPorts {
+): WorkflowCoordinatorPorts & {
+  /** Default-root tracker state when the fixture provided one. */
+  __defaultTracker?: ReturnType<typeof createTracker>;
+} {
   const startPath = overrides.startPath ?? "/repo";
   const defaultRoot: RootFixture = overrides.defaultRoot ?? {
     preferences: { globalWorkerProfile: defaultWorkerProfile },
   };
   const roots = overrides.roots ?? {};
+  const defaultTracker = defaultRoot.tracker ?? createTracker();
 
   return {
     startPath,
     topology: overrides.topology ?? createTopology({ nearest: "/repo" }),
     models: overrides.models ?? createModels(),
+    __defaultTracker: defaultTracker,
     forRoot(rootPath: string): RootScopedPorts {
       const fixture = roots[rootPath] ?? defaultRoot;
+      const skillsFixture: SkillsFixture = fixture.skills
+        ? fixture.skills
+        : fixture.skillNames
+          ? { names: fixture.skillNames }
+          : {};
+      const tracker = fixture.tracker ?? defaultTracker;
       return {
         environment: createEnvironment(fixture.environment),
-        skills: createSkills(fixture.skills),
+        skills: createSkills(skillsFixture),
         preferences: createPreferences(
           fixture.preferences ?? {
             globalWorkerProfile: defaultWorkerProfile,
           },
         ),
+        tracker: tracker.port,
       };
     },
   };
@@ -253,7 +399,7 @@ describe("Workflow coordinator preflight", () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
-          skills: ["to-spec", "implement"],
+          skillNames: ["to-spec", "implement"],
           preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
@@ -540,11 +686,343 @@ describe("Workflow coordinator Next actions", () => {
     await expect(coordinator.nextActions()).resolves.toEqual([]);
   });
 
-  it("returns no planning or implementation Next actions yet when preflight passes", async () => {
-    // Stages land in later tickets.
+  it("offers Create spec when preflight passes and there is no Active workflow", async () => {
     const coordinator = createWorkflowCoordinator(createPorts());
 
-    await expect(coordinator.nextActions()).resolves.toEqual([]);
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_SPEC_ACTION.id,
+        label: CREATE_SPEC_ACTION.label,
+        description: CREATE_SPEC_ACTION.description,
+      },
+    ]);
+  });
+
+  it("offers Create tickets after a published Create-spec workflow", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "spec-published",
+        workerProfile: defaultWorkerProfile,
+        title: "Existing spec",
+      },
+    });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_TICKETS_ACTION.id,
+        label: CREATE_TICKETS_ACTION.label,
+        description: CREATE_TICKETS_ACTION.description,
+      },
+    ]);
+  });
+});
+
+describe("Workflow coordinator Create-spec Planning stage", () => {
+  it("runs Create-spec in Workflow home via the skills adapter and needs Stage confirmation", async () => {
+    const skillsCalls = { runCreateSpec: 0 };
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: { calls: skillsCalls },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+
+    expect(result).toEqual({
+      status: "needs-confirmation",
+      stage: "create-spec",
+      draft: defaultSpecDraft,
+      confirmationOptions: [...STAGE_CONFIRMATION_OPTIONS],
+    });
+    expect(skillsCalls.runCreateSpec).toBe(1);
+    // Planning stage must not publish silently.
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+  });
+
+  it("does not launch Create-spec as an Implementation worker action surface", async () => {
+    // Create-spec is only a Workflow-home Planning Next action, never a worker profile launch.
+    const coordinator = createWorkflowCoordinator(createPorts());
+    const actions = await coordinator.nextActions();
+
+    expect(actions.map((a) => a.id)).toEqual([CREATE_SPEC_ACTION.id]);
+    expect(actions.some((a) => /worker|implement/i.test(a.id))).toBe(false);
+  });
+
+  it("publishes only on Stage confirmation Publish and sets the Workflow ID from the issue number", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+    const published = await coordinator.confirmStage("publish");
+
+    expect(published).toEqual({
+      status: "completed",
+      stage: "create-spec",
+      workflowId: 100,
+    });
+    expect(tracker.state.createIssueCalls).toBe(1);
+    expect(tracker.state.writeManifestCalls).toBe(1);
+    expect(tracker.state.issues[0]).toMatchObject({
+      number: 100,
+      title: defaultSpecDraft.title,
+      body: defaultSpecDraft.body,
+      labels: [SPEC_ISSUE_LABEL],
+    });
+
+    const manifest = tracker.state.manifests.get(100);
+    expect(manifest).toEqual({
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: 100,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      stage: "spec-published",
+      workerProfile: defaultWorkerProfile,
+    });
+
+    await expect(coordinator.getActiveWorkflow()).resolves.toEqual({
+      workflowId: 100,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      stage: "spec-published",
+      workerProfile: defaultWorkerProfile,
+      title: defaultSpecDraft.title,
+    });
+
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_TICKETS_ACTION.id,
+        label: CREATE_TICKETS_ACTION.label,
+        description: CREATE_TICKETS_ACTION.description,
+      },
+    ]);
+  });
+
+  it("cancels Stage confirmation with no partial remote publication", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+    const cancelled = await coordinator.confirmStage("cancel");
+
+    expect(cancelled).toEqual({
+      status: "cancelled",
+      stage: "create-spec",
+    });
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+    expect(tracker.state.issues).toEqual([]);
+    expect(tracker.state.manifests.size).toBe(0);
+    await expect(coordinator.getActiveWorkflow()).resolves.toBeUndefined();
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_SPEC_ACTION.id,
+        label: CREATE_SPEC_ACTION.label,
+        description: CREATE_SPEC_ACTION.description,
+      },
+    ]);
+  });
+
+  it("revises by re-invoking to-spec without remote publication", async () => {
+    const revisedDraft: SpecDraft = {
+      title: "Ship feature X (revised)",
+      body: "## Problem Statement\n\nRevised.\n",
+    };
+    const skillsCalls = { runCreateSpec: 0 };
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            calls: skillsCalls,
+            createSpecOutcomes: [
+              { ok: true, draft: defaultSpecDraft },
+              { ok: true, draft: revisedDraft },
+            ],
+          },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+    const revised = await coordinator.confirmStage("revise");
+
+    expect(revised).toEqual({
+      status: "needs-confirmation",
+      stage: "create-spec",
+      draft: revisedDraft,
+      confirmationOptions: [...STAGE_CONFIRMATION_OPTIONS],
+    });
+    expect(skillsCalls.runCreateSpec).toBe(2);
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+  });
+
+  it("enters Compatibility recovery when to-spec omits a reviewable draft", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            createSpecOutcomes: [
+              { ok: false, reason: "Skill settled without a Stage result." },
+            ],
+          },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+
+    expect(result).toEqual({
+      status: "compatibility-recovery",
+      stage: "create-spec",
+      reason: "Skill settled without a Stage result.",
+    });
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("enters Compatibility recovery when the draft is missing title or body", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            createSpecOutcomes: [
+              { ok: true, draft: { title: "  ", body: "body only" } },
+            ],
+          },
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+
+    expect(result.status).toBe("compatibility-recovery");
+    if (result.status === "compatibility-recovery") {
+      expect(result.reason).toMatch(/title|body|draft/i);
+    }
+  });
+
+  it("fails closed when Create-spec is requested while preflight is incomplete", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          environment: { hasGitHubRemote: async () => false },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/preflight/i);
+    }
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("fails closed when Create-spec is requested while an Active workflow already exists", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 7,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "spec-published",
+        workerProfile: defaultWorkerProfile,
+      },
+    });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/Active workflow/i);
+    }
+    // Existing remote state only — no additional publish attempt.
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("fails closed when Stage confirmation is given without a pending stage", async () => {
+    const coordinator = createWorkflowCoordinator(createPorts());
+
+    const result = await coordinator.confirmStage("publish");
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/pending/i);
+    }
+  });
+
+  it("snapshots the effective Worker profile into the Workflow manifest on publish", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+          },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+    await coordinator.confirmStage("publish");
+
+    expect(tracker.state.manifests.get(100)?.workerProfile).toEqual(rootProfile);
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: rootProfile,
+      source: "workflow-snapshot",
+    });
   });
 });
 

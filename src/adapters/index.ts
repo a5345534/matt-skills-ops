@@ -7,5 +7,13 @@ export {
   thinkingLevelsForModel,
 } from "./models.js";
 export { createPreferencesPort } from "./preferences.js";
-export { createSkillsPort } from "./skills.js";
+export {
+  createSkillsPort,
+  type CreateSpecHost,
+} from "./skills.js";
+export {
+  createTrackerPort,
+  formatWorkflowManifestComment,
+  parseWorkflowManifestComment,
+} from "./tracker.js";
 export { createGitTopologyPort } from "./topology.js";

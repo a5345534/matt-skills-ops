@@ -24,3 +24,35 @@ export const UNSUPPORTED_TRACKER_REASON =
  */
 export const NO_GIT_REPOSITORY_REASON =
   "Not inside a Git repository. Matt Auto selects Workflow roots from independently managed Git repositories. Open a path inside a Git repository, or clone one first. Matt Auto V1 does not run git init or create repositories.";
+
+/** Next action: Create-spec Planning stage in Workflow home. */
+export const CREATE_SPEC_ACTION = {
+  id: "create-spec",
+  label: "Create spec",
+  description:
+    "Run the Create-spec Planning stage in Workflow home using the installed to-spec skill.",
+} as const;
+
+/** Next action: Create-tickets Planning stage (after a published spec). */
+export const CREATE_TICKETS_ACTION = {
+  id: "create-tickets",
+  label: "Create tickets",
+  description:
+    "Break the published spec into tickets as a Planning stage in Workflow home.",
+} as const;
+
+/** Stage confirmation choices after a reviewable Planning-stage artifact. */
+export const STAGE_CONFIRMATION_OPTIONS = [
+  "publish",
+  "revise",
+  "cancel",
+] as const;
+
+/** HTML comment marker for the managed Workflow manifest GitHub comment. */
+export const WORKFLOW_MANIFEST_MARKER = "<!-- matt-auto:workflow-manifest -->";
+
+/** Schema id embedded in the Workflow manifest JSON body. */
+export const WORKFLOW_MANIFEST_SCHEMA = "matt-auto/workflow-manifest" as const;
+
+/** Triage label applied to published specs. */
+export const SPEC_ISSUE_LABEL = "ready-for-agent";

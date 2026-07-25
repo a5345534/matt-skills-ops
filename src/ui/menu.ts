@@ -4,6 +4,9 @@ import type {
   PreflightCheck,
   PreflightResult,
   ResolvedWorkerProfile,
+  SpecDraft,
+  StageConfirmationDecision,
+  StageResult,
   WorkerProfile,
   WorkflowCoordinator,
   WorkflowRoot,
@@ -20,6 +23,11 @@ export type MattAutoUi = {
     title: string,
     placeholder?: string,
   ): Promise<string | undefined>;
+  /**
+   * Optional multi-line editor (used for Create-spec draft capture).
+   * When omitted, Create-spec falls back to title + body inputs when available.
+   */
+  editor?(title: string, prefill?: string): Promise<string | undefined>;
   notify(message: string, type?: "info" | "warning" | "error"): void;
 };
 
@@ -36,6 +44,31 @@ const SET_GLOBAL_WORKER = "Set global default Worker profile";
 const SET_ROOT_WORKER = "Set Workflow-root override";
 const CLEAR_ROOT_WORKER = "Clear Workflow-root override";
 const BACK_ITEM = "← Back";
+
+const PUBLISH_ITEM = "Publish";
+const REVISE_ITEM = "Revise";
+const CANCEL_ITEM = "Cancel";
+
+const CREATE_SPEC_EDITOR_TITLE =
+  "Create-spec draft (to-spec synthesis; Matt Auto publishes only after Stage confirmation)";
+
+const CREATE_SPEC_EDITOR_PREFILL = `
+# Spec title on the first line
+
+## Problem Statement
+
+## Solution
+
+## User Stories
+
+## Implementation Decisions
+
+## Testing Decisions
+
+## Out of Scope
+
+## Further Notes
+`.trimStart();
 
 function formatCheckLine(check: PreflightCheck): string {
   const mark = check.ok ? "✓" : "✗";
@@ -177,12 +210,137 @@ export async function presentMainMenu(
 
     const action = nextActions.find((a) => selected.startsWith(a.label));
     if (action) {
-      ui.notify(
-        `Next action "${action.label}" is not wired yet.`,
-        "info",
-      );
+      await handleNextAction(coordinator, ui, action);
     }
   }
+}
+
+/** Run a Next action and drive Stage confirmation when required. */
+export async function handleNextAction(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  action: NextAction,
+): Promise<void> {
+  let result = await coordinator.runNextAction(action.id);
+  result = await resolveStageResult(coordinator, ui, result);
+  notifyStageResult(ui, result);
+}
+
+async function resolveStageResult(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  initial: StageResult,
+): Promise<StageResult> {
+  let result = initial;
+
+  while (result.status === "needs-confirmation") {
+    const decision = await presentStageConfirmation(ui, result.draft);
+    if (!decision) {
+      result = await coordinator.confirmStage("cancel");
+      break;
+    }
+    result = await coordinator.confirmStage(decision);
+  }
+
+  return result;
+}
+
+/** Stage confirmation menu: Publish / Revise / Cancel. */
+export async function presentStageConfirmation(
+  ui: MattAutoUi,
+  draft: SpecDraft,
+): Promise<StageConfirmationDecision | undefined> {
+  const preview =
+    draft.body.length > 280 ? `${draft.body.slice(0, 277)}...` : draft.body;
+  ui.notify(
+    `Stage confirmation for Create-spec\nTitle: ${draft.title}\n\n${preview}`,
+    "info",
+  );
+
+  const selected = await ui.select("Stage confirmation", [
+    PUBLISH_ITEM,
+    REVISE_ITEM,
+    CANCEL_ITEM,
+  ]);
+  if (selected === undefined) return undefined;
+  if (selected === PUBLISH_ITEM) return "publish";
+  if (selected === REVISE_ITEM) return "revise";
+  if (selected === CANCEL_ITEM) return "cancel";
+  return undefined;
+}
+
+function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
+  switch (result.status) {
+    case "completed":
+      ui.notify(
+        `Published Create-spec as Workflow ID #${result.workflowId}. Workflow manifest written. Next: Create tickets.`,
+        "info",
+      );
+      return;
+    case "cancelled":
+      ui.notify(
+        "Create-spec cancelled. No remote publication was made.",
+        "info",
+      );
+      return;
+    case "compatibility-recovery":
+      ui.notify(
+        `Compatibility recovery: ${result.reason}`,
+        "warning",
+      );
+      return;
+    case "failed":
+      ui.notify(result.reason, "error");
+      return;
+    case "needs-confirmation":
+      // Should have been resolved by resolveStageResult.
+      ui.notify(
+        "Create-spec is waiting for Stage confirmation (Publish / Revise / Cancel).",
+        "warning",
+      );
+      return;
+  }
+}
+
+/**
+ * Capture a Create-spec draft in Workflow home without publishing.
+ * Used by the Matt skills adapter host; skill definitions stay unmodified.
+ */
+export async function captureCreateSpecDraft(
+  ui: MattAutoUi,
+): Promise<SpecDraft | undefined> {
+  if (ui.editor) {
+    const text = await ui.editor(
+      CREATE_SPEC_EDITOR_TITLE,
+      CREATE_SPEC_EDITOR_PREFILL,
+    );
+    if (text === undefined) return undefined;
+    return parseDraftFromEditor(text);
+  }
+
+  if (!ui.input) {
+    ui.notify(
+      "Create-spec needs an editor or input UI to capture the to-spec draft without publishing.",
+      "warning",
+    );
+    return undefined;
+  }
+
+  const title = await ui.input("Spec title", "Title from to-spec synthesis");
+  if (title === undefined) return undefined;
+  const body = await ui.input("Spec body", "Full PRD/spec body");
+  if (body === undefined) return undefined;
+  return { title, body };
+}
+
+function parseDraftFromEditor(text: string): SpecDraft | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const lines = trimmed.split(/\r?\n/);
+  const title = (lines[0] ?? "").replace(/^#\s*/, "").trim();
+  const body = lines.slice(1).join("\n").replace(/^\n+/, "");
+  if (!title || !body.trim()) return undefined;
+  return { title, body };
 }
 
 /** Interactive Root selection among discovered Workflow roots. */
@@ -451,7 +609,7 @@ export async function presentNextActions(
 
   const action = nextActions.find((a) => selected.startsWith(a.label));
   if (action) {
-    ui.notify(`Next action "${action.label}" is not wired yet.`, "info");
+    await handleNextAction(coordinator, ui, action);
   }
 }
 
