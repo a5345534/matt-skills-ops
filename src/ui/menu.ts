@@ -509,6 +509,51 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
         );
         return;
       }
+      if (result.stage === "workflow-pr") {
+        if (result.workflowPrNumber !== undefined) {
+          const target = result.targetBranch
+            ? ` → ${result.targetBranch}`
+            : "";
+          ui.notify(
+            [
+              `Workflow PR #${result.workflowPrNumber}${target}.`,
+              result.integrationBranch
+                ? `Integration branch: ${result.integrationBranch}.`
+                : undefined,
+              result.workflowPrUrl ? result.workflowPrUrl : undefined,
+            ]
+              .filter(Boolean)
+              .join(" "),
+            "info",
+          );
+          return;
+        }
+      }
+      if (result.stage === "cleanup") {
+        ui.notify(
+          [
+            `Workflow cleanup completed for #${result.workflowId}.`,
+            result.cleanedLocal && result.cleanedRemote
+              ? "Local workspaces/transcripts and remote matt-auto branches removed together."
+              : undefined,
+            "GitHub issue/PR/manifest history retained.",
+            result.removedBranches?.length
+              ? `Branches: ${result.removedBranches.join(", ")}.`
+              : undefined,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          "info",
+        );
+        return;
+      }
+      if (result.stage === "follow-up") {
+        ui.notify(
+          `Started Follow-up workflow #${result.workflowId} referencing completed Workflow #${result.followUpOf}. Next: Create tickets.`,
+          "info",
+        );
+        return;
+      }
       if (result.ticketProgress) {
         ui.notify(
           [

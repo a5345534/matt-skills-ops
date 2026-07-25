@@ -209,3 +209,58 @@ export function parseCiRecoveryActionId(
   if (!Number.isInteger(ticketNumber) || ticketNumber <= 0) return undefined;
   return { ticketNumber, decision };
 }
+
+/** Next action: open the single Workflow PR (Integration → Target). */
+export const OPEN_WORKFLOW_PR_ACTION = {
+  id: "open-workflow-pr",
+  label: "Open Workflow PR",
+  description:
+    "Open one Workflow PR from the Integration branch to the Target branch after all tickets are integrated and CI-complete.",
+} as const;
+
+/** Next action: merge the Workflow PR through Matt Auto. */
+export const MERGE_WORKFLOW_PR_ACTION = {
+  id: "merge-workflow-pr",
+  label: "Merge Workflow PR",
+  description:
+    "Merge the Workflow PR as a Next action rather than requiring a manual GitHub operation.",
+} as const;
+
+/** Next action: paired local + remote Workflow cleanup after merge. */
+export const CLEANUP_WORKFLOW_ACTION = {
+  id: "cleanup-workflow",
+  label: "Cleanup workflow",
+  description:
+    "Remove local workspaces/transcripts and matching remote matt-auto branches together. Retains GitHub issue/PR/manifest history.",
+} as const;
+
+/** Next action: start a Follow-up workflow after the original Workflow PR merges. */
+export const START_FOLLOW_UP_ACTION = {
+  id: "start-follow-up",
+  label: "Start Follow-up workflow",
+  description:
+    "Create a Follow-up workflow with a new spec issue that references the completed workflow rather than mutating it.",
+} as const;
+
+/** Prefix for Next actions that start a pre-merge Rework attempt for a closed ticket. */
+export const REWORK_TICKET_ACTION_PREFIX = "rework-ticket:" as const;
+
+/** Build the Next action id for a pre-merge Rework attempt. */
+export function reworkTicketActionId(ticketNumber: number): string {
+  return `${REWORK_TICKET_ACTION_PREFIX}${ticketNumber}`;
+}
+
+/** Parse a rework-ticket Next action id. */
+export function parseReworkTicketActionId(
+  actionId: string,
+): number | undefined {
+  if (!actionId.startsWith(REWORK_TICKET_ACTION_PREFIX)) {
+    return undefined;
+  }
+  const raw = actionId.slice(REWORK_TICKET_ACTION_PREFIX.length);
+  const number = Number(raw);
+  if (!Number.isInteger(number) || number <= 0) {
+    return undefined;
+  }
+  return number;
+}

@@ -55,5 +55,30 @@ export function createRemoteGitPort(workflowRoot: string): RemoteGitPort {
         );
       }
     },
+
+    async deleteRemoteBranches(branchNames) {
+      for (const branchName of branchNames) {
+        // `git push origin --delete <branch>` fails if the remote branch is already gone;
+        // treat missing remotes as success so paired cleanup stays idempotent.
+        const result = await run(root, "git", [
+          "push",
+          "origin",
+          "--delete",
+          branchName,
+        ]);
+        if (result.code === 0) continue;
+        const detail = (result.stderr || result.stdout || "").toLowerCase();
+        const missing =
+          detail.includes("remote ref does not exist") ||
+          detail.includes("does not exist") ||
+          detail.includes("not found") ||
+          detail.includes("unable to delete");
+        if (!missing) {
+          throw new Error(
+            `git push origin --delete ${branchName} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
+          );
+        }
+      }
+    },
   };
 }

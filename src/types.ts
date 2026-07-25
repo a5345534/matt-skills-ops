@@ -40,7 +40,11 @@ export type StageId =
   | "create-tickets"
   | "implement"
   | "integrate"
-  | "ci-gate";
+  | "ci-gate"
+  | "workflow-pr"
+  | "cleanup"
+  | "rework"
+  | "follow-up";
 
 /** On-demand CI gate status for an Integration branch. Never polled in the background. */
 export type CiStatus = "pending" | "success" | "failure";
@@ -99,8 +103,16 @@ export type TicketsDraft = {
 /**
  * Durable orchestration stage recorded on the Workflow manifest.
  * Extended by later tickets as the workflow advances.
+ * - pr-opened: Workflow PR exists (pre-merge)
+ * - merged: Workflow PR merged; cleanup still available
+ * - completed: post-cleanup; no longer an Active workflow
  */
-export type WorkflowStage = "spec-published" | "tickets-published";
+export type WorkflowStage =
+  | "spec-published"
+  | "tickets-published"
+  | "pr-opened"
+  | "merged"
+  | "completed";
 
 /**
  * One ticket whose Integration unit has been merged, verified, and pushed.
@@ -110,6 +122,14 @@ export type IntegratedTicketRef = {
   number: number;
   attempt: number;
   branchName: string;
+};
+
+/** Workflow PR recorded on the Workflow manifest. */
+export type WorkflowPrRef = {
+  number: number;
+  url?: string;
+  headBranch: string;
+  baseBranch: string;
 };
 
 /**
@@ -129,11 +149,16 @@ export type WorkflowManifest = {
   integrationBranch?: string;
   /** Tickets whose Integration units have been merged, verified, and pushed. */
   integratedTickets?: readonly IntegratedTicketRef[];
+  /** Single Workflow PR from Integration branch to Target branch. */
+  workflowPr?: WorkflowPrRef;
+  /** When this is a Follow-up workflow, the original completed Workflow ID. */
+  followUpOf?: number;
 };
 
 /**
  * Active workflow recovered from GitHub (spec issue + Workflow manifest).
  * Workflow ID is the published spec issue number.
+ * Completed (post-cleanup) workflows are not Active.
  */
 export type ActiveWorkflow = {
   workflowId: number;
@@ -147,6 +172,10 @@ export type ActiveWorkflow = {
   integrationBranch?: string;
   /** Tickets already integrated (ticket issues stay open until CI gate). */
   integratedTickets?: readonly IntegratedTicketRef[];
+  /** Single Workflow PR when opened (or after merge, until cleanup). */
+  workflowPr?: WorkflowPrRef;
+  /** When this is a Follow-up workflow, the original completed Workflow ID. */
+  followUpOf?: number;
 };
 
 /** A ticket that is open and has no open blockers — ready for Implementation. */
@@ -219,6 +248,14 @@ export type WorkflowPanelState = {
     summary?: string;
     url?: string;
   }[];
+  /** Compact Workflow PR status when opened or merged (pre-cleanup). */
+  workflowPr?: {
+    number: number;
+    status: "open" | "merged";
+    url?: string;
+    baseBranch: string;
+    headBranch: string;
+  };
 };
 
 /**
@@ -341,6 +378,22 @@ export type StageResult =
       ciUrl?: string;
       /** Optional CI summary for panel / recovery. */
       ciSummary?: string;
+      /** Workflow PR number after open or merge. */
+      workflowPrNumber?: number;
+      /** Workflow PR URL when available. */
+      workflowPrUrl?: string;
+      /** Target branch for the Workflow PR. */
+      targetBranch?: string;
+      /** Branches removed by paired Workflow cleanup (local + remote). */
+      removedBranches?: readonly string[];
+      /** True when paired cleanup removed local workspaces/transcripts. */
+      cleanedLocal?: boolean;
+      /** True when paired cleanup removed matching remote matt-auto branches. */
+      cleanedRemote?: boolean;
+      /** Original Workflow ID when a Follow-up workflow was created. */
+      followUpOf?: number;
+      /** True when this Stage result is a pre-merge Rework attempt. */
+      rework?: boolean;
     }
   | {
       status: "pending-ci";
@@ -386,6 +439,16 @@ export type StageResult =
       reason: string;
       ticketNumber?: number;
       attempt?: number;
+      workflowId?: number;
+      workflowPrNumber?: number;
+      workflowPrUrl?: string;
+      integrationBranch?: string;
+      targetBranch?: string;
+      removedBranches?: readonly string[];
+      cleanedLocal?: boolean;
+      cleanedRemote?: boolean;
+      followUpOf?: number;
+      rework?: boolean;
     }
   | {
       status: "compatibility-recovery";
@@ -393,6 +456,7 @@ export type StageResult =
       reason: string;
       ticketNumber?: number;
       attempt?: number;
+      rework?: boolean;
     };
 
 /**

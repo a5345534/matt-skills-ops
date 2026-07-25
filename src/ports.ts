@@ -149,6 +149,19 @@ export type WorkspacePort = {
     workflowId: number;
     ticketBranch: string;
   }): Promise<IntegrationMergeResult>;
+  /**
+   * List local matt-auto branches owned by a Workflow ID
+   * (Integration branch + ticket attempt branches).
+   */
+  listWorkflowBranches(workflowId: number): Promise<readonly string[]>;
+  /**
+   * Remove local Implementation/Integration worktrees and matching local branches
+   * for a Workflow ID. Does not touch remotes or GitHub history.
+   */
+  cleanupWorkflowWorkspaces(workflowId: number): Promise<{
+    removedWorktrees: readonly string[];
+    removedLocalBranches: readonly string[];
+  }>;
 };
 
 /** Outcome of Local verification in the Integration workspace. */
@@ -195,6 +208,11 @@ export type RemoteGitPort = {
    * Only the Workflow coordinator may call this after Local verification succeeds.
    */
   pushBranch(branchName: string): Promise<void>;
+  /**
+   * Delete remote branches (paired Workflow cleanup).
+   * Only the Workflow coordinator may call this after Workflow PR merge.
+   */
+  deleteRemoteBranches(branchNames: readonly string[]): Promise<void>;
 };
 
 /** Launch parameters for one session-owned Implementation worker. */
@@ -255,6 +273,11 @@ export type TranscriptPort = {
   append(key: TranscriptKey, event: unknown): Promise<void>;
   /** Read retained transcript events for an attempt (empty when none). */
   read(key: TranscriptKey): Promise<readonly unknown[]>;
+  /**
+   * Remove all local Worker transcripts for a Workflow ID (paired cleanup).
+   * Never touches GitHub history.
+   */
+  cleanupWorkflowTranscripts(workflowId: number): Promise<void>;
 };
 
 /**
@@ -318,6 +341,25 @@ export type TrackerPort = {
   ): Promise<void>;
   /** Close a GitHub issue after Integration unit + CI gate success. */
   closeIssue(issueNumber: number): Promise<void>;
+  /**
+   * Reopen a closed GitHub issue for a pre-merge Rework attempt.
+   * Does not mutate completed workflow history after a Workflow PR merges.
+   */
+  reopenIssue(issueNumber: number): Promise<void>;
+  /**
+   * Open one Workflow PR from the Integration branch to the Target branch.
+   * Only the Workflow coordinator may create the Workflow PR.
+   */
+  createPullRequest(input: {
+    head: string;
+    base: string;
+    title: string;
+    body: string;
+  }): Promise<{ number: number; url?: string }>;
+  /**
+   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   */
+  mergePullRequest(input: { number: number }): Promise<void>;
 };
 
 /**

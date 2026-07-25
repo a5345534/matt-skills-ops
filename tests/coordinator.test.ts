@@ -38,6 +38,7 @@ import type {
 import {
   checkCiActionId,
   ciRecoveryActionId,
+  CLEANUP_WORKFLOW_ACTION,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
@@ -46,10 +47,14 @@ import {
   implementationBranchName,
   integrateTicketActionId,
   integrationBranchName,
+  MERGE_WORKFLOW_PR_ACTION,
   NO_GIT_REPOSITORY_REASON,
+  OPEN_WORKFLOW_PR_ACTION,
   REQUIRED_MATT_SKILLS,
+  reworkTicketActionId,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
+  START_FOLLOW_UP_ACTION,
   TICKET_ISSUE_LABEL,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
@@ -203,6 +208,8 @@ type WorkspaceState = {
     ticketBranch: string;
   }>;
   attempts: Map<string, number>;
+  cleanupCalls: number[];
+  listBranchesCalls: number[];
   failCreate?: boolean;
   failEnsureIntegration?: boolean;
   mergeResult?:
@@ -224,6 +231,8 @@ function createWorkspace(
     integrationEnsures: [],
     merges: [],
     attempts: initial.attempts ?? new Map(),
+    cleanupCalls: [],
+    listBranchesCalls: [],
     ...(initial.failCreate !== undefined
       ? { failCreate: initial.failCreate }
       : {}),
@@ -296,6 +305,27 @@ function createWorkspace(
       }
       return { ok: true, mergeCommitSha: "merge-sha-1" };
     },
+    listWorkflowBranches: async (workflowId) => {
+      state.listBranchesCalls.push(workflowId);
+      const branches = new Set<string>();
+      branches.add(integrationBranchName(workflowId));
+      for (const create of state.creates) {
+        if (create.workflowId === workflowId) {
+          branches.add(create.branchName);
+        }
+      }
+      return [...branches].sort();
+    },
+    cleanupWorkflowWorkspaces: async (workflowId) => {
+      state.cleanupCalls.push(workflowId);
+      const branches = await port.listWorkflowBranches(workflowId);
+      return {
+        removedWorktrees: branches.map(
+          (b) => `/matt-auto-workspaces/${workflowId}/${b.replace(/\//g, "-")}`,
+        ),
+        removedLocalBranches: branches,
+      };
+    },
   };
 
   return { port, state };
@@ -326,15 +356,21 @@ function createVerification(
 
 type RemoteGitState = {
   pushes: string[];
+  deleted: string[][];
   failPush?: boolean;
+  failDelete?: boolean;
 };
 
 function createRemoteGit(
-  initial: { failPush?: boolean } = {},
+  initial: { failPush?: boolean; failDelete?: boolean } = {},
 ): { port: RemoteGitPort; state: RemoteGitState } {
   const state: RemoteGitState = {
     pushes: [],
+    deleted: [],
     ...(initial.failPush !== undefined ? { failPush: initial.failPush } : {}),
+    ...(initial.failDelete !== undefined
+      ? { failDelete: initial.failDelete }
+      : {}),
   };
   return {
     state,
@@ -344,6 +380,12 @@ function createRemoteGit(
           throw new Error(`push failed for ${branchName}`);
         }
         state.pushes.push(branchName);
+      },
+      deleteRemoteBranches: async (branchNames) => {
+        if (state.failDelete) {
+          throw new Error(`delete remote failed for ${branchNames.join(", ")}`);
+        }
+        state.deleted.push([...branchNames]);
       },
     },
   };
@@ -433,8 +475,10 @@ function createWorkers(
 function createTranscripts(): {
   port: TranscriptPort;
   state: Map<string, unknown[]>;
+  cleanupCalls: number[];
 } {
   const state = new Map<string, unknown[]>();
+  const cleanupCalls: number[] = [];
   const keyOf = (key: {
     workflowId: number;
     ticketNumber: number;
@@ -443,6 +487,7 @@ function createTranscripts(): {
 
   return {
     state,
+    cleanupCalls,
     port: {
       append: async (key, event) => {
         const k = keyOf(key);
@@ -451,6 +496,14 @@ function createTranscripts(): {
         state.set(k, list);
       },
       read: async (key) => state.get(keyOf(key)) ?? [],
+      cleanupWorkflowTranscripts: async (workflowId) => {
+        cleanupCalls.push(workflowId);
+        for (const key of [...state.keys()]) {
+          if (key.startsWith(`${workflowId}:`)) {
+            state.delete(key);
+          }
+        }
+      },
     },
   };
 }
@@ -466,12 +519,25 @@ type TrackerState = {
     parent?: number;
   }>;
   manifests: Map<number, WorkflowManifest>;
+  pullRequests: Array<{
+    number: number;
+    head: string;
+    base: string;
+    title: string;
+    body: string;
+    merged: boolean;
+    url: string;
+  }>;
   createIssueCalls: number;
   writeManifestCalls: number;
   closeIssueCalls: number[];
+  reopenIssueCalls: number[];
+  createPrCalls: Array<{ head: string; base: string; title: string }>;
+  mergePrCalls: number[];
   addBlockedByCalls: Array<{ issue: number; blocker: number }>;
   addSubIssueCalls: Array<{ parent: number; child: number }>;
   nextNumber: number;
+  nextPrNumber: number;
 };
 
 function createTracker(
@@ -491,12 +557,17 @@ function createTracker(
   const state: TrackerState = {
     issues: [],
     manifests: new Map(),
+    pullRequests: [],
     createIssueCalls: 0,
     writeManifestCalls: 0,
     closeIssueCalls: [],
+    reopenIssueCalls: [],
+    createPrCalls: [],
+    mergePrCalls: [],
     addBlockedByCalls: [],
     addSubIssueCalls: [],
     nextNumber: 100,
+    nextPrNumber: 500,
   };
 
   if (initial.active) {
@@ -510,6 +581,18 @@ function createTracker(
     };
     if (initial.active.tickets) {
       manifest.tickets = [...initial.active.tickets];
+    }
+    if (initial.active.integrationBranch) {
+      manifest.integrationBranch = initial.active.integrationBranch;
+    }
+    if (initial.active.integratedTickets) {
+      manifest.integratedTickets = [...initial.active.integratedTickets];
+    }
+    if (initial.active.workflowPr) {
+      manifest.workflowPr = { ...initial.active.workflowPr };
+    }
+    if (initial.active.followUpOf !== undefined) {
+      manifest.followUpOf = initial.active.followUpOf;
     }
     state.manifests.set(initial.active.workflowId, manifest);
     state.issues.push({
@@ -565,28 +648,34 @@ function createTracker(
     },
     findActiveWorkflow: async (targetBranch) => {
       for (const manifest of state.manifests.values()) {
-        if (manifest.targetBranch === targetBranch) {
-          const issue = state.issues.find((i) => i.number === manifest.workflowId);
-          const active: ActiveWorkflow = {
-            workflowId: manifest.workflowId,
-            targetBranch: manifest.targetBranch,
-            stage: manifest.stage,
-            workerProfile: manifest.workerProfile,
-          };
-          if (manifest.tickets) {
-            active.tickets = [...manifest.tickets];
-          }
-          if (manifest.integrationBranch) {
-            active.integrationBranch = manifest.integrationBranch;
-          }
-          if (manifest.integratedTickets) {
-            active.integratedTickets = [...manifest.integratedTickets];
-          }
-          if (issue?.title) {
-            active.title = issue.title;
-          }
-          return active;
+        if (manifest.targetBranch !== targetBranch) continue;
+        if (manifest.stage === "completed") continue;
+        const issue = state.issues.find((i) => i.number === manifest.workflowId);
+        const active: ActiveWorkflow = {
+          workflowId: manifest.workflowId,
+          targetBranch: manifest.targetBranch,
+          stage: manifest.stage,
+          workerProfile: manifest.workerProfile,
+        };
+        if (manifest.tickets) {
+          active.tickets = [...manifest.tickets];
         }
+        if (manifest.integrationBranch) {
+          active.integrationBranch = manifest.integrationBranch;
+        }
+        if (manifest.integratedTickets) {
+          active.integratedTickets = [...manifest.integratedTickets];
+        }
+        if (manifest.workflowPr) {
+          active.workflowPr = { ...manifest.workflowPr };
+        }
+        if (manifest.followUpOf !== undefined) {
+          active.followUpOf = manifest.followUpOf;
+        }
+        if (issue?.title) {
+          active.title = issue.title;
+        }
+        return active;
       }
       return undefined;
     },
@@ -614,6 +703,38 @@ function createTracker(
       state.closeIssueCalls.push(issueNumber);
       const issue = state.issues.find((i) => i.number === issueNumber);
       if (issue) issue.state = "CLOSED";
+    },
+    reopenIssue: async (issueNumber) => {
+      state.reopenIssueCalls.push(issueNumber);
+      const issue = state.issues.find((i) => i.number === issueNumber);
+      if (issue) issue.state = "OPEN";
+    },
+    createPullRequest: async (input) => {
+      state.createPrCalls.push({
+        head: input.head,
+        base: input.base,
+        title: input.title,
+      });
+      const number = state.nextPrNumber++;
+      const url = `https://example.test/pr/${number}`;
+      state.pullRequests.push({
+        number,
+        head: input.head,
+        base: input.base,
+        title: input.title,
+        body: input.body,
+        merged: false,
+        url,
+      });
+      return { number, url };
+    },
+    mergePullRequest: async (input) => {
+      state.mergePrCalls.push(input.number);
+      const pr = state.pullRequests.find((p) => p.number === input.number);
+      if (!pr) {
+        throw new Error(`PR #${input.number} not found`);
+      }
+      pr.merged = true;
     },
     addBlockedBy: async (issueNumber, blockerIssueNumber) => {
       state.addBlockedByCalls.push({
@@ -3292,5 +3413,307 @@ describe("Workflow coordinator on-demand CI gate", () => {
     });
     expect(transcript).toContainEqual(expect.objectContaining({ type: "ci-check", status: "success" }));
     expect(transcript).toContainEqual(expect.objectContaining({ type: "ticket-closed", ticketNumber: 43 }));
+  });
+});
+
+describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-up", () => {
+  async function completeWorker(
+    coordinator: ReturnType<typeof createWorkflowCoordinator>,
+    workers: ReturnType<typeof createWorkers>,
+    ticketNumber: number,
+    attempt = 1,
+  ) {
+    await coordinator.runNextAction(implementTicketActionId(ticketNumber));
+    const workerId = `implement-42-${ticketNumber}-r${attempt}`;
+    await workers.emit(workerId, {
+      type: "stage-result",
+      workerId,
+      outcome: { status: "completed", summary: `Done #${ticketNumber}` },
+    });
+  }
+
+  async function integrateAndClose(
+    coordinator: ReturnType<typeof createWorkflowCoordinator>,
+    workers: ReturnType<typeof createWorkers>,
+    ticketNumber: number,
+    attempt = 1,
+  ) {
+    await completeWorker(coordinator, workers, ticketNumber, attempt);
+    const result = await coordinator.confirmDisposition("close");
+    expect(result).toMatchObject({
+      status: "completed",
+      stage: "ci-gate",
+      ticketClosed: true,
+      ticketNumber,
+    });
+  }
+
+  function allCompleteFixture() {
+    const ci = createCi({ result: { status: "success", summary: "green" } });
+    const fixture = ticketsPublishedFixture({ ci });
+    return { ...fixture, ci };
+  }
+
+  async function driveAllTicketsComplete() {
+    const fixture = allCompleteFixture();
+    const { coordinator, workers } = fixture;
+    // 43 unblocks 45; 44 is independent.
+    await integrateAndClose(coordinator, workers, 43);
+    await integrateAndClose(coordinator, workers, 44);
+    await integrateAndClose(coordinator, workers, 45);
+    return fixture;
+  }
+
+  it("offers a single Workflow PR only after all tickets are integrated and CI-complete", async () => {
+    const partial = allCompleteFixture();
+    await integrateAndClose(partial.coordinator, partial.workers, 43);
+    const partialIds = (await partial.coordinator.nextActions()).map((a) => a.id);
+    expect(partialIds).not.toContain(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(partialIds).toContain(implementTicketActionId(44));
+
+    const { coordinator } = await driveAllTicketsComplete();
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids[0]).toBe(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(ids).not.toContain(implementTicketActionId(43));
+    expect(ids).not.toContain(implementTicketActionId(44));
+    expect(ids).not.toContain(implementTicketActionId(45));
+  });
+
+  it("opens one Workflow PR from the Integration branch to the configured Target branch", async () => {
+    const { coordinator, tracker } = await driveAllTicketsComplete();
+    const opened = await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(opened).toMatchObject({
+      status: "completed",
+      stage: "workflow-pr",
+      workflowId: 42,
+      workflowPrNumber: 500,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      integrationBranch: "matt-auto/42",
+    });
+    expect(tracker.state.createPrCalls).toEqual([
+      {
+        head: "matt-auto/42",
+        base: DEFAULT_TARGET_BRANCH,
+        title: expect.stringContaining("Workflow #42"),
+      },
+    ]);
+    const manifest = tracker.state.manifests.get(42);
+    expect(manifest?.stage).toBe("pr-opened");
+    expect(manifest?.workflowPr).toMatchObject({
+      number: 500,
+      headBranch: "matt-auto/42",
+      baseBranch: DEFAULT_TARGET_BRANCH,
+    });
+
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids[0]).toBe(MERGE_WORKFLOW_PR_ACTION.id);
+    expect(ids).not.toContain(OPEN_WORKFLOW_PR_ACTION.id);
+  });
+
+  it("targets a configured non-main Target branch on the Workflow PR", async () => {
+    const ci = createCi({ result: { status: "success", summary: "green" } });
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: "develop",
+        stage: "tickets-published",
+        workerProfile: defaultWorkerProfile,
+        title: "Develop workflow",
+        tickets: [43, 44, 45],
+      },
+      tickets: [
+        { number: 43, title: "Ship core path", blockedBy: [] },
+        { number: 44, title: "Ship parallel path", blockedBy: [] },
+        { number: 45, title: "Ship dependent path", blockedBy: [43] },
+      ],
+    });
+    const workspace = createWorkspace("/repo");
+    const workers = createWorkers();
+    const remoteGit = createRemoteGit();
+    const ports = createPorts({
+      defaultRoot: {
+        preferences: {
+          targetBranch: "develop",
+          globalWorkerProfile: defaultWorkerProfile,
+        },
+        tracker,
+        workspace,
+        workers,
+        remoteGit,
+        ci,
+      },
+    });
+    const coordinator = createWorkflowCoordinator(ports);
+    await integrateAndClose(coordinator, workers, 43);
+    await integrateAndClose(coordinator, workers, 44);
+    await integrateAndClose(coordinator, workers, 45);
+
+    const opened = await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(opened).toMatchObject({
+      status: "completed",
+      targetBranch: "develop",
+    });
+    expect(tracker.state.createPrCalls[0]?.base).toBe("develop");
+    expect(tracker.state.manifests.get(42)?.workflowPr?.baseBranch).toBe("develop");
+  });
+
+  it("merges the Workflow PR as a Matt Auto Next action", async () => {
+    const { coordinator, tracker } = await driveAllTicketsComplete();
+    await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    const merged = await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+    expect(merged).toMatchObject({
+      status: "completed",
+      stage: "workflow-pr",
+      workflowId: 42,
+      workflowPrNumber: 500,
+    });
+    expect(tracker.state.mergePrCalls).toEqual([500]);
+    expect(tracker.state.pullRequests[0]?.merged).toBe(true);
+    expect(tracker.state.manifests.get(42)?.stage).toBe("merged");
+
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toEqual([CLEANUP_WORKFLOW_ACTION.id]);
+  });
+
+  it("pairs local and remote matt-auto cleanup after merge and retains GitHub history", async () => {
+    const fixture = await driveAllTicketsComplete();
+    const { coordinator, tracker, workspace, remoteGit, transcripts } = fixture;
+    await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+
+    const cleaned = await coordinator.runNextAction(CLEANUP_WORKFLOW_ACTION.id);
+    expect(cleaned).toMatchObject({
+      status: "completed",
+      stage: "cleanup",
+      workflowId: 42,
+      cleanedLocal: true,
+      cleanedRemote: true,
+    });
+    expect(workspace.state.cleanupCalls).toEqual([42]);
+    expect(remoteGit.state.deleted).toHaveLength(1);
+    const deleted = remoteGit.state.deleted[0] ?? [];
+    expect(deleted).toContain("matt-auto/42");
+    expect(deleted).toContain("matt-auto/42/ticket-43/r1");
+    expect(deleted).toContain("matt-auto/42/ticket-44/r1");
+    expect(deleted).toContain("matt-auto/42/ticket-45/r1");
+    expect(transcripts.cleanupCalls).toEqual([42]);
+
+    // GitHub issue / PR / manifest history retained.
+    expect(tracker.state.issues.find((i) => i.number === 42)).toBeDefined();
+    expect(tracker.state.pullRequests).toHaveLength(1);
+    expect(tracker.state.manifests.get(42)?.stage).toBe("completed");
+    expect(tracker.state.manifests.get(42)?.workflowPr?.number).toBe(500);
+
+    // No longer Active after cleanup.
+    await expect(coordinator.getActiveWorkflow()).resolves.toBeUndefined();
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(CREATE_SPEC_ACTION.id);
+    expect(ids).toContain(START_FOLLOW_UP_ACTION.id);
+  });
+
+  it("creates a fresh numbered Rework attempt workspace for a closed ticket before merge", async () => {
+    const { coordinator, workers, tracker, workspace } = await driveAllTicketsComplete();
+    // Pre-merge: all tickets closed; rework reopens and numbers a new attempt.
+    const idsBefore = (await coordinator.nextActions()).map((a) => a.id);
+    expect(idsBefore).toContain(reworkTicketActionId(43));
+    expect(idsBefore).toContain(OPEN_WORKFLOW_PR_ACTION.id);
+
+    const reworked = await coordinator.runNextAction(reworkTicketActionId(43));
+    expect(reworked).toMatchObject({
+      status: "running",
+      stage: "implement",
+      ticketNumber: 43,
+      attempt: 2,
+      branchName: "matt-auto/42/ticket-43/r2",
+    });
+    expect(tracker.state.reopenIssueCalls).toEqual([43]);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+    expect(
+      tracker.state.manifests.get(42)?.integratedTickets?.map((t) => t.number),
+    ).toEqual([44, 45]);
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 1, 1, 2]);
+
+    // Workflow PR is not offered while rework is in flight / ticket open.
+    expect(await coordinator.nextActions()).toEqual([]);
+
+    await workers.emit("implement-42-43-r2", {
+      type: "stage-result",
+      workerId: "implement-42-43-r2",
+      outcome: { status: "completed", summary: "Reworked #43" },
+    });
+    await coordinator.confirmDisposition("close");
+
+    const idsAfter = (await coordinator.nextActions()).map((a) => a.id);
+    expect(idsAfter).toContain(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("CLOSED");
+  });
+
+  it("numbers rework attempts without reusing a completed workspace identity (pre-merge)", async () => {
+    // Existing leave-open path already numbers attempts; rework of a closed ticket uses the same numbering.
+    const { coordinator, workers, workspace } = await driveAllTicketsComplete();
+    await coordinator.runNextAction(reworkTicketActionId(44));
+    await workers.emit("implement-42-44-r2", {
+      type: "stage-result",
+      workerId: "implement-42-44-r2",
+      outcome: { status: "completed" },
+    });
+    await coordinator.confirmDisposition("leave-open");
+    const third = await coordinator.runNextAction(implementTicketActionId(44));
+    expect(third).toMatchObject({
+      status: "running",
+      attempt: 3,
+      branchName: "matt-auto/42/ticket-44/r3",
+    });
+    expect(workspace.state.creates.map((c) => `${c.ticketNumber}/r${c.attempt}`)).toEqual(
+      expect.arrayContaining(["44/r1", "44/r2", "44/r3"]),
+    );
+  });
+
+  it("creates a Follow-up workflow with a new spec issue after merge rather than mutating the completed workflow", async () => {
+    const { coordinator, tracker } = await driveAllTicketsComplete();
+    await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+    await coordinator.runNextAction(CLEANUP_WORKFLOW_ACTION.id);
+
+    const originalManifest = structuredClone(tracker.state.manifests.get(42)!);
+    const followUp = await coordinator.runNextAction(START_FOLLOW_UP_ACTION.id);
+    expect(followUp).toMatchObject({
+      status: "completed",
+      stage: "follow-up",
+      followUpOf: 42,
+    });
+    expect(followUp.status === "completed" && followUp.workflowId).not.toBe(42);
+
+    const newId = followUp.status === "completed" ? followUp.workflowId : undefined;
+    expect(newId).toBeDefined();
+    const newManifest = tracker.state.manifests.get(newId!);
+    expect(newManifest).toMatchObject({
+      workflowId: newId,
+      stage: "spec-published",
+      followUpOf: 42,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+    });
+    // Original completed workflow is not mutated beyond its completed stage.
+    expect(tracker.state.manifests.get(42)).toEqual(originalManifest);
+    expect(tracker.state.manifests.get(42)?.stage).toBe("completed");
+    expect(tracker.state.manifests.get(42)?.integrationBranch).toBe("matt-auto/42");
+
+    const active = await coordinator.getActiveWorkflow();
+    expect(active).toMatchObject({
+      workflowId: newId,
+      stage: "spec-published",
+      followUpOf: 42,
+    });
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      expect.objectContaining({ id: CREATE_TICKETS_ACTION.id }),
+    ]);
+  });
+
+  it("does not offer Follow-up mutation path for pre-merge rework", async () => {
+    const { coordinator } = await driveAllTicketsComplete();
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(reworkTicketActionId(43));
+    expect(ids).not.toContain(START_FOLLOW_UP_ACTION.id);
+    expect(ids).not.toContain(CLEANUP_WORKFLOW_ACTION.id);
   });
 });

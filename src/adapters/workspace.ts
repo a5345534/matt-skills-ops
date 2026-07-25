@@ -263,5 +263,118 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
         ? { ok: true, mergeCommitSha }
         : { ok: true };
     },
+
+    async listWorkflowBranches(workflowId) {
+      const patterns = [
+        `matt-auto/${workflowId}`,
+        `matt-auto/${workflowId}/*`,
+      ];
+      const found = new Set<string>();
+      for (const pattern of patterns) {
+        const listed = await run(root, "git", [
+          "branch",
+          "--list",
+          "--format=%(refname:short)",
+          pattern,
+        ]);
+        if (listed.code !== 0) continue;
+        for (const line of listed.stdout.split("\n")) {
+          const name = line.trim();
+          if (name) found.add(name);
+        }
+      }
+      return [...found].sort();
+    },
+
+    async cleanupWorkflowWorkspaces(workflowId) {
+      const branchNames = await this.listWorkflowBranches(workflowId);
+      const removedWorktrees: string[] = [];
+      const removedLocalBranches: string[] = [];
+
+      // Remove worktrees first so branch -D succeeds.
+      const listed = await run(root, "git", [
+        "worktree",
+        "list",
+        "--porcelain",
+      ]);
+      if (listed.code === 0) {
+        const entries: Array<{ path?: string; branch?: string }> = [];
+        let current: { path?: string; branch?: string } = {};
+        for (const line of listed.stdout.split("\n")) {
+          if (line.startsWith("worktree ")) {
+            if (current.path) entries.push(current);
+            current = { path: line.slice("worktree ".length).trim() };
+          } else if (line.startsWith("branch ")) {
+            const ref = line.slice("branch ".length).trim();
+            current.branch = ref.replace(/^refs\/heads\//, "");
+          } else if (line.trim() === "") {
+            if (current.path) entries.push(current);
+            current = {};
+          }
+        }
+        if (current.path) entries.push(current);
+
+        for (const entry of entries) {
+          if (!entry.path || !entry.branch) continue;
+          if (!branchNames.includes(entry.branch)) continue;
+          // Never remove the main Workflow root worktree.
+          if (path.resolve(entry.path) === root) continue;
+          const removed = await run(root, "git", [
+            "worktree",
+            "remove",
+            "--force",
+            entry.path,
+          ]);
+          if (removed.code === 0) {
+            removedWorktrees.push(entry.path);
+          }
+        }
+      }
+
+      // Also drop known sibling layout paths if still present without branch mapping.
+      const siblingRoot = path.join(
+        path.dirname(root),
+        "matt-auto-workspaces",
+        String(workflowId),
+      );
+      if (await pathExists(siblingRoot)) {
+        // Best-effort: remove any remaining worktrees under the sibling root.
+        const listedAgain = await run(root, "git", [
+          "worktree",
+          "list",
+          "--porcelain",
+        ]);
+        if (listedAgain.code === 0) {
+          for (const line of listedAgain.stdout.split("\n")) {
+            if (!line.startsWith("worktree ")) continue;
+            const worktreePath = line.slice("worktree ".length).trim();
+            if (!worktreePath.startsWith(siblingRoot)) continue;
+            if (path.resolve(worktreePath) === root) continue;
+            const removed = await run(root, "git", [
+              "worktree",
+              "remove",
+              "--force",
+              worktreePath,
+            ]);
+            if (removed.code === 0 && !removedWorktrees.includes(worktreePath)) {
+              removedWorktrees.push(worktreePath);
+            }
+          }
+        }
+      }
+
+      for (const branchName of branchNames) {
+        const deleted = await run(root, "git", [
+          "branch",
+          "-D",
+          branchName,
+        ]);
+        if (deleted.code === 0) {
+          removedLocalBranches.push(branchName);
+        }
+      }
+
+      return { removedWorktrees, removedLocalBranches };
+    },
   };
 }

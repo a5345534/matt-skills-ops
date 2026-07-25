@@ -3,6 +3,7 @@ import {
   checkCiActionId,
   CI_RECOVERY_OPTIONS,
   ciRecoveryActionId,
+  CLEANUP_WORKFLOW_ACTION,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
@@ -12,15 +13,20 @@ import {
   implementationBranchName,
   integrateTicketActionId,
   integrationBranchName,
+  MERGE_WORKFLOW_PR_ACTION,
   NO_GIT_REPOSITORY_REASON,
+  OPEN_WORKFLOW_PR_ACTION,
   parseCheckCiActionId,
   parseCiRecoveryActionId,
   parseDispositionActionId,
   parseImplementTicketActionId,
   parseIntegrateTicketActionId,
+  parseReworkTicketActionId,
   REQUIRED_MATT_SKILLS,
+  reworkTicketActionId,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
+  START_FOLLOW_UP_ACTION,
   TICKET_ISSUE_LABEL,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
@@ -57,6 +63,7 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
   WorkflowRootKind,
+  WorkflowStage,
 } from "./types.js";
 
 type PendingCreateSpec = {
@@ -171,6 +178,13 @@ export function createWorkflowCoordinator(
    */
   let activeConflictWorker: ActiveConflictWorker | undefined;
   let pendingCiRecovery: PendingCiRecovery | undefined;
+  /**
+   * Session pointer to the most recently cleaned-up workflow on this Target branch.
+   * Enables Start Follow-up without mutating the completed workflow.
+   */
+  let lastCompletedWorkflow:
+    | { workflowId: number; title?: string; targetBranch: string }
+    | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -531,11 +545,68 @@ export function createWorkflowCoordinator(
     };
   }
 
+  function isTicketWorkStage(stage: WorkflowStage): boolean {
+    return stage === "tickets-published" || stage === "pr-opened";
+  }
+
+  function allTicketsComplete(progress: TicketProgressSummary): boolean {
+    return (
+      progress.total > 0 &&
+      progress.closed === progress.total &&
+      progress.open === 0 &&
+      progress.awaitingCi.length === 0 &&
+      progress.ready.length === 0
+    );
+  }
+
+  function manifestFromActive(
+    active: ActiveWorkflow,
+    overrides: Partial<WorkflowManifest> = {},
+  ): WorkflowManifest {
+    const manifest: WorkflowManifest = {
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: active.workflowId,
+      targetBranch: active.targetBranch,
+      stage: overrides.stage ?? active.stage,
+      workerProfile: active.workerProfile,
+    };
+    const tickets = overrides.tickets ?? active.tickets;
+    if (tickets) {
+      manifest.tickets = [...tickets];
+    }
+    const integrationBranch =
+      overrides.integrationBranch ?? active.integrationBranch;
+    if (integrationBranch) {
+      manifest.integrationBranch = integrationBranch;
+    }
+    const integratedTickets =
+      overrides.integratedTickets ?? active.integratedTickets;
+    if (integratedTickets) {
+      manifest.integratedTickets = [...integratedTickets];
+    }
+    const workflowPr =
+      overrides.workflowPr !== undefined
+        ? overrides.workflowPr
+        : active.workflowPr;
+    if (workflowPr) {
+      manifest.workflowPr = { ...workflowPr };
+    }
+    const followUpOf =
+      overrides.followUpOf !== undefined
+        ? overrides.followUpOf
+        : active.followUpOf;
+    if (followUpOf !== undefined) {
+      manifest.followUpOf = followUpOf;
+    }
+    return manifest;
+  }
+
   async function loadTicketProgress(
     bound: RootScopedPorts,
     active: ActiveWorkflow,
   ): Promise<TicketProgressSummary | undefined> {
-    if (active.stage !== "tickets-published") {
+    if (!isTicketWorkStage(active.stage) && active.stage !== "merged") {
       return undefined;
     }
     const numbers = active.tickets ?? [];
@@ -627,6 +698,23 @@ export function createWorkflowCoordinator(
       lines.push(`CI awaiting check: ${list}`);
     }
     return lines;
+  }
+
+  function appendWorkflowPrPanelLines(
+    lines: string[],
+    active: ActiveWorkflow,
+  ): void {
+    if (active.stage === "merged" && active.workflowPr) {
+      lines.push(
+        `Workflow PR #${active.workflowPr.number}: merged → ${active.workflowPr.baseBranch} (cleanup pending)`,
+      );
+      return;
+    }
+    if (active.workflowPr) {
+      lines.push(
+        `Workflow PR #${active.workflowPr.number}: open → ${active.workflowPr.baseBranch}`,
+      );
+    }
   }
 
   async function invokeCreateSpec(
@@ -842,13 +930,25 @@ export function createWorkflowCoordinator(
     const active = await loadActiveWorkflow(bound);
 
     if (!active) {
-      return [
+      const actions: NextAction[] = [
         {
           id: CREATE_SPEC_ACTION.id,
           label: CREATE_SPEC_ACTION.label,
           description: CREATE_SPEC_ACTION.description,
         },
       ];
+      const targetBranch = await resolveTargetBranch(bound.preferences);
+      if (
+        lastCompletedWorkflow &&
+        lastCompletedWorkflow.targetBranch === targetBranch
+      ) {
+        actions.push({
+          id: START_FOLLOW_UP_ACTION.id,
+          label: START_FOLLOW_UP_ACTION.label,
+          description: `${START_FOLLOW_UP_ACTION.description} References completed Workflow #${lastCompletedWorkflow.workflowId}.`,
+        });
+      }
+      return actions;
     }
 
     if (active.stage === "spec-published") {
@@ -861,7 +961,17 @@ export function createWorkflowCoordinator(
       ];
     }
 
-    if (active.stage === "tickets-published") {
+    if (active.stage === "merged") {
+      return [
+        {
+          id: CLEANUP_WORKFLOW_ACTION.id,
+          label: CLEANUP_WORKFLOW_ACTION.label,
+          description: CLEANUP_WORKFLOW_ACTION.description,
+        },
+      ];
+    }
+
+    if (isTicketWorkStage(active.stage)) {
       // While a worker runs, the passive panel owns progress.
       if (activeWorker || activeConflictWorker) {
         return [];
@@ -935,6 +1045,55 @@ export function createWorkflowCoordinator(
       }
 
       actions.push(...progress.ready.map(formatImplementAction));
+
+      // Pre-merge Rework for closed integrated tickets (fresh numbered attempt).
+      if (!active.workflowPr || active.stage === "pr-opened") {
+        const closedIntegrated = (active.integratedTickets ?? []).filter(
+          (t) =>
+            !progress.ready.some((r) => r.number === t.number) &&
+            !progress.awaitingCi.some((r) => r.number === t.number) &&
+            !progress.blocked.some((r) => r.number === t.number),
+        );
+        // Offer rework only for tickets that are closed on GitHub.
+        if (closedIntegrated.length > 0) {
+          const closedTickets = await bound.tracker.listTickets(
+            closedIntegrated.map((t) => t.number),
+          );
+          for (const ticket of closedTickets) {
+            if (ticket.state !== "CLOSED") continue;
+            actions.push({
+              id: reworkTicketActionId(ticket.number),
+              label: `Rework #${ticket.number}`,
+              description: `${ticket.title}. Pre-merge Rework attempt: reopen the ticket and create a fresh numbered Implementation workspace without reusing the completed one.`,
+            });
+          }
+        }
+      }
+
+      if (allTicketsComplete(progress)) {
+        const integratedCount = active.integratedTickets?.length ?? 0;
+        const allIntegrated =
+          integratedCount >= progress.total &&
+          (active.tickets ?? []).every((n) =>
+            (active.integratedTickets ?? []).some((t) => t.number === n),
+          );
+        if (allIntegrated && active.integrationBranch) {
+          if (!active.workflowPr) {
+            actions.unshift({
+              id: OPEN_WORKFLOW_PR_ACTION.id,
+              label: OPEN_WORKFLOW_PR_ACTION.label,
+              description: `${OPEN_WORKFLOW_PR_ACTION.description} Target branch: ${active.targetBranch}.`,
+            });
+          } else if (active.stage === "pr-opened") {
+            actions.unshift({
+              id: MERGE_WORKFLOW_PR_ACTION.id,
+              label: MERGE_WORKFLOW_PR_ACTION.label,
+              description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+            });
+          }
+        }
+      }
+
       actions.push(formatTicketProgressAction(progress));
       return actions;
     }
@@ -978,6 +1137,27 @@ export function createWorkflowCoordinator(
     const ciRecovery = parseCiRecoveryActionId(actionId);
     if (ciRecovery !== undefined) {
       return runCiRecovery(ciRecovery.ticketNumber, ciRecovery.decision);
+    }
+
+    if (actionId === OPEN_WORKFLOW_PR_ACTION.id) {
+      return openWorkflowPr();
+    }
+
+    if (actionId === MERGE_WORKFLOW_PR_ACTION.id) {
+      return mergeWorkflowPr();
+    }
+
+    if (actionId === CLEANUP_WORKFLOW_ACTION.id) {
+      return cleanupWorkflow();
+    }
+
+    if (actionId === START_FOLLOW_UP_ACTION.id) {
+      return startFollowUpWorkflow();
+    }
+
+    const reworkTicket = parseReworkTicketActionId(actionId);
+    if (reworkTicket !== undefined) {
+      return startRework(reworkTicket);
     }
 
     return {
@@ -1422,12 +1602,12 @@ export function createWorkflowCoordinator(
     }
 
     const active = await loadActiveWorkflow(bound);
-    if (!active || active.stage !== "tickets-published") {
+    if (!active || !isTicketWorkStage(active.stage)) {
       return {
         status: "failed",
         stage: "implement",
         reason:
-          "Implementation workers require an Active workflow with published tickets.",
+          "Implementation workers require an Active workflow with published tickets (pre-merge).",
         ticketNumber,
       };
     }
@@ -2277,19 +2457,10 @@ export function createWorkflowCoordinator(
         },
       ];
 
-      const manifest: WorkflowManifest = {
-        schema: WORKFLOW_MANIFEST_SCHEMA,
-        version: 1,
-        workflowId: active.workflowId,
-        targetBranch: active.targetBranch,
-        stage: active.stage,
-        workerProfile: active.workerProfile,
+      const manifest = manifestFromActive(active, {
         integrationBranch: integrationWorkspace.branchName,
         integratedTickets,
-      };
-      if (active.tickets) {
-        manifest.tickets = [...active.tickets];
-      }
+      });
 
       try {
         await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
@@ -2553,7 +2724,7 @@ export function createWorkflowCoordinator(
     | { ok: false; reason: string }
   > {
     const active = await loadActiveWorkflow(bound);
-    if (!active || active.stage !== "tickets-published") {
+    if (!active || !isTicketWorkStage(active.stage)) {
       return {
         ok: false,
         reason:
@@ -2699,6 +2870,511 @@ export function createWorkflowCoordinator(
     });
   }
 
+  async function openWorkflowPr(): Promise<StageResult> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (!active || !isTicketWorkStage(active.stage)) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "Open Workflow PR requires an Active workflow with published tickets that are all CI-complete.",
+      };
+    }
+    if (active.workflowPr) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Workflow PR #${active.workflowPr.number} is already open. Use Merge Workflow PR.`,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url ? { workflowPrUrl: active.workflowPr.url } : {}),
+      };
+    }
+
+    const progress = await loadTicketProgress(bound, active);
+    if (!progress || !allTicketsComplete(progress)) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "A Workflow PR is offered only after all tickets are integrated and CI-complete.",
+        workflowId: active.workflowId,
+      };
+    }
+
+    const ticketNumbers = active.tickets ?? [];
+    const integrated = active.integratedTickets ?? [];
+    const allIntegrated = ticketNumbers.every((n) =>
+      integrated.some((t) => t.number === n),
+    );
+    if (!allIntegrated || !active.integrationBranch) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "Cannot open a Workflow PR until every ticket has a successful Integration unit recorded on the Workflow manifest.",
+        workflowId: active.workflowId,
+      };
+    }
+
+    const head = active.integrationBranch;
+    const base = active.targetBranch;
+    const title =
+      active.title?.trim()
+        ? `Workflow #${active.workflowId}: ${active.title.trim()}`
+        : `Workflow #${active.workflowId}`;
+    const body = [
+      `Matt Auto Workflow PR for Workflow ID #${active.workflowId}.`,
+      "",
+      `Integration branch: \`${head}\``,
+      `Target branch: \`${base}\``,
+      "",
+      "Tickets:",
+      ...ticketNumbers.map((n) => `- #${n}`),
+      "",
+      "Opened by Matt Auto after all tickets integrated and CI-complete.",
+    ].join("\n");
+
+    let pr: { number: number; url?: string };
+    try {
+      pr = await bound.tracker.createPullRequest({
+        head,
+        base,
+        title,
+        body,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Failed to open Workflow PR from ${head} to ${base}: ${message}`,
+        workflowId: active.workflowId,
+        integrationBranch: head,
+        targetBranch: base,
+      };
+    }
+
+    const workflowPr = {
+      number: pr.number,
+      headBranch: head,
+      baseBranch: base,
+      ...(pr.url ? { url: pr.url } : {}),
+    };
+    const manifest = manifestFromActive(active, {
+      stage: "pr-opened",
+      workflowPr,
+    });
+
+    try {
+      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Opened Workflow PR #${pr.number} but writing the Workflow manifest failed: ${message}. Recover the Workflow manifest on #${active.workflowId}.`,
+        workflowId: active.workflowId,
+        workflowPrNumber: pr.number,
+        ...(pr.url ? { workflowPrUrl: pr.url } : {}),
+        integrationBranch: head,
+        targetBranch: base,
+      };
+    }
+
+    return {
+      status: "completed",
+      stage: "workflow-pr",
+      workflowId: active.workflowId,
+      workflowPrNumber: pr.number,
+      ...(pr.url ? { workflowPrUrl: pr.url } : {}),
+      integrationBranch: head,
+      targetBranch: base,
+    };
+  }
+
+  async function mergeWorkflowPr(): Promise<StageResult> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (!active || active.stage !== "pr-opened" || !active.workflowPr) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "Merge Workflow PR requires an open Workflow PR on the Active workflow.",
+      };
+    }
+
+    const progress = await loadTicketProgress(bound, active);
+    if (!progress || !allTicketsComplete(progress)) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "Cannot merge the Workflow PR while tickets remain open or awaiting CI. Finish or Rework tickets first.",
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+      };
+    }
+
+    try {
+      await bound.tracker.mergePullRequest({
+        number: active.workflowPr.number,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Failed to merge Workflow PR #${active.workflowPr.number}: ${message}`,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
+    }
+
+    const manifest = manifestFromActive(active, { stage: "merged" });
+    try {
+      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Merged Workflow PR #${active.workflowPr.number} but writing the Workflow manifest failed: ${message}. Recover the Workflow manifest on #${active.workflowId} before cleanup.`,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
+    }
+
+    return {
+      status: "completed",
+      stage: "workflow-pr",
+      workflowId: active.workflowId,
+      workflowPrNumber: active.workflowPr.number,
+      ...(active.workflowPr.url
+        ? { workflowPrUrl: active.workflowPr.url }
+        : {}),
+      ...(active.integrationBranch
+        ? { integrationBranch: active.integrationBranch }
+        : {}),
+      targetBranch: active.targetBranch,
+    };
+  }
+
+  async function cleanupWorkflow(): Promise<StageResult> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (!active || active.stage !== "merged") {
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason:
+          "Workflow cleanup runs after the Workflow PR merges. Merge the Workflow PR first.",
+      };
+    }
+
+    const branches = await bound.workspace.listWorkflowBranches(
+      active.workflowId,
+    );
+
+    let removedLocalBranches: readonly string[] = [];
+    try {
+      const local = await bound.workspace.cleanupWorkflowWorkspaces(
+        active.workflowId,
+      );
+      removedLocalBranches = local.removedLocalBranches;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: `Local workspace cleanup failed: ${message}`,
+        workflowId: active.workflowId,
+      };
+    }
+
+    // Pair remote cleanup with local — same branch set (local list + any already-known).
+    const remoteBranches = [
+      ...new Set([
+        ...branches,
+        ...removedLocalBranches,
+        ...(active.integrationBranch ? [active.integrationBranch] : []),
+        ...(active.integratedTickets ?? []).map((t) => t.branchName),
+      ]),
+    ].sort();
+
+    try {
+      await bound.remoteGit.deleteRemoteBranches(remoteBranches);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: `Remote matt-auto branch cleanup failed after local cleanup: ${message}. Retry Cleanup to finish paired remote removal.`,
+        workflowId: active.workflowId,
+        removedBranches: remoteBranches,
+        cleanedLocal: true,
+        cleanedRemote: false,
+      };
+    }
+
+    try {
+      await bound.transcripts.cleanupWorkflowTranscripts(active.workflowId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: `Transcript cleanup failed after local/remote branch cleanup: ${message}`,
+        workflowId: active.workflowId,
+        removedBranches: remoteBranches,
+        cleanedLocal: true,
+        cleanedRemote: true,
+      };
+    }
+
+    // Retain GitHub issue/PR/manifest history — only mark completed.
+    const manifest = manifestFromActive(active, { stage: "completed" });
+    try {
+      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: `Cleaned local/remote artifacts but writing the completed Workflow manifest failed: ${message}`,
+        workflowId: active.workflowId,
+        removedBranches: remoteBranches,
+        cleanedLocal: true,
+        cleanedRemote: true,
+      };
+    }
+
+    lastCompletedWorkflow = {
+      workflowId: active.workflowId,
+      targetBranch: active.targetBranch,
+      ...(active.title ? { title: active.title } : {}),
+    };
+
+    return {
+      status: "completed",
+      stage: "cleanup",
+      workflowId: active.workflowId,
+      removedBranches: remoteBranches,
+      cleanedLocal: true,
+      cleanedRemote: true,
+      ...(active.workflowPr
+        ? {
+            workflowPrNumber: active.workflowPr.number,
+            ...(active.workflowPr.url
+              ? { workflowPrUrl: active.workflowPr.url }
+              : {}),
+          }
+        : {}),
+      targetBranch: active.targetBranch,
+      ...(active.integrationBranch
+        ? { integrationBranch: active.integrationBranch }
+        : {}),
+    };
+  }
+
+  async function startFollowUpWorkflow(): Promise<StageResult> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (active) {
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Finish or clean it up before starting a Follow-up workflow.`,
+      };
+    }
+
+    const targetBranch = await resolveTargetBranch(bound.preferences);
+    if (
+      !lastCompletedWorkflow ||
+      lastCompletedWorkflow.targetBranch !== targetBranch
+    ) {
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason:
+          "Start Follow-up workflow requires a completed Workflow on this Target branch (after Workflow PR merge and cleanup).",
+      };
+    }
+
+    const original = lastCompletedWorkflow;
+    const workerProfile = await resolveWorkerProfile(bound);
+    if (!workerProfile) {
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason:
+          "Cannot start a Follow-up workflow without a Worker profile. Configure a Worker profile first.",
+      };
+    }
+
+    const title = original.title?.trim()
+      ? `Follow-up: ${original.title.trim()}`
+      : `Follow-up of Workflow #${original.workflowId}`;
+    const body = [
+      `## Follow-up workflow`,
+      "",
+      `This Follow-up workflow references completed Workflow #${original.workflowId} rather than mutating it.`,
+      "",
+      `Original Workflow ID: #${original.workflowId}`,
+      `Target branch: \`${original.targetBranch}\``,
+      "",
+      "## What to build",
+      "",
+      "Describe the post-merge rework for this Follow-up workflow.",
+    ].join("\n");
+
+    let created: { number: number };
+    try {
+      created = await bound.tracker.createIssue({
+        title,
+        body,
+        labels: [SPEC_ISSUE_LABEL],
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason: `Failed to create Follow-up spec issue: ${message}`,
+        followUpOf: original.workflowId,
+      };
+    }
+
+    const manifest: WorkflowManifest = {
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: created.number,
+      targetBranch,
+      stage: "spec-published",
+      workerProfile: workerProfile.profile,
+      followUpOf: original.workflowId,
+    };
+
+    try {
+      await bound.tracker.writeWorkflowManifest(created.number, manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason: `Created Follow-up issue #${created.number} but writing the Workflow manifest failed: ${message}`,
+        workflowId: created.number,
+        followUpOf: original.workflowId,
+      };
+    }
+
+    // One Active workflow per Target branch — clear the completed pointer once followed up.
+    lastCompletedWorkflow = undefined;
+
+    return {
+      status: "completed",
+      stage: "follow-up",
+      workflowId: created.number,
+      followUpOf: original.workflowId,
+      targetBranch,
+    };
+  }
+
+  async function startRework(ticketNumber: number): Promise<StageResult> {
+    const bound = await requireScoped();
+    const active = await loadActiveWorkflow(bound);
+    if (!active || !isTicketWorkStage(active.stage)) {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason:
+          "Pre-merge Rework requires an Active workflow before the Workflow PR merges.",
+        ticketNumber,
+      };
+    }
+
+    if (active.stage === "merged") {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason:
+          "Post-merge rework creates a Follow-up workflow with a new spec issue rather than mutating the completed workflow.",
+        ticketNumber,
+      };
+    }
+
+    const integrated = (active.integratedTickets ?? []).find(
+      (t) => t.number === ticketNumber,
+    );
+    if (!integrated) {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason: `Ticket #${ticketNumber} is not recorded as integrated. Use Implement for open ready tickets, or complete Integration first.`,
+        ticketNumber,
+      };
+    }
+
+    const tickets = await bound.tracker.listTickets([ticketNumber]);
+    const ticket = tickets.find((t) => t.number === ticketNumber);
+    if (!ticket) {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason: `Ticket #${ticketNumber} was not found on GitHub.`,
+        ticketNumber,
+      };
+    }
+
+    if (ticket.state === "CLOSED") {
+      try {
+        await bound.tracker.reopenIssue(ticketNumber);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          status: "failed",
+          stage: "rework",
+          reason: `Failed to reopen #${ticketNumber} for Rework: ${message}`,
+          ticketNumber,
+        };
+      }
+    }
+
+    // Drop from integrated list so the frontier and Workflow PR gates re-evaluate.
+    const remainingIntegrated = (active.integratedTickets ?? []).filter(
+      (t) => t.number !== ticketNumber,
+    );
+    const manifest = manifestFromActive(active, {
+      // Keep pr-opened if a Workflow PR already exists; otherwise stay on tickets-published.
+      stage: active.workflowPr ? "pr-opened" : "tickets-published",
+      integratedTickets: remainingIntegrated,
+    });
+
+    try {
+      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "rework",
+        reason: `Reopened #${ticketNumber} but updating the Workflow manifest failed: ${message}`,
+        ticketNumber,
+        workflowId: active.workflowId,
+      };
+    }
+
+    // Fresh numbered attempt workspace + Implementation worker (does not reuse completed workspace).
+    return startImplementation(ticketNumber);
+  }
+
   async function abortWorkers(): Promise<void> {
     const bound = scoped ?? (await requireScoped());
     const worker = activeWorker;
@@ -2776,13 +3452,24 @@ export function createWorkflowCoordinator(
           ]
         : [];
 
+    const lines = panelLines(active.workflowId, progress, worker);
+    appendWorkflowPrPanelLines(lines, active);
     const state: WorkflowPanelState = {
       workflowId: active.workflowId,
-      lines: panelLines(active.workflowId, progress, worker),
+      lines,
       workers,
     };
     if (progress) {
       state.ticketProgress = progress;
+    }
+    if (active.workflowPr) {
+      state.workflowPr = {
+        number: active.workflowPr.number,
+        status: active.stage === "merged" ? "merged" : "open",
+        baseBranch: active.workflowPr.baseBranch,
+        headBranch: active.workflowPr.headBranch,
+        ...(active.workflowPr.url ? { url: active.workflowPr.url } : {}),
+      };
     }
     if (activeConflictWorker) {
       state.integration = {
@@ -2867,6 +3554,8 @@ export function createWorkflowCoordinator(
     // Session-owned workers abort cleanly on Workflow-root switching.
     if (scoped && selectedPath && path.resolve(selectedPath) !== resolved) {
       await abortWorkers();
+      // Follow-up pointer is session-local to the previous Workflow root.
+      lastCompletedWorkflow = undefined;
     }
 
     bindRoot(match.path);

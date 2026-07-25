@@ -1,13 +1,14 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { TranscriptKey, TranscriptPort } from "../ports.js";
 
+function transcriptRoot(workflowRoot: string): string {
+  return path.join(path.resolve(workflowRoot), ".pi", "matt-auto", "transcripts");
+}
+
 function transcriptPath(workflowRoot: string, key: TranscriptKey): string {
   return path.join(
-    path.resolve(workflowRoot),
-    ".pi",
-    "matt-auto",
-    "transcripts",
+    transcriptRoot(workflowRoot),
     String(key.workflowId),
     `ticket-${key.ticketNumber}`,
     `r${key.attempt}.jsonl`,
@@ -44,6 +45,11 @@ export function createTranscriptPort(workflowRoot: string): TranscriptPort {
       } catch {
         return [];
       }
+    },
+
+    async cleanupWorkflowTranscripts(workflowId) {
+      const dir = path.join(transcriptRoot(workflowRoot), String(workflowId));
+      await rm(dir, { recursive: true, force: true });
     },
   };
 }

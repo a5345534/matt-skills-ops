@@ -58,7 +58,35 @@ function isWorkerProfile(value: unknown): value is WorkerProfile {
 }
 
 function isWorkflowStage(value: unknown): value is WorkflowStage {
-  return value === "spec-published" || value === "tickets-published";
+  return (
+    value === "spec-published" ||
+    value === "tickets-published" ||
+    value === "pr-opened" ||
+    value === "merged" ||
+    value === "completed"
+  );
+}
+
+function isWorkflowPrRef(
+  value: unknown,
+): value is NonNullable<WorkflowManifest["workflowPr"]> {
+  if (!value || typeof value !== "object") return false;
+  const pr = value as {
+    number?: unknown;
+    url?: unknown;
+    headBranch?: unknown;
+    baseBranch?: unknown;
+  };
+  return (
+    typeof pr.number === "number" &&
+    Number.isInteger(pr.number) &&
+    pr.number > 0 &&
+    typeof pr.headBranch === "string" &&
+    pr.headBranch.length > 0 &&
+    typeof pr.baseBranch === "string" &&
+    pr.baseBranch.length > 0 &&
+    (pr.url === undefined || typeof pr.url === "string")
+  );
 }
 
 function isTicketNumberList(value: unknown): value is number[] {
@@ -142,6 +170,21 @@ export function parseWorkflowManifestComment(
     }
     if (isIntegratedTicketList(parsed.integratedTickets)) {
       manifest.integratedTickets = [...parsed.integratedTickets];
+    }
+    if (isWorkflowPrRef(parsed.workflowPr)) {
+      manifest.workflowPr = {
+        number: parsed.workflowPr.number,
+        headBranch: parsed.workflowPr.headBranch,
+        baseBranch: parsed.workflowPr.baseBranch,
+        ...(parsed.workflowPr.url ? { url: parsed.workflowPr.url } : {}),
+      };
+    }
+    if (
+      typeof parsed.followUpOf === "number" &&
+      Number.isInteger(parsed.followUpOf) &&
+      parsed.followUpOf > 0
+    ) {
+      manifest.followUpOf = parsed.followUpOf;
     }
     return manifest;
   } catch {
@@ -367,6 +410,8 @@ export function createTrackerPort(cwd: string): TrackerPort {
         if (!found) continue;
         if (found.targetBranch !== targetBranch) continue;
         if (found.workflowId !== issue.number) continue;
+        // Completed workflows are no longer Active (cleanup finished).
+        if (found.stage === "completed") continue;
 
         const active: ActiveWorkflow = {
           workflowId: found.workflowId,
@@ -382,6 +427,12 @@ export function createTrackerPort(cwd: string): TrackerPort {
         }
         if (found.integratedTickets) {
           active.integratedTickets = [...found.integratedTickets];
+        }
+        if (found.workflowPr) {
+          active.workflowPr = { ...found.workflowPr };
+        }
+        if (found.followUpOf !== undefined) {
+          active.followUpOf = found.followUpOf;
         }
         const title = detail.title ?? issue.title;
         if (title) {
@@ -541,6 +592,71 @@ export function createTrackerPort(cwd: string): TrackerPort {
         throw new Error(
           result.stderr.trim() ||
             `gh issue close failed for #${issueNumber} with exit code ${result.code}`,
+        );
+      }
+    },
+
+    async reopenIssue(issueNumber) {
+      const result = await run(cwd, "gh", [
+        "issue",
+        "reopen",
+        String(issueNumber),
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `gh issue reopen failed for #${issueNumber} with exit code ${result.code}`,
+        );
+      }
+    },
+
+    async createPullRequest(input) {
+      const result = await run(cwd, "gh", [
+        "pr",
+        "create",
+        "--base",
+        input.base,
+        "--head",
+        input.head,
+        "--title",
+        input.title,
+        "--body",
+        input.body,
+        "--json",
+        "number,url",
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `gh pr create failed with exit code ${result.code}`,
+        );
+      }
+      let parsed: { number?: number; url?: string };
+      try {
+        parsed = JSON.parse(result.stdout) as { number?: number; url?: string };
+      } catch {
+        throw new Error("gh pr create returned non-JSON output.");
+      }
+      if (typeof parsed.number !== "number") {
+        throw new Error("gh pr create did not return a pull request number.");
+      }
+      return {
+        number: parsed.number,
+        ...(parsed.url ? { url: parsed.url } : {}),
+      };
+    },
+
+    async mergePullRequest(input) {
+      const result = await run(cwd, "gh", [
+        "pr",
+        "merge",
+        String(input.number),
+        "--merge",
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `gh pr merge failed for #${input.number} with exit code ${result.code}`,
         );
       }
     },

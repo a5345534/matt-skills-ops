@@ -125,11 +125,21 @@ Choosing **Close** on a completed Implementation disposition runs one Integratio
 5. On Local verification failure: **fail closed** — no push, no Workflow manifest update; Next actions offer **Retry Integration #N**.
 6. On Conflict resolution failure or missing Stage result: enter Compatibility / integration recovery without guessing merges; retry re-launches Conflict resolution without re-merging.
 7. On success: the Workflow coordinator pushes the Integration branch (and ticket branch) and updates the Workflow manifest (`integrationBranch`, `integratedTickets`).
-8. GitHub tickets remain open until the CI gate (later ticket).
+8. On-demand **CI gate**: pending returns control immediately; `/matt-auto next` rechecks once; green closes the ticket and unblocks dependents; red offers inspect / retry / leave-open.
 9. Later Implementation workspaces branch from the Integration branch so dependents see integrated code.
 
-Frontier multi-select concurrency, CI gate / ticket close, and Workflow PR land in later tickets.
+## Workflow PR, cleanup, rework, and follow-up
+
+When **all tickets** are integrated and CI-complete:
+
+1. **Open Workflow PR** — one PR from the Integration branch to the configured Target branch (default `main`).
+2. **Merge Workflow PR** — offered as a Matt Auto Next action (no manual GitHub merge required).
+3. **Cleanup workflow** — pairs local workspaces/transcripts with matching remote `matt-auto/*` branch removal; retains GitHub issue/PR/manifest history.
+4. **Pre-merge Rework** — reopens a closed ticket and creates a fresh numbered attempt workspace (`…/rN`) without reusing the completed workspace.
+5. **Start Follow-up workflow** — after merge + cleanup, creates a new spec issue that references the completed Workflow rather than mutating it.
+
+Frontier multi-select concurrency lands in a later ticket.
 
 ## Status
 
-Tickets #2–#7, #9, and #11 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, frontier discovery, the single Implementation worker path, Integration units (Integration workspace, Local verification, coordinator remote writes), and Conflict resolution workers via `resolving-merge-conflicts`. Multi-worker concurrency, CI, and Workflow PR land in later tickets.
+Tickets #2–#7 and #9–#12 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, frontier discovery, the single Implementation worker path, Integration units, Conflict resolution workers, on-demand CI gate / ticket close, Workflow PR, paired cleanup, pre-merge Rework attempts, and Follow-up workflows. Multi-worker concurrency lands in a later ticket.
