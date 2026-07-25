@@ -1,6 +1,7 @@
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CiStatus,
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
@@ -155,6 +156,21 @@ export type LocalVerificationResult =
   | { ok: true; commands: readonly string[] }
   | { ok: false; reason: string; commands: readonly string[] };
 
+/** On-demand CI gate check result for one branch. Never polled in a loop. */
+export type CiCheckResult = {
+  status: CiStatus;
+  url?: string;
+  summary?: string;
+};
+
+/**
+ * GitHub Actions / checks CI gate.
+ * On-demand only — the Workflow coordinator never starts a background poll loop.
+ */
+export type CiPort = {
+  checkStatus(input: { branchName: string }): Promise<CiCheckResult>;
+};
+
 /**
  * Project-discoverable Local verification checks.
  * System boundary: package scripts / project tooling inside a worktree.
@@ -300,6 +316,8 @@ export type TrackerPort = {
     parentIssueNumber: number,
     childIssueNumber: number,
   ): Promise<void>;
+  /** Close a GitHub issue after Integration unit + CI gate success. */
+  closeIssue(issueNumber: number): Promise<void>;
 };
 
 /**
@@ -385,6 +403,8 @@ export type RootScopedPorts = {
   verification: VerificationPort;
   /** Coordinator-only remote Git writes (push). */
   remoteGit: RemoteGitPort;
+  /** On-demand GitHub Actions CI gate (no background polling). */
+  ci: CiPort;
 };
 
 /** Ports injected into the Workflow coordinator. */

@@ -163,3 +163,49 @@ export function parseDispositionActionId(
   }
   return number;
 }
+
+/** Prefix for Next actions that run an on-demand CI gate check. */
+export const CHECK_CI_ACTION_PREFIX = "check-ci:" as const;
+
+/** Prefix for CI red recovery Next actions. */
+export const CI_RECOVERY_ACTION_PREFIX = "ci-recovery:" as const;
+
+/** CI red recovery choices after a failed on-demand CI gate check. */
+export const CI_RECOVERY_OPTIONS = [
+  "inspect",
+  "retry",
+  "leave-open",
+] as const;
+
+export function checkCiActionId(ticketNumber: number): string {
+  return `${CHECK_CI_ACTION_PREFIX}${ticketNumber}`;
+}
+
+export function parseCheckCiActionId(actionId: string): number | undefined {
+  if (!actionId.startsWith(CHECK_CI_ACTION_PREFIX)) return undefined;
+  const number = Number(actionId.slice(CHECK_CI_ACTION_PREFIX.length));
+  if (!Number.isInteger(number) || number <= 0) return undefined;
+  return number;
+}
+
+export function ciRecoveryActionId(
+  ticketNumber: number,
+  decision: (typeof CI_RECOVERY_OPTIONS)[number],
+): string {
+  return `${CI_RECOVERY_ACTION_PREFIX}${decision}:${ticketNumber}`;
+}
+
+export function parseCiRecoveryActionId(
+  actionId: string,
+):
+  | { ticketNumber: number; decision: (typeof CI_RECOVERY_OPTIONS)[number] }
+  | undefined {
+  if (!actionId.startsWith(CI_RECOVERY_ACTION_PREFIX)) return undefined;
+  const rest = actionId.slice(CI_RECOVERY_ACTION_PREFIX.length);
+  const match = /^(inspect|retry|leave-open):(\d+)$/.exec(rest);
+  if (!match) return undefined;
+  const decision = match[1] as (typeof CI_RECOVERY_OPTIONS)[number];
+  const ticketNumber = Number(match[2]);
+  if (!Number.isInteger(ticketNumber) || ticketNumber <= 0) return undefined;
+  return { ticketNumber, decision };
+}

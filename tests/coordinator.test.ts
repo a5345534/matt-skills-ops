@@ -2,6 +2,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type {
+  CiCheckResult,
+  CiPort,
   CreateSpecSkillOutcome,
   CreateTicketsSkillOutcome,
   EnvironmentPort,
@@ -34,6 +36,8 @@ import type {
   WorkflowManifest,
 } from "../src/types.js";
 import {
+  checkCiActionId,
+  ciRecoveryActionId,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
@@ -345,6 +349,30 @@ function createRemoteGit(
   };
 }
 
+type CiState = {
+  checks: string[];
+  result: CiCheckResult;
+};
+
+function createCi(
+  initial: { result?: CiCheckResult } = {},
+): { port: CiPort; state: CiState } {
+  const state: CiState = {
+    checks: [],
+    result: initial.result ?? { status: "pending", summary: "CI pending" },
+  };
+  return {
+    state,
+    port: {
+      checkStatus: async (input) => {
+        state.checks.push(input.branchName);
+        return state.result;
+      },
+    },
+  };
+}
+
+
 type WorkersState = {
   launches: WorkerLaunchInput[];
   aborts: string[];
@@ -440,6 +468,7 @@ type TrackerState = {
   manifests: Map<number, WorkflowManifest>;
   createIssueCalls: number;
   writeManifestCalls: number;
+  closeIssueCalls: number[];
   addBlockedByCalls: Array<{ issue: number; blocker: number }>;
   addSubIssueCalls: Array<{ parent: number; child: number }>;
   nextNumber: number;
@@ -464,6 +493,7 @@ function createTracker(
     manifests: new Map(),
     createIssueCalls: 0,
     writeManifestCalls: 0,
+    closeIssueCalls: [],
     addBlockedByCalls: [],
     addSubIssueCalls: [],
     nextNumber: 100,
@@ -580,6 +610,11 @@ function createTracker(
       }
       return tickets;
     },
+    closeIssue: async (issueNumber) => {
+      state.closeIssueCalls.push(issueNumber);
+      const issue = state.issues.find((i) => i.number === issueNumber);
+      if (issue) issue.state = "CLOSED";
+    },
     addBlockedBy: async (issueNumber, blockerIssueNumber) => {
       state.addBlockedByCalls.push({
         issue: issueNumber,
@@ -671,6 +706,7 @@ type RootFixture = {
   transcripts?: ReturnType<typeof createTranscripts>;
   verification?: ReturnType<typeof createVerification>;
   remoteGit?: ReturnType<typeof createRemoteGit>;
+  ci?: ReturnType<typeof createCi>;
 };
 
 function createTopology(
@@ -715,6 +751,7 @@ function createPorts(
   const defaultTranscripts = defaultRoot.transcripts ?? createTranscripts();
   const defaultVerification = defaultRoot.verification ?? createVerification();
   const defaultRemoteGit = defaultRoot.remoteGit ?? createRemoteGit();
+  const defaultCi = defaultRoot.ci ?? createCi();
 
   return {
     startPath,
@@ -749,6 +786,8 @@ function createPorts(
       const remoteGit =
         fixture.remoteGit ??
         (fixture === defaultRoot ? defaultRemoteGit : createRemoteGit());
+      const ci =
+        fixture.ci ?? (fixture === defaultRoot ? defaultCi : createCi());
       return {
         environment: createEnvironment(fixture.environment),
         skills: createSkills(skillsFixture),
@@ -763,6 +802,7 @@ function createPorts(
         transcripts: transcripts.port,
         verification: verification.port,
         remoteGit: remoteGit.port,
+        ci: ci.port,
       };
     },
   };
@@ -1894,6 +1934,7 @@ describe("Workflow coordinator Create-tickets Planning stage", () => {
           openBlockers: [43],
         },
       ],
+      awaitingCi: [],
     });
 
     await expect(coordinator.getTicketProgress()).resolves.toEqual(
@@ -2159,6 +2200,7 @@ function ticketsPublishedFixture(
     remoteGit?: ReturnType<typeof createRemoteGit>;
     workspace?: ReturnType<typeof createWorkspace>;
     skills?: SkillsFixture;
+      ci?: ReturnType<typeof createCi>;
   } = {},
 ) {
   const tracker = createTracker({
@@ -2181,6 +2223,7 @@ function ticketsPublishedFixture(
   const transcripts = createTranscripts();
   const verification = options.verification ?? createVerification();
   const remoteGit = options.remoteGit ?? createRemoteGit();
+  const ci = options.ci ?? createCi({ result: { status: "pending", summary: "CI pending" } });
   const skillsCalls = {
     runCreateSpec: 0,
     runCreateTickets: 0,
@@ -2197,6 +2240,7 @@ function ticketsPublishedFixture(
       transcripts,
       verification,
       remoteGit,
+      ci,
       skills: {
         ...(options.skills ?? {}),
         calls: skillsCalls,
@@ -2386,14 +2430,15 @@ describe("Workflow coordinator single Implementation worker path", () => {
     }
 
     const closed = await coordinator.confirmDisposition("close");
-    expect(closed).toEqual({
-      status: "completed",
-      stage: "integrate",
+    expect(closed).toMatchObject({
+      status: "pending-ci",
+      stage: "ci-gate",
       workflowId: 42,
       ticketNumber: 43,
       attempt: 1,
-      disposition: "close",
       integrated: true,
+      ticketClosed: false,
+      ciStatus: "pending",
       integrationBranch: "matt-auto/42",
       integrationWorktreePath: "/matt-auto-workspaces/42/integration",
       localVerification: { ok: true, commands: ["npm test"] },
@@ -2626,10 +2671,11 @@ describe("Workflow coordinator Integration unit", () => {
     await completeWorker(coordinator, workers, 43);
     const result = await coordinator.confirmDisposition("close");
 
-    expect(result.status).toBe("completed");
-    if (result.status === "completed") {
-      expect(result.stage).toBe("integrate");
+    expect(result.status).toBe("pending-ci");
+    if (result.status === "pending-ci") {
+      expect(result.stage).toBe("ci-gate");
       expect(result.integrated).toBe(true);
+      expect(result.ticketClosed).toBe(false);
       expect(result.integrationBranch).toBe("matt-auto/42");
       expect(result.integrationWorktreePath).toBe(
         "/matt-auto-workspaces/42/integration",
@@ -2730,10 +2776,11 @@ describe("Workflow coordinator Integration unit", () => {
     verification.state.result = { ok: true, commands: ["npm test"] };
     const retried = await coordinator.runNextAction(integrateTicketActionId(43));
     expect(retried).toMatchObject({
-      status: "completed",
-      stage: "integrate",
+      status: "pending-ci",
+      stage: "ci-gate",
       integrated: true,
       ticketNumber: 43,
+      ticketClosed: false,
     });
     expect(remoteGit.state.pushes).toEqual([
       "matt-auto/42",
@@ -3084,5 +3131,166 @@ describe("Workflow coordinator Conflict resolution worker", () => {
       ),
     ).toHaveLength(0);
     expect(remoteGit.state.pushes).toEqual([]);
+  });
+});
+
+describe("Workflow coordinator on-demand CI gate", () => {
+  async function completeWorker(
+    coordinator: ReturnType<typeof createWorkflowCoordinator>,
+    workers: ReturnType<typeof createWorkers>,
+    ticketNumber: number,
+    attempt = 1,
+  ) {
+    await coordinator.runNextAction(implementTicketActionId(ticketNumber));
+    const workerId = `implement-42-${ticketNumber}-r${attempt}`;
+    await workers.emit(workerId, {
+      type: "stage-result",
+      workerId,
+      outcome: { status: "completed", summary: `Done #${ticketNumber}` },
+    });
+  }
+
+  async function integrateWithCi(ciResult: CiCheckResult) {
+    const ci = createCi({ result: ciResult });
+    const fixture = ticketsPublishedFixture({ ci });
+    await completeWorker(fixture.coordinator, fixture.workers, 43);
+    const result = await fixture.coordinator.confirmDisposition("close");
+    return { ...fixture, result, ci };
+  }
+
+  it("returns control immediately when CI is pending after Integration push", async () => {
+    const { result, tracker, ci } = await integrateWithCi({
+      status: "pending",
+      summary: "Actions still running",
+      url: "https://example.test/run/1",
+    });
+    expect(result).toMatchObject({
+      status: "pending-ci",
+      stage: "ci-gate",
+      ticketNumber: 43,
+      integrated: true,
+      ticketClosed: false,
+      ciStatus: "pending",
+    });
+    expect(ci.state.checks).toEqual(["matt-auto/42"]);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+    expect(tracker.state.closeIssueCalls).toEqual([]);
+  });
+
+  it("offers Check CI as a Next action for open integrated tickets (on-demand)", async () => {
+    const { coordinator } = await integrateWithCi({ status: "pending" });
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(checkCiActionId(43));
+    expect(ids).not.toContain(implementTicketActionId(43));
+    expect(ids).toContain(implementTicketActionId(44));
+  });
+
+  it("performs an on-demand CI recheck via Check CI without background polling", async () => {
+    const ci = createCi({ result: { status: "pending", summary: "still pending" } });
+    const { coordinator, workers } = ticketsPublishedFixture({ ci });
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+    expect(ci.state.checks).toHaveLength(1);
+    const recheck = await coordinator.runNextAction(checkCiActionId(43));
+    expect(recheck).toMatchObject({ status: "pending-ci", stage: "ci-gate", ticketClosed: false });
+    expect(ci.state.checks).toEqual(["matt-auto/42", "matt-auto/42"]);
+  });
+
+  it("closes the ticket only when CI is green", async () => {
+    const { result, tracker } = await integrateWithCi({
+      status: "success",
+      summary: "All checks passed",
+    });
+    expect(result).toMatchObject({
+      status: "completed",
+      stage: "ci-gate",
+      ticketNumber: 43,
+      ticketClosed: true,
+      ciStatus: "success",
+    });
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("CLOSED");
+    expect(tracker.state.closeIssueCalls).toEqual([43]);
+  });
+
+  it("unblocks dependents in frontier calculation after CI green closes a ticket", async () => {
+    const { coordinator } = await integrateWithCi({ status: "success" });
+    const progress = await coordinator.getTicketProgress();
+    expect(progress?.awaitingCi.map((t) => t.number)).toEqual([]);
+    expect(progress?.ready.map((t) => t.number).sort((a, b) => a - b)).toEqual([44, 45]);
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(implementTicketActionId(45));
+    expect(ids).not.toContain(checkCiActionId(43));
+  });
+
+  it("does not close the ticket while CI is pending or red", async () => {
+    const pending = await integrateWithCi({ status: "pending" });
+    expect(pending.tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+    const failed = await integrateWithCi({
+      status: "failure",
+      summary: "npm test failed",
+      url: "https://example.test/run/bad",
+    });
+    expect(failed.result).toMatchObject({
+      status: "needs-ci-recovery",
+      stage: "ci-gate",
+      ticketClosed: false,
+      ciStatus: "failure",
+    });
+    expect(failed.tracker.state.closeIssueCalls).toEqual([]);
+  });
+
+  it("offers inspect / retry / leave-open recovery actions when CI is red", async () => {
+    const { coordinator } = await integrateWithCi({
+      status: "failure",
+      summary: "lint failed",
+      url: "https://example.test/run/2",
+    });
+    const ids = (await coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(ciRecoveryActionId(43, "inspect"));
+    expect(ids).toContain(ciRecoveryActionId(43, "retry"));
+    expect(ids).toContain(ciRecoveryActionId(43, "leave-open"));
+    expect(ids).not.toContain(checkCiActionId(43));
+  });
+
+  it("inspect / leave-open / retry recovery path", async () => {
+    const ci = createCi({
+      result: { status: "failure", summary: "build failed", url: "https://example.test/run/3" },
+    });
+    const { coordinator, workers, tracker, remoteGit } = ticketsPublishedFixture({ ci });
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    const inspected = await coordinator.runNextAction(ciRecoveryActionId(43, "inspect"));
+    expect(inspected).toMatchObject({
+      status: "completed",
+      stage: "ci-gate",
+      ticketClosed: false,
+      ciStatus: "failure",
+      ciUrl: "https://example.test/run/3",
+    });
+
+    const left = await coordinator.runNextAction(ciRecoveryActionId(43, "leave-open"));
+    expect(left).toMatchObject({ disposition: "leave-open", ticketClosed: false });
+    expect((await coordinator.nextActions()).map((a) => a.id)).toContain(checkCiActionId(43));
+
+    ci.state.result = { status: "failure", summary: "still red" };
+    await coordinator.runNextAction(checkCiActionId(43));
+    const pushesBefore = remoteGit.state.pushes.length;
+    ci.state.result = { status: "success", summary: "fixed" };
+    const retried = await coordinator.runNextAction(ciRecoveryActionId(43, "retry"));
+    expect(retried).toMatchObject({ status: "completed", ticketClosed: true, ciStatus: "success" });
+    expect(remoteGit.state.pushes.slice(pushesBefore)).toEqual(["matt-auto/42"]);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("CLOSED");
+  });
+
+  it("records CI gate transitions in the Worker transcript", async () => {
+    const { coordinator } = await integrateWithCi({ status: "success", summary: "green" });
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript).toContainEqual(expect.objectContaining({ type: "ci-check", status: "success" }));
+    expect(transcript).toContainEqual(expect.objectContaining({ type: "ticket-closed", ticketNumber: 43 }));
   });
 });

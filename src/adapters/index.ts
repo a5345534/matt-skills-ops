@@ -30,3 +30,4 @@ export {
   discoverLocalVerificationCommands,
 } from "./verification.js";
 export { createRemoteGitPort } from "./remote-git.js";
+export { createCiPort } from "./ci.js";

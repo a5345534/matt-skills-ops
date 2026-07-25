@@ -528,5 +528,21 @@ export function createTrackerPort(cwd: string): TrackerPort {
         );
       }
     },
+
+    async closeIssue(issueNumber) {
+      const result = await run(cwd, "gh", [
+        "issue",
+        "close",
+        String(issueNumber),
+        "--reason",
+        "completed",
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `gh issue close failed for #${issueNumber} with exit code ${result.code}`,
+        );
+      }
+    },
   };
 }

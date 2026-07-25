@@ -1,5 +1,10 @@
 export { createWorkflowCoordinator } from "./coordinator.js";
 export {
+  CHECK_CI_ACTION_PREFIX,
+  checkCiActionId,
+  CI_RECOVERY_ACTION_PREFIX,
+  CI_RECOVERY_OPTIONS,
+  ciRecoveryActionId,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
@@ -13,6 +18,8 @@ export {
   integrateTicketActionId,
   integrationBranchName,
   NO_GIT_REPOSITORY_REASON,
+  parseCheckCiActionId,
+  parseCiRecoveryActionId,
   parseDispositionActionId,
   parseImplementTicketActionId,
   parseIntegrateTicketActionId,
@@ -26,6 +33,8 @@ export {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 export type {
+  CiCheckResult,
+  CiPort,
   CreateSpecSkillOutcome,
   CreateTicketsSkillOutcome,
   EnvironmentPort,
@@ -54,6 +63,8 @@ export type {
 export type {
   ActiveWorkflow,
   AvailableModel,
+  CiRecoveryDecision,
+  CiStatus,
   ImplementationAttemptRef,
   ImplementationDispositionDecision,
   ImplementationWorkerStatus,

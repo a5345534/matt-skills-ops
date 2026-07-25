@@ -19,6 +19,7 @@ import {
   createGitTopologyPort,
   createModelsPort,
   createPreferencesPort,
+  createCiPort,
   createRemoteGitPort,
   createSkillsPort,
   createTrackerPort,
@@ -155,6 +156,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           transcripts: createTranscriptPort(rootPath),
           verification: createVerificationPort(),
           remoteGit: createRemoteGitPort(rootPath),
+          ci: createCiPort(rootPath),
         };
       },
     });

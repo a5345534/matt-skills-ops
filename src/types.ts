@@ -39,7 +39,14 @@ export type StageId =
   | "create-spec"
   | "create-tickets"
   | "implement"
-  | "integrate";
+  | "integrate"
+  | "ci-gate";
+
+/** On-demand CI gate status for an Integration branch. Never polled in the background. */
+export type CiStatus = "pending" | "success" | "failure";
+
+/** Recovery choices after a red CI gate check. */
+export type CiRecoveryDecision = "inspect" | "retry" | "leave-open";
 
 /** Stage confirmation choices after a reviewable artifact is produced. */
 export type StageConfirmationDecision = "publish" | "revise" | "cancel";
@@ -47,7 +54,7 @@ export type StageConfirmationDecision = "publish" | "revise" | "cancel";
 /**
  * Implementation disposition after a successful Implementation worker Stage result.
  * Close starts a serialized Integration unit; the GitHub ticket closes only after
- * Integration + CI succeed (CI gate is a later ticket).
+ * Integration + CI succeed.
  */
 export type ImplementationDispositionDecision =
   | "close"
@@ -157,7 +164,10 @@ export type TicketProgressSummary = {
   total: number;
   open: number;
   closed: number;
-  /** Ready frontier: open tickets with no open blockers, recommendation-ordered. */
+  /**
+   * Ready frontier: open tickets with no open blockers that are not already
+   * integrated (integrated open tickets await the CI gate instead).
+   */
   ready: readonly ReadyTicket[];
   /** Open tickets still gated by open blockers. */
   blocked: readonly {
@@ -165,6 +175,8 @@ export type TicketProgressSummary = {
     title: string;
     openBlockers: readonly number[];
   }[];
+  /** Open integrated tickets awaiting the on-demand CI gate. */
+  awaitingCi: readonly ReadyTicket[];
 };
 
 /** Identity of one Implementation worker attempt (branch + worktree + transcript). */
@@ -198,6 +210,15 @@ export type WorkflowPanelState = {
     branchName: string;
     reason?: string;
   };
+  /** Compact CI gate status for open integrated tickets (no background polling). */
+  ci?: readonly {
+    ticketNumber: number;
+    attempt: number;
+    status: "awaiting-check" | "failure";
+    integrationBranch: string;
+    summary?: string;
+    url?: string;
+  }[];
 };
 
 /**
@@ -296,7 +317,7 @@ export type StageResult =
       disposition?: ImplementationDispositionDecision;
       /**
        * True when Close ran a successful Integration unit.
-       * The GitHub ticket remains open until the CI gate (later ticket).
+       * The GitHub ticket remains open until the CI gate succeeds.
        */
       integrated?: boolean;
       /** Integration branch after a successful Integration unit. */
@@ -310,6 +331,48 @@ export type StageResult =
       };
       /** Branches pushed by the Workflow coordinator (never by workers). */
       pushedBranches?: readonly string[];
+      branchName?: string;
+      worktreePath?: string;
+      /** On-demand CI gate status after an Integration unit or Check CI action. */
+      ciStatus?: CiStatus;
+      /** True when the CI gate closed the GitHub ticket. */
+      ticketClosed?: boolean;
+      /** Optional CI run URL for inspect recovery. */
+      ciUrl?: string;
+      /** Optional CI summary for panel / recovery. */
+      ciSummary?: string;
+    }
+  | {
+      status: "pending-ci";
+      stage: "ci-gate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      integrationBranch: string;
+      integrated: true;
+      ciStatus: "pending";
+      ticketClosed: false;
+      ciUrl?: string;
+      ciSummary?: string;
+      pushedBranches?: readonly string[];
+      localVerification?: { ok: true; commands: readonly string[] };
+      integrationWorktreePath?: string;
+      branchName?: string;
+      worktreePath?: string;
+    }
+  | {
+      status: "needs-ci-recovery";
+      stage: "ci-gate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      integrationBranch: string;
+      integrated: true;
+      ciStatus: "failure";
+      ticketClosed: false;
+      recoveryOptions: readonly CiRecoveryDecision[];
+      ciUrl?: string;
+      ciSummary?: string;
       branchName?: string;
       worktreePath?: string;
     }

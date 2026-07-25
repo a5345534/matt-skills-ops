@@ -464,21 +464,37 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
         );
         return;
       }
-      if (result.stage === "integrate") {
+      if (result.stage === "integrate" || result.stage === "ci-gate") {
+        if (result.ticketClosed) {
+          ui.notify(
+            [
+              `CI green for #${result.ticketNumber} (r${result.attempt}).`,
+              "Ticket closed; dependents may now be ready.",
+              result.integrationBranch
+                ? `Integration branch: ${result.integrationBranch}.`
+                : undefined,
+            ].filter(Boolean).join(" "),
+            "info",
+          );
+          return;
+        }
         ui.notify(
           [
-            `Integration unit completed for #${result.ticketNumber} (r${result.attempt}).`,
+            result.stage === "ci-gate"
+              ? `CI gate update for #${result.ticketNumber} (r${result.attempt}).`
+              : `Integration unit completed for #${result.ticketNumber} (r${result.attempt}).`,
             result.integrationBranch
               ? `Integration branch: ${result.integrationBranch}.`
               : undefined,
             result.pushedBranches?.length
               ? `Pushed: ${result.pushedBranches.join(", ")}.`
               : undefined,
-            "Ticket remains open until CI succeeds.",
-          ]
-            .filter(Boolean)
-            .join(" "),
-          "info",
+            result.ciStatus === "failure"
+              ? result.ciSummary ?? "CI failed — inspect / retry / leave open."
+              : "Ticket remains open until CI succeeds.",
+            result.ciUrl ? `CI: ${result.ciUrl}` : undefined,
+          ].filter(Boolean).join(" "),
+          result.ciStatus === "failure" ? "warning" : "info",
         );
         return;
       }
@@ -530,6 +546,27 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
     case "needs-disposition":
       ui.notify(
         `Implementation #${result.ticketNumber} is waiting for disposition (Close / Leave open / Investigate).`,
+        "warning",
+      );
+      return;
+    case "pending-ci":
+      ui.notify(
+        [
+          `CI pending for #${result.ticketNumber} on ${result.integrationBranch}.`,
+          "Control returned immediately — no background polling.",
+          "Run Check CI from Next actions when ready.",
+          result.ciUrl ? `CI: ${result.ciUrl}` : undefined,
+        ].filter(Boolean).join(" "),
+        "info",
+      );
+      return;
+    case "needs-ci-recovery":
+      ui.notify(
+        [
+          `CI failed for #${result.ticketNumber} on ${result.integrationBranch}.`,
+          result.ciSummary ?? "Inspect / retry / leave open from Next actions.",
+          result.ciUrl ? `CI: ${result.ciUrl}` : undefined,
+        ].filter(Boolean).join(" "),
         "warning",
       );
       return;

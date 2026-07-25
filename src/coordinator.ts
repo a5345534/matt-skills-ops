@@ -1,5 +1,8 @@
 import path from "node:path";
 import {
+  checkCiActionId,
+  CI_RECOVERY_OPTIONS,
+  ciRecoveryActionId,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
@@ -10,6 +13,8 @@ import {
   integrateTicketActionId,
   integrationBranchName,
   NO_GIT_REPOSITORY_REASON,
+  parseCheckCiActionId,
+  parseCiRecoveryActionId,
   parseDispositionActionId,
   parseImplementTicketActionId,
   parseIntegrateTicketActionId,
@@ -30,8 +35,10 @@ import type {
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CiRecoveryDecision,
   ImplementationDispositionDecision,
   ImplementationWorkerStatus,
+  IntegratedTicketRef,
   NextAction,
   PreflightCheck,
   PreflightResult,
@@ -118,6 +125,18 @@ type PendingIntegration = {
   };
 };
 
+type PendingCiRecovery = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  branchName: string;
+  worktreePath: string;
+  integrationBranch: string;
+  url?: string;
+  summary?: string;
+};
+
+
 /**
  * Create the Workflow coordinator — the sole product seam for Matt Auto.
  *
@@ -151,6 +170,7 @@ export function createWorkflowCoordinator(
    * Lifetime is bound to Workflow home; never durable across processes.
    */
   let activeConflictWorker: ActiveConflictWorker | undefined;
+  let pendingCiRecovery: PendingCiRecovery | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -467,17 +487,23 @@ export function createWorkflowCoordinator(
   function computeTicketProgress(
     workflowId: number,
     tickets: readonly TrackerTicket[],
+    integratedNumbers: ReadonlySet<number> = new Set(),
   ): TicketProgressSummary {
     const open = tickets.filter((t) => t.state === "OPEN");
     const closed = tickets.filter((t) => t.state === "CLOSED");
 
     const ready: ReadyTicket[] = [];
     const blocked: TicketProgressSummary["blocked"][number][] = [];
+    const awaitingCi: ReadyTicket[] = [];
 
-    // Recommendation order: ascending issue number (blockers published first).
     const sortedOpen = [...open].sort((a, b) => a.number - b.number);
 
     for (const ticket of sortedOpen) {
+      if (integratedNumbers.has(ticket.number)) {
+        awaitingCi.push({ number: ticket.number, title: ticket.title });
+        continue;
+      }
+
       const openBlockers = ticket.blockedBy
         .filter((b) => b.state === "OPEN")
         .map((b) => b.number)
@@ -501,6 +527,7 @@ export function createWorkflowCoordinator(
       closed: closed.length,
       ready,
       blocked,
+      awaitingCi,
     };
   }
 
@@ -512,6 +539,9 @@ export function createWorkflowCoordinator(
       return undefined;
     }
     const numbers = active.tickets ?? [];
+    const integratedNumbers = new Set(
+      (active.integratedTickets ?? []).map((t) => t.number),
+    );
     if (numbers.length === 0) {
       return {
         workflowId: active.workflowId,
@@ -520,10 +550,11 @@ export function createWorkflowCoordinator(
         closed: 0,
         ready: [],
         blocked: [],
+        awaitingCi: [],
       };
     }
     const tickets = await bound.tracker.listTickets(numbers);
-    return computeTicketProgress(active.workflowId, tickets);
+    return computeTicketProgress(active.workflowId, tickets, integratedNumbers);
   }
 
   function formatTicketProgressAction(
@@ -583,6 +614,17 @@ export function createWorkflowCoordinator(
       lines.push(
         `Integration #${pendingIntegration.ticketNumber} r${pendingIntegration.attempt}: pending-retry${failure}`,
       );
+    }
+    if (pendingCiRecovery) {
+      const detail = pendingCiRecovery.summary
+        ? ` — ${pendingCiRecovery.summary}`
+        : "";
+      lines.push(
+        `CI #${pendingCiRecovery.ticketNumber} r${pendingCiRecovery.attempt}: failure${detail}`,
+      );
+    } else if (progress && progress.awaitingCi.length > 0) {
+      const list = progress.awaitingCi.map((t) => `#${t.number}`).join(", ");
+      lines.push(`CI awaiting check: ${list}`);
     }
     return lines;
   }
@@ -851,12 +893,48 @@ export function createWorkflowCoordinator(
         ];
       }
 
-      const progress = await loadTicketProgress(bound, active);
-      if (!progress) {
-        return [];
+      const actions: NextAction[] = [];
+      if (pendingCiRecovery) {
+        const n = pendingCiRecovery.ticketNumber;
+        const detail =
+          pendingCiRecovery.summary ??
+          "CI gate failed. Inspect the run, retry the check, or leave the ticket open.";
+        actions.push(
+          {
+            id: ciRecoveryActionId(n, "inspect"),
+            label: `Inspect CI #${n}`,
+            description: detail,
+          },
+          {
+            id: ciRecoveryActionId(n, "retry"),
+            label: `Retry CI #${n}`,
+            description:
+              "Re-push the Integration branch if needed and re-run the on-demand CI gate check once.",
+          },
+          {
+            id: ciRecoveryActionId(n, "leave-open"),
+            label: `Leave open #${n}`,
+            description:
+              "Dismiss CI recovery and leave the GitHub ticket open. Check CI remains available later.",
+          },
+        );
       }
 
-      const actions: NextAction[] = progress.ready.map(formatImplementAction);
+      const progress = await loadTicketProgress(bound, active);
+      if (!progress) {
+        return actions;
+      }
+
+      for (const ticket of progress.awaitingCi) {
+        if (pendingCiRecovery?.ticketNumber === ticket.number) continue;
+        actions.push({
+          id: checkCiActionId(ticket.number),
+          label: `Check CI #${ticket.number}`,
+          description: `${ticket.title}. On-demand CI gate check — pending returns control immediately; green closes the ticket; red offers recovery.`,
+        });
+      }
+
+      actions.push(...progress.ready.map(formatImplementAction));
       actions.push(formatTicketProgressAction(progress));
       return actions;
     }
@@ -890,6 +968,16 @@ export function createWorkflowCoordinator(
     const integrateTicket = parseIntegrateTicketActionId(actionId);
     if (integrateTicket !== undefined) {
       return retryIntegration(integrateTicket);
+    }
+
+    const checkCiTicket = parseCheckCiActionId(actionId);
+    if (checkCiTicket !== undefined) {
+      return runCiGateCheck(checkCiTicket, { rePush: false });
+    }
+
+    const ciRecovery = parseCiRecoveryActionId(actionId);
+    if (ciRecovery !== undefined) {
+      return runCiRecovery(ciRecovery.ticketNumber, ciRecovery.decision);
     }
 
     return {
@@ -2232,15 +2320,13 @@ export function createWorkflowCoordinator(
         pushedBranches,
       });
 
-      // Ticket remains open — CI gate and close land in a later ticket.
-      return {
-        status: "completed",
-        stage: "integrate",
+      // On-demand CI gate once after push — never poll. Pending returns control immediately.
+      return applyCiGate(bound, {
         workflowId: unit.workflowId,
         ticketNumber: unit.ticketNumber,
         attempt: unit.attempt,
-        disposition: "close",
-        integrated: true,
+        branchName: unit.branchName,
+        worktreePath: unit.worktreePath,
         integrationBranch: integrationWorkspace.branchName,
         integrationWorktreePath: integrationWorkspace.worktreePath,
         localVerification: {
@@ -2248,14 +2334,369 @@ export function createWorkflowCoordinator(
           commands: verification.commands,
         },
         pushedBranches,
-        branchName: unit.branchName,
-        worktreePath: unit.worktreePath,
-      };
+        rePush: false,
+      });
     } finally {
       if (heldGuard) {
         integrationInProgress = false;
       }
     }
+  }
+
+  async function applyCiGate(
+    bound: RootScopedPorts,
+    input: {
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      branchName: string;
+      worktreePath: string;
+      integrationBranch: string;
+      integrationWorktreePath?: string;
+      localVerification?: { ok: true; commands: readonly string[] };
+      pushedBranches?: readonly string[];
+      rePush: boolean;
+    },
+  ): Promise<StageResult> {
+    const transcriptKey = {
+      workflowId: input.workflowId,
+      ticketNumber: input.ticketNumber,
+      attempt: input.attempt,
+    };
+
+    if (input.rePush) {
+      try {
+        await bound.remoteGit.pushBranch(input.integrationBranch);
+        await bound.transcripts.append(transcriptKey, {
+          type: "ci-retry-push",
+          branchName: input.integrationBranch,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `CI retry push of ${input.integrationBranch} failed: ${message}`;
+        pendingCiRecovery = {
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          branchName: input.branchName,
+          worktreePath: input.worktreePath,
+          integrationBranch: input.integrationBranch,
+          summary: reason,
+        };
+        await bound.transcripts.append(transcriptKey, {
+          type: "ci-check",
+          status: "failure",
+          summary: reason,
+        });
+        return {
+          status: "needs-ci-recovery",
+          stage: "ci-gate",
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          integrationBranch: input.integrationBranch,
+          integrated: true,
+          ciStatus: "failure",
+          ticketClosed: false,
+          recoveryOptions: [...CI_RECOVERY_OPTIONS],
+          ciSummary: reason,
+          branchName: input.branchName,
+          worktreePath: input.worktreePath,
+        };
+      }
+    }
+
+    const ci = await bound.ci.checkStatus({
+      branchName: input.integrationBranch,
+    });
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "ci-check",
+      status: ci.status,
+      url: ci.url,
+      summary: ci.summary,
+    });
+
+    if (ci.status === "success") {
+      try {
+        await bound.tracker.closeIssue(input.ticketNumber);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `CI is green but closing #${input.ticketNumber} failed: ${message}`;
+        pendingCiRecovery = {
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          branchName: input.branchName,
+          worktreePath: input.worktreePath,
+          integrationBranch: input.integrationBranch,
+          ...(ci.url ? { url: ci.url } : {}),
+          summary: reason,
+        };
+        await bound.transcripts.append(transcriptKey, {
+          type: "ticket-close-failed",
+          reason,
+        });
+        return {
+          status: "needs-ci-recovery",
+          stage: "ci-gate",
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          integrationBranch: input.integrationBranch,
+          integrated: true,
+          ciStatus: "failure",
+          ticketClosed: false,
+          recoveryOptions: [...CI_RECOVERY_OPTIONS],
+          ...(ci.url ? { ciUrl: ci.url } : {}),
+          ciSummary: reason,
+          branchName: input.branchName,
+          worktreePath: input.worktreePath,
+        };
+      }
+
+      pendingCiRecovery = undefined;
+      await bound.transcripts.append(transcriptKey, {
+        type: "ticket-closed",
+        ticketNumber: input.ticketNumber,
+      });
+
+      return {
+        status: "completed",
+        stage: "ci-gate",
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+        attempt: input.attempt,
+        disposition: "close",
+        integrated: true,
+        integrationBranch: input.integrationBranch,
+        ...(input.integrationWorktreePath
+          ? { integrationWorktreePath: input.integrationWorktreePath }
+          : {}),
+        ...(input.localVerification
+          ? { localVerification: input.localVerification }
+          : {}),
+        ...(input.pushedBranches ? { pushedBranches: input.pushedBranches } : {}),
+        ciStatus: "success",
+        ticketClosed: true,
+        ...(ci.url ? { ciUrl: ci.url } : {}),
+        ...(ci.summary ? { ciSummary: ci.summary } : {}),
+        branchName: input.branchName,
+        worktreePath: input.worktreePath,
+      };
+    }
+
+    if (ci.status === "failure") {
+      pendingCiRecovery = {
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+        attempt: input.attempt,
+        branchName: input.branchName,
+        worktreePath: input.worktreePath,
+        integrationBranch: input.integrationBranch,
+        ...(ci.url ? { url: ci.url } : {}),
+        ...(ci.summary ? { summary: ci.summary } : {}),
+      };
+      return {
+        status: "needs-ci-recovery",
+        stage: "ci-gate",
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+        attempt: input.attempt,
+        integrationBranch: input.integrationBranch,
+        integrated: true,
+        ciStatus: "failure",
+        ticketClosed: false,
+        recoveryOptions: [...CI_RECOVERY_OPTIONS],
+        ...(ci.url ? { ciUrl: ci.url } : {}),
+        ...(ci.summary ? { ciSummary: ci.summary } : {}),
+        branchName: input.branchName,
+        worktreePath: input.worktreePath,
+      };
+    }
+
+    pendingCiRecovery = undefined;
+    return {
+      status: "pending-ci",
+      stage: "ci-gate",
+      workflowId: input.workflowId,
+      ticketNumber: input.ticketNumber,
+      attempt: input.attempt,
+      integrationBranch: input.integrationBranch,
+      integrated: true,
+      ciStatus: "pending",
+      ticketClosed: false,
+      ...(input.integrationWorktreePath
+        ? { integrationWorktreePath: input.integrationWorktreePath }
+        : {}),
+      ...(input.localVerification
+        ? { localVerification: input.localVerification }
+        : {}),
+      ...(input.pushedBranches ? { pushedBranches: input.pushedBranches } : {}),
+      ...(ci.url ? { ciUrl: ci.url } : {}),
+      ...(ci.summary ? { ciSummary: ci.summary } : {}),
+      branchName: input.branchName,
+      worktreePath: input.worktreePath,
+    };
+  }
+
+  async function resolveIntegratedTicket(
+    bound: RootScopedPorts,
+    ticketNumber: number,
+  ): Promise<
+    | {
+        ok: true;
+        active: ActiveWorkflow;
+        integrated: IntegratedTicketRef;
+        integrationBranch: string;
+      }
+    | { ok: false; reason: string }
+  > {
+    const active = await loadActiveWorkflow(bound);
+    if (!active || active.stage !== "tickets-published") {
+      return {
+        ok: false,
+        reason:
+          "No Active workflow with published tickets. Recover Workflow state before checking CI.",
+      };
+    }
+    const integrated = active.integratedTickets?.find(
+      (t) => t.number === ticketNumber,
+    );
+    if (!integrated) {
+      return {
+        ok: false,
+        reason: `Ticket #${ticketNumber} is not recorded as integrated on the Workflow manifest.`,
+      };
+    }
+    const tickets = await bound.tracker.listTickets([ticketNumber]);
+    const ticket = tickets.find((t) => t.number === ticketNumber);
+    if (!ticket) {
+      return {
+        ok: false,
+        reason: `Ticket #${ticketNumber} was not found on GitHub.`,
+      };
+    }
+    if (ticket.state === "CLOSED") {
+      return {
+        ok: false,
+        reason: `Ticket #${ticketNumber} is already closed.`,
+      };
+    }
+    const integrationBranch =
+      active.integrationBranch ?? integrationBranchName(active.workflowId);
+    return { ok: true, active, integrated, integrationBranch };
+  }
+
+  async function runCiGateCheck(
+    ticketNumber: number,
+    options: { rePush: boolean },
+  ): Promise<StageResult> {
+    const bound = await requireScoped();
+    const resolved = await resolveIntegratedTicket(bound, ticketNumber);
+    if (!resolved.ok) {
+      return {
+        status: "failed",
+        stage: "ci-gate",
+        reason: resolved.reason,
+        ticketNumber,
+      };
+    }
+
+    return applyCiGate(bound, {
+      workflowId: resolved.active.workflowId,
+      ticketNumber,
+      attempt: resolved.integrated.attempt,
+      branchName: resolved.integrated.branchName,
+      worktreePath: "",
+      integrationBranch: resolved.integrationBranch,
+      rePush: options.rePush,
+    });
+  }
+
+  async function runCiRecovery(
+    ticketNumber: number,
+    decision: CiRecoveryDecision,
+  ): Promise<StageResult> {
+    if (!pendingCiRecovery || pendingCiRecovery.ticketNumber !== ticketNumber) {
+      return {
+        status: "failed",
+        stage: "ci-gate",
+        reason: `No pending CI recovery for #${ticketNumber}. Run Check CI first.`,
+        ticketNumber,
+      };
+    }
+
+    const current = pendingCiRecovery;
+    const bound = await requireScoped();
+    const transcriptKey = {
+      workflowId: current.workflowId,
+      ticketNumber: current.ticketNumber,
+      attempt: current.attempt,
+    };
+
+    if (decision === "inspect") {
+      await bound.transcripts.append(transcriptKey, {
+        type: "ci-recovery",
+        decision: "inspect",
+        url: current.url,
+        summary: current.summary,
+      });
+      return {
+        status: "completed",
+        stage: "ci-gate",
+        workflowId: current.workflowId,
+        ticketNumber: current.ticketNumber,
+        attempt: current.attempt,
+        integrated: true,
+        integrationBranch: current.integrationBranch,
+        ciStatus: "failure",
+        ticketClosed: false,
+        ...(current.url ? { ciUrl: current.url } : {}),
+        ciSummary:
+          current.summary ??
+          current.url ??
+          `CI failed for #${current.ticketNumber} on ${current.integrationBranch}.`,
+        branchName: current.branchName,
+        worktreePath: current.worktreePath,
+      };
+    }
+
+    if (decision === "leave-open") {
+      pendingCiRecovery = undefined;
+      await bound.transcripts.append(transcriptKey, {
+        type: "ci-recovery",
+        decision: "leave-open",
+      });
+      return {
+        status: "completed",
+        stage: "ci-gate",
+        workflowId: current.workflowId,
+        ticketNumber: current.ticketNumber,
+        attempt: current.attempt,
+        disposition: "leave-open",
+        integrated: true,
+        integrationBranch: current.integrationBranch,
+        ciStatus: "failure",
+        ticketClosed: false,
+        branchName: current.branchName,
+        worktreePath: current.worktreePath,
+      };
+    }
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "ci-recovery",
+      decision: "retry",
+    });
+    return applyCiGate(bound, {
+      workflowId: current.workflowId,
+      ticketNumber: current.ticketNumber,
+      attempt: current.attempt,
+      branchName: current.branchName,
+      worktreePath: current.worktreePath,
+      integrationBranch: current.integrationBranch,
+      rePush: true,
+    });
   }
 
   async function abortWorkers(): Promise<void> {
@@ -2365,6 +2806,32 @@ export function createWorkflowCoordinator(
           ? { reason: pendingIntegration.lastFailure }
           : {}),
       };
+    }
+
+    const ciEntries: NonNullable<WorkflowPanelState["ci"]>[number][] = [];
+    if (pendingCiRecovery) {
+      ciEntries.push({
+        ticketNumber: pendingCiRecovery.ticketNumber,
+        attempt: pendingCiRecovery.attempt,
+        status: "failure",
+        integrationBranch: pendingCiRecovery.integrationBranch,
+        ...(pendingCiRecovery.summary ? { summary: pendingCiRecovery.summary } : {}),
+        ...(pendingCiRecovery.url ? { url: pendingCiRecovery.url } : {}),
+      });
+    } else if (progress) {
+      for (const ticket of progress.awaitingCi) {
+        const integrated = active.integratedTickets?.find((t) => t.number === ticket.number);
+        ciEntries.push({
+          ticketNumber: ticket.number,
+          attempt: integrated?.attempt ?? 1,
+          status: "awaiting-check",
+          integrationBranch:
+            active.integrationBranch ?? integrationBranchName(active.workflowId),
+        });
+      }
+    }
+    if (ciEntries.length > 0) {
+      state.ci = ciEntries;
     }
     return state;
   }

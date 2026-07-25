@@ -64,6 +64,7 @@ describe("buildMainMenuItems", () => {
       closed: 1,
       ready: [{ number: 10, title: "Ready A" }],
       blocked: [{ number: 11, title: "Blocked B", openBlockers: [10] }],
+    awaitingCi: [],
     };
     const items = buildMainMenuItems(
       preflightWithProfile,
@@ -124,6 +125,7 @@ describe("formatTicketProgressLines", () => {
       closed: 0,
       ready: [{ number: 3, title: "A" }],
       blocked: [{ number: 4, title: "B", openBlockers: [3] }],
+    awaitingCi: [],
     });
 
     expect(lines[0]).toMatch(/1 ready \/ 2 open \/ 0 closed/);
