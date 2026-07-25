@@ -1,0 +1,44 @@
+{
+  "name": "matt-auto",
+  "version": "0.1.0",
+  "description": "Stage-gated workflow orchestration for Pi Coding Agent",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "matt-auto",
+    "workflow"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "CONTEXT.md",
+    "AGENTS.md",
+    "docs"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
