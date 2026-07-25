@@ -229,6 +229,15 @@ export type WorkflowPanelState = {
     status: ImplementationWorkerStatus;
     progress?: string;
     branchName: string;
+    /** Stable attempt id (e.g. implement-255-257-r2). */
+    workerId?: string;
+    /** OS pid of the `pi --mode json` child when known. */
+    pid?: number;
+    worktreePath?: string;
+    /** Local transcript path — primary place to "go look" (no Pi session). */
+    transcriptPath?: string;
+    /** False when panel still says running but the OS process is gone. */
+    processAlive?: boolean;
   }[];
   ticketProgress?: TicketProgressSummary;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */

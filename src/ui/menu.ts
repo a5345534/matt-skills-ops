@@ -110,7 +110,14 @@ async function waitForPipelineWorkers(
       log("info", "pipeline:workers-settled", {
         panelWorkers: panel?.workers.map((w) => ({
           ticketNumber: w.ticketNumber,
+          attempt: w.attempt,
           status: w.status,
+          workerId: w.workerId,
+          pid: w.pid,
+          processAlive: w.processAlive,
+          worktreePath: w.worktreePath,
+          transcriptPath: w.transcriptPath,
+          branchName: w.branchName,
         })),
       });
       return;
@@ -121,7 +128,17 @@ async function waitForPipelineWorkers(
         "info",
       );
       log("debug", "pipeline:wait-workers-tick", {
-        running: running.map((w) => w.ticketNumber),
+        running: running.map((w) => ({
+          ticketNumber: w.ticketNumber,
+          attempt: w.attempt,
+          workerId: w.workerId,
+          pid: w.pid,
+          processAlive: w.processAlive,
+          worktreePath: w.worktreePath,
+          transcriptPath: w.transcriptPath,
+          branchName: w.branchName,
+          progress: w.progress,
+        })),
       });
     }
   }
@@ -594,9 +611,22 @@ export async function runPostGrillPipeline(
     // Implement returns "running" while the worker is live — wait here instead
     // of falling through to an empty nextActions and exiting to the main menu.
     if (result.status === "running") {
+      const panel = await coordinator.getPanelState();
+      const ticketNumber =
+        "ticketNumber" in result ? result.ticketNumber : undefined;
+      const worker =
+        (ticketNumber !== undefined
+          ? panel?.workers.find((w) => w.ticketNumber === ticketNumber)
+          : undefined) ?? panel?.workers[0];
       log("info", "pipeline:worker-running", {
-        ticketNumber:
-          "ticketNumber" in result ? result.ticketNumber : undefined,
+        ticketNumber,
+        workerId: worker?.workerId,
+        attempt: worker?.attempt,
+        pid: worker?.pid,
+        processAlive: worker?.processAlive,
+        worktreePath: worker?.worktreePath,
+        transcriptPath: worker?.transcriptPath,
+        branchName: worker?.branchName,
       });
       await waitForPipelineWorkers(coordinator, ui);
     }

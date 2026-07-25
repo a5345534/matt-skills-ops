@@ -33,6 +33,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import { workerTranscriptPath } from "./adapters/transcripts.js";
 import { implementationWorktreePath } from "./adapters/workspace.js";
 import type {
   RootScopedPorts,
@@ -92,6 +93,8 @@ type ActiveImplementationWorker = {
   status: ImplementationWorkerStatus;
   progress?: string;
   summary?: string;
+  /** OS pid of the `pi --mode json` child when known. */
+  pid?: number;
   /** True once a stage-result event was handled for this worker. */
   receivedStageResult: boolean;
 };
@@ -109,6 +112,8 @@ type ActiveConflictWorker = {
   integrationWorktreePath: string;
   status: ImplementationWorkerStatus;
   progress?: string;
+  /** OS pid of the conflict-resolution child when known. */
+  pid?: number;
   receivedStageResult: boolean;
 };
 
@@ -1969,7 +1974,7 @@ export function createWorkflowCoordinator(
     };
 
     try {
-      await bound.workers.launch(
+      const runtime = await bound.workers.launch(
         {
           workerId,
           workflowId: active.workflowId,
@@ -1984,6 +1989,22 @@ export function createWorkflowCoordinator(
         },
         sink,
       );
+      if (typeof runtime.pid === "number") {
+        worker.pid = runtime.pid;
+      }
+      await bound.transcripts.append(transcriptKey, {
+        type: "worker-process",
+        workerId,
+        pid: runtime.pid,
+        alive: runtime.alive,
+        worktreePath: workspace.worktreePath,
+        branchName: workspace.branchName,
+        transcriptPath: workerTranscriptPath(selectedPath ?? ports.startPath, {
+          workflowId: active.workflowId,
+          ticketNumber,
+          attempt,
+        }),
+      });
     } catch (error) {
       activeWorker = undefined;
       const message = error instanceof Error ? error.message : String(error);
@@ -2591,7 +2612,7 @@ export function createWorkflowCoordinator(
     };
 
     try {
-      await bound.workers.launch(
+      const runtime = await bound.workers.launch(
         {
           workerId,
           workflowId: unit.workflowId,
@@ -2606,6 +2627,22 @@ export function createWorkflowCoordinator(
         },
         sink,
       );
+      if (typeof runtime.pid === "number") {
+        worker.pid = runtime.pid;
+      }
+      await bound.transcripts.append(transcriptKey, {
+        type: "worker-process",
+        workerId,
+        pid: runtime.pid,
+        alive: runtime.alive,
+        worktreePath: conflict.integrationWorktreePath,
+        branchName: conflict.integrationBranch,
+        transcriptPath: workerTranscriptPath(selectedPath ?? ports.startPath, {
+          workflowId: unit.workflowId,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        }),
+      });
     } catch (error) {
       activeConflictWorker = undefined;
       const message = error instanceof Error ? error.message : String(error);
@@ -3702,8 +3739,112 @@ export function createWorkflowCoordinator(
     activeConflictWorker = undefined;
   }
 
+  /**
+   * If panel still says running but the OS child is gone, synthesize process-exit
+   * so the pipeline does not wait forever on a zombie in-memory worker.
+   */
+  async function reconcileDeadWorkers(bound: RootScopedPorts): Promise<void> {
+    if (activeWorker && activeWorker.status === "running") {
+      const runtime = bound.workers.getRuntime(activeWorker.workerId);
+      if (!runtime || !runtime.alive) {
+        const transcriptKey = {
+          workflowId: activeWorker.workflowId,
+          ticketNumber: activeWorker.ticketNumber,
+          attempt: activeWorker.attempt,
+        };
+        await bound.transcripts.append(transcriptKey, {
+          type: "process-gone",
+          workerId: activeWorker.workerId,
+          pid: activeWorker.pid ?? runtime?.pid,
+          reason:
+            "Panel still marked running but the OS process is gone; synthesizing process-exit.",
+        });
+        await handleWorkerEvent(bound, {
+          type: "process-exit",
+          workerId: activeWorker.workerId,
+          code: null,
+        });
+      }
+    }
+
+    if (activeConflictWorker && activeConflictWorker.status === "running") {
+      const runtime = bound.workers.getRuntime(activeConflictWorker.workerId);
+      if (!runtime || !runtime.alive) {
+        const transcriptKey = {
+          workflowId: activeConflictWorker.workflowId,
+          ticketNumber: activeConflictWorker.ticketNumber,
+          attempt: activeConflictWorker.attempt,
+        };
+        await bound.transcripts.append(transcriptKey, {
+          type: "process-gone",
+          workerId: activeConflictWorker.workerId,
+          pid: activeConflictWorker.pid ?? runtime?.pid,
+          reason:
+            "Conflict worker still marked running but the OS process is gone; synthesizing process-exit.",
+        });
+        await handleWorkerEvent(bound, {
+          type: "process-exit",
+          workerId: activeConflictWorker.workerId,
+          code: null,
+        });
+      }
+    }
+  }
+
+  function panelWorkerInspection(
+    worker: {
+      workerId: string;
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      branchName: string;
+      worktreePath: string;
+      status: ImplementationWorkerStatus;
+      progress?: string;
+      pid?: number;
+    },
+    bound: RootScopedPorts,
+  ): WorkflowPanelState["workers"][number] {
+    const rootPath = selectedPath ?? ports.startPath;
+    const transcriptPath = workerTranscriptPath(rootPath, {
+      workflowId: worker.workflowId,
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+    });
+    const runtime = bound.workers.getRuntime(worker.workerId);
+    const pid =
+      typeof worker.pid === "number"
+        ? worker.pid
+        : typeof runtime?.pid === "number"
+          ? runtime.pid
+          : undefined;
+    const entry: WorkflowPanelState["workers"][number] = {
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+      status: worker.status,
+      branchName: worker.branchName,
+      workerId: worker.workerId,
+      worktreePath: worker.worktreePath,
+      transcriptPath,
+    };
+    if (typeof pid === "number") {
+      entry.pid = pid;
+    }
+    if (worker.status === "running") {
+      entry.processAlive = runtime?.alive ?? false;
+    } else if (runtime) {
+      entry.processAlive = runtime.alive;
+    }
+    if (worker.progress) {
+      entry.progress = worker.progress;
+    }
+    return entry;
+  }
+
   async function getPanelState(): Promise<WorkflowPanelState | undefined> {
     const bound = await requireScoped();
+    // Detect zombie running state before snapshotting the panel.
+    await reconcileDeadWorkers(bound);
     const active = await loadActiveWorkflow(bound);
     if (!active) return undefined;
 
@@ -3711,25 +3852,41 @@ export function createWorkflowCoordinator(
     const worker = activeWorker ?? pendingDisposition;
     const workers = worker
       ? [
-          {
-            ticketNumber: worker.ticketNumber,
-            attempt: worker.attempt,
-            status: worker.status,
-            branchName: worker.branchName,
-            ...(worker.progress ? { progress: worker.progress } : {}),
-          },
+          panelWorkerInspection(
+            {
+              workerId: worker.workerId,
+              workflowId: worker.workflowId,
+              ticketNumber: worker.ticketNumber,
+              attempt: worker.attempt,
+              branchName: worker.branchName,
+              worktreePath: worker.worktreePath,
+              status: worker.status,
+              ...(worker.progress ? { progress: worker.progress } : {}),
+              ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
+            },
+            bound,
+          ),
         ]
       : activeConflictWorker
         ? [
-            {
-              ticketNumber: activeConflictWorker.ticketNumber,
-              attempt: activeConflictWorker.attempt,
-              status: activeConflictWorker.status,
-              branchName: activeConflictWorker.integrationBranch,
-              ...(activeConflictWorker.progress
-                ? { progress: activeConflictWorker.progress }
-                : {}),
-            },
+            panelWorkerInspection(
+              {
+                workerId: activeConflictWorker.workerId,
+                workflowId: activeConflictWorker.workflowId,
+                ticketNumber: activeConflictWorker.ticketNumber,
+                attempt: activeConflictWorker.attempt,
+                branchName: activeConflictWorker.integrationBranch,
+                worktreePath: activeConflictWorker.integrationWorktreePath,
+                status: activeConflictWorker.status,
+                ...(activeConflictWorker.progress
+                  ? { progress: activeConflictWorker.progress }
+                  : {}),
+                ...(typeof activeConflictWorker.pid === "number"
+                  ? { pid: activeConflictWorker.pid }
+                  : {}),
+              },
+              bound,
+            ),
           ]
         : [];
 

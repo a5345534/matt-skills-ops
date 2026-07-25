@@ -240,6 +240,19 @@ export type WorkerLaunchInput = {
 };
 
 /**
+ * Live OS process identity for a session-owned worker.
+ * Workers use `pi --no-session` — there is no Pi session to open; inspect via
+ * pid + worktree + transcript instead.
+ */
+export type WorkerRuntimeInfo = {
+  workerId: string;
+  /** OS process id when known. */
+  pid?: number;
+  /** True when the child is still in the process table. */
+  alive: boolean;
+};
+
+/**
  * Sink for Worker protocol events mapped from the worker's Pi JSON event stream.
  * The Workflow coordinator processes Stage results and progress; the sink carries
  * no GitHub mutation authority.
@@ -257,8 +270,14 @@ export type WorkersPort = {
   /**
    * Start a session-owned Implementation worker that runs `/implement` in the workspace.
    * Lifetime is bound to Workflow home; abort on shutdown/reload/root switch.
+   * Returns the OS process identity for logs / panel inspection.
    */
-  launch(input: WorkerLaunchInput, sink: WorkerEventSink): Promise<void>;
+  launch(
+    input: WorkerLaunchInput,
+    sink: WorkerEventSink,
+  ): Promise<WorkerRuntimeInfo>;
+  /** Current OS runtime for a launched worker (undefined if not tracked). */
+  getRuntime(workerId: string): WorkerRuntimeInfo | undefined;
   /** Abort one worker cleanly. */
   abort(workerId: string): Promise<void>;
   /** Abort all workers owned by this session. */

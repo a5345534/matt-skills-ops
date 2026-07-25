@@ -1,5 +1,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import type { WorkerLaunchInput, WorkersPort } from "../ports.js";
+import type {
+  WorkerLaunchInput,
+  WorkerRuntimeInfo,
+  WorkersPort,
+} from "../ports.js";
 import type { WorkerProtocolEvent } from "../types.js";
 
 type Running = {
@@ -8,6 +12,26 @@ type Running = {
   buffer: string;
   sawStageResult: boolean;
 };
+
+function isChildAlive(child: ChildProcess): boolean {
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  const pid = child.pid;
+  if (typeof pid !== "number" || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runtimeOf(workerId: string, entry: Running): WorkerRuntimeInfo {
+  return {
+    workerId,
+    ...(typeof entry.child.pid === "number" ? { pid: entry.child.pid } : {}),
+    alive: isChildAlive(entry.child),
+  };
+}
 
 function parseStageResultFromLine(
   workerId: string,
@@ -235,6 +259,14 @@ export function createWorkersPort(): WorkersPort {
           }
         })();
       });
+
+      return runtimeOf(input.workerId, entry);
+    },
+
+    getRuntime(workerId: string) {
+      const entry = running.get(workerId);
+      if (!entry) return undefined;
+      return runtimeOf(workerId, entry);
     },
 
     async abort(workerId: string) {

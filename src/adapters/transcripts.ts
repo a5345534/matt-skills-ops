@@ -6,13 +6,21 @@ function transcriptRoot(workflowRoot: string): string {
   return path.join(path.resolve(workflowRoot), ".pi", "matt-auto", "transcripts");
 }
 
-function transcriptPath(workflowRoot: string, key: TranscriptKey): string {
+/** Absolute path of one attempt's jsonl transcript (inspection handle). */
+export function workerTranscriptPath(
+  workflowRoot: string,
+  key: TranscriptKey,
+): string {
   return path.join(
     transcriptRoot(workflowRoot),
     String(key.workflowId),
     `ticket-${key.ticketNumber}`,
     `r${key.attempt}.jsonl`,
   );
+}
+
+function transcriptPath(workflowRoot: string, key: TranscriptKey): string {
+  return workerTranscriptPath(workflowRoot, key);
 }
 
 /**

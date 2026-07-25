@@ -455,15 +455,24 @@ function createWorkers(
       }
       state.launches.push(input);
       state.sinks.set(input.workerId, sink);
+      // Synthetic pid so panel inspection + process-gone logic can run in tests.
+      return { workerId: input.workerId, pid: 4242, alive: true };
+    },
+    getRuntime: (workerId) => {
+      if (!state.sinks.has(workerId)) return undefined;
+      // Stay "alive" until the test emits process-exit / abort clears the sink.
+      return { workerId, pid: 4242, alive: true };
     },
     abort: async (workerId) => {
       state.aborts.push(workerId);
+      state.sinks.delete(workerId);
     },
     abortAll: async () => {
       state.abortAllCount += 1;
       for (const id of state.sinks.keys()) {
         state.aborts.push(id);
       }
+      state.sinks.clear();
     },
   };
 
@@ -2352,6 +2361,7 @@ function ticketsPublishedFixture(
     verification?: ReturnType<typeof createVerification>;
     remoteGit?: ReturnType<typeof createRemoteGit>;
     workspace?: ReturnType<typeof createWorkspace>;
+    workers?: ReturnType<typeof createWorkers>;
     transcripts?: ReturnType<typeof createTranscripts>;
     skills?: SkillsFixture;
     ci?: ReturnType<typeof createCi>;
@@ -2373,7 +2383,7 @@ function ticketsPublishedFixture(
     ],
   });
   const workspace = options.workspace ?? createWorkspace("/repo");
-  const workers = createWorkers();
+  const workers = options.workers ?? createWorkers();
   const transcripts = options.transcripts ?? createTranscripts();
   const verification = options.verification ?? createVerification();
   const remoteGit = options.remoteGit ?? createRemoteGit();
@@ -2511,6 +2521,11 @@ describe("Workflow coordinator single Implementation worker path", () => {
         status: "running",
         progress: "Running tests",
         branchName: "matt-auto/42/ticket-43/r1",
+        workerId: "implement-42-43-r1",
+        pid: 4242,
+        processAlive: true,
+        worktreePath: expect.stringContaining("ticket-43"),
+        transcriptPath: expect.stringMatching(/ticket-43.*r1\.jsonl$/),
       },
     ]);
     expect(panel?.lines.some((l) => /Worker #43 r1: running/.test(l))).toBe(
@@ -2819,6 +2834,51 @@ describe("Workflow coordinator single Implementation worker path", () => {
       attempt: 2,
       branchName: "matt-auto/42/ticket-43/r2",
     });
+  });
+
+  it("exposes worker inspection handles on the panel and reconciles process-gone", async () => {
+    const workers = createWorkers();
+    let reportAlive = true;
+    const baseGetRuntime = workers.port.getRuntime.bind(workers.port);
+    workers.port.getRuntime = (workerId) => {
+      const runtime = baseGetRuntime(workerId);
+      if (!runtime) return undefined;
+      return { ...runtime, alive: reportAlive };
+    };
+
+    const { coordinator, transcripts } = ticketsPublishedFixture({ workers });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    const panelWhileAlive = await coordinator.getPanelState();
+    const worker = panelWhileAlive?.workers[0];
+    expect(worker).toMatchObject({
+      ticketNumber: 43,
+      attempt: 1,
+      status: "running",
+      workerId: "implement-42-43-r1",
+      pid: 4242,
+      processAlive: true,
+      branchName: "matt-auto/42/ticket-43/r1",
+    });
+    expect(worker?.worktreePath).toContain("ticket-43");
+    expect(worker?.transcriptPath).toContain("ticket-43");
+    expect(worker?.transcriptPath).toMatch(/r1\.jsonl$/);
+
+    // OS process vanished without a process-exit event.
+    reportAlive = false;
+    const panelAfterDeath = await coordinator.getPanelState();
+    expect(
+      panelAfterDeath?.workers.every((w) => w.status !== "running") ?? true,
+    ).toBe(true);
+
+    const events = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(events.some((e) => (e as { type?: string }).type === "process-gone")).toBe(
+      true,
+    );
   });
 
   it("aborts workers when switching Workflow root", async () => {
