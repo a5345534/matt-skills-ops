@@ -1,7 +1,42 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { SkillsPort } from "../ports.js";
+import type {
+  CreateSpecSkillOutcome,
+  CreateTicketsSkillOutcome,
+  PrepareImplementOutcome,
+  SkillsPort,
+} from "../ports.js";
+
+/**
+ * Optional host that performs Create-spec / Create-tickets skill invocation.
+ * The adapter discovers installed skills and delegates invocation without
+ * modifying skill definitions. When omitted, run methods fail closed.
+ *
+ * `prepareImplement` is optional; the adapter can build a default `/implement`
+ * prompt when the skill is installed.
+ */
+export type SkillsHost = {
+  runCreateSpec?(): Promise<CreateSpecSkillOutcome>;
+  runCreateTickets?(input: {
+    workflowId: number;
+    title?: string;
+  }): Promise<CreateTicketsSkillOutcome>;
+  prepareImplement?(input: {
+    ticketNumber: number;
+    title: string;
+  }): Promise<PrepareImplementOutcome>;
+  prepareResolveConflicts?(input: {
+    ticketNumber: number;
+    ticketBranch: string;
+    integrationBranch: string;
+  }): Promise<PrepareImplementOutcome>;
+};
+
+/** @deprecated Prefer SkillsHost; kept for existing Create-spec wiring. */
+export type CreateSpecHost = {
+  runCreateSpec(): Promise<CreateSpecSkillOutcome>;
+};
 
 async function isDirectory(candidate: string): Promise<boolean> {
   try {
@@ -56,17 +91,131 @@ function skillSearchRoots(cwd: string): string[] {
 }
 
 /**
- * Discover installed skill names from standard Pi / agents skill locations.
- * Does not parse skill bodies for orchestration logic.
+ * Discover installed skill names and invoke Planning skills via an optional host.
+ * Does not parse skill bodies for orchestration logic and never modifies SKILL.md.
  */
-export function createSkillsPort(cwd: string): SkillsPort {
+export function createSkillsPort(
+  cwd: string,
+  host?: SkillsHost | CreateSpecHost,
+): SkillsPort {
+  async function installedSkillNames(): Promise<readonly string[]> {
+    const names = new Set<string>();
+    for (const root of skillSearchRoots(cwd)) {
+      await collectFromRoot(root, names);
+    }
+    return [...names].sort();
+  }
+
   return {
-    async installedSkillNames() {
-      const names = new Set<string>();
-      for (const root of skillSearchRoots(cwd)) {
-        await collectFromRoot(root, names);
+    installedSkillNames,
+
+    async runCreateSpec() {
+      const names = await installedSkillNames();
+      if (!names.includes("to-spec")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill to-spec is missing. Install it into a Pi skill location and retry Create-spec.",
+        };
       }
-      return [...names].sort();
+
+      if (!host || !("runCreateSpec" in host) || !host.runCreateSpec) {
+        return {
+          ok: false,
+          reason:
+            "Create-spec Planning host is not wired. Matt Auto cannot invoke to-spec without a Workflow-home host.",
+        };
+      }
+
+      // Host invokes the installed skill capability; definitions stay untouched.
+      return host.runCreateSpec();
+    },
+
+    async runCreateTickets(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("to-tickets")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill to-tickets is missing. Install it into a Pi skill location and retry Create-tickets.",
+        };
+      }
+
+      const ticketsHost = host as SkillsHost | undefined;
+      if (!ticketsHost?.runCreateTickets) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets Planning host is not wired. Matt Auto cannot invoke to-tickets without a Workflow-home host.",
+        };
+      }
+
+      // Host invokes the installed skill capability; definitions stay untouched.
+      return ticketsHost.runCreateTickets(input);
+    },
+
+    async prepareImplement(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("implement")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill implement is missing. Install it into a Pi skill location and retry Implementation.",
+        };
+      }
+
+      const implementHost = host as SkillsHost | undefined;
+      if (implementHost?.prepareImplement) {
+        // Host may customize the worker prompt; skill definitions stay untouched.
+        return implementHost.prepareImplement(input);
+      }
+
+      // Default orchestration wrapper: run /implement for the ticket in the worker.
+      return {
+        ok: true,
+        skillCommand: "/implement",
+        prompt: [
+          `/implement`,
+          "",
+          `Implement GitHub issue #${input.ticketNumber}: ${input.title}`,
+          "",
+          "Work only in this Implementation workspace. Commit locally when done.",
+          "Do not push, edit GitHub issues, or mutate remote workflow state.",
+          "When finished, emit a Stage result on the Worker protocol (completed or failed).",
+        ].join("\n"),
+      };
+    },
+
+    async prepareResolveConflicts(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("resolving-merge-conflicts")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill resolving-merge-conflicts is missing. Install it into a Pi skill location and retry Conflict resolution.",
+        };
+      }
+
+      const conflictHost = host as SkillsHost | undefined;
+      if (conflictHost?.prepareResolveConflicts) {
+        return conflictHost.prepareResolveConflicts(input);
+      }
+
+      return {
+        ok: true,
+        skillCommand: "/resolving-merge-conflicts",
+        prompt: [
+          `/resolving-merge-conflicts`,
+          "",
+          `Resolve the in-progress merge conflict integrating ticket #${input.ticketNumber}.`,
+          `Ticket branch: ${input.ticketBranch}`,
+          `Integration branch: ${input.integrationBranch}`,
+          "",
+          "Work only in this Integration workspace. Always resolve; never --abort.",
+          "Do not push, edit GitHub issues, or mutate remote workflow state.",
+          "When finished, emit a Stage result on the Worker protocol (completed or failed).",
+        ].join("\n"),
+      };
     },
   };
 }

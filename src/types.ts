@@ -34,6 +34,431 @@ export type NextAction = {
   description: string;
 };
 
+/** Planning / orchestration stage identifiers known to the coordinator. */
+export type StageId =
+  | "create-spec"
+  | "create-tickets"
+  | "implement"
+  | "integrate"
+  | "ci-gate"
+  | "workflow-pr"
+  | "cleanup"
+  | "rework"
+  | "follow-up";
+
+/** On-demand CI gate status for an Integration branch. Never polled in the background. */
+export type CiStatus = "pending" | "success" | "failure";
+
+/** Recovery choices after a red CI gate check. */
+export type CiRecoveryDecision = "inspect" | "retry" | "leave-open";
+
+/** Stage confirmation choices after a reviewable artifact is produced. */
+export type StageConfirmationDecision = "publish" | "revise" | "cancel";
+
+/**
+ * Implementation disposition after a successful Implementation worker Stage result.
+ * Close starts a serialized Integration unit; the GitHub ticket closes only after
+ * Integration + CI succeed.
+ */
+export type ImplementationDispositionDecision =
+  | "close"
+  | "leave-open"
+  | "investigate";
+
+/** Lifecycle of one session-owned Implementation worker attempt (panel / local state). */
+export type ImplementationWorkerStatus =
+  | "running"
+  | "needs-disposition"
+  | "completed"
+  | "failed"
+  | "aborted"
+  | "compatibility-recovery";
+
+/** Reviewable Create-spec draft produced by the Matt skills adapter. */
+export type SpecDraft = {
+  title: string;
+  body: string;
+};
+
+/**
+ * One ticket in a Create-tickets breakdown.
+ * `localId` and `blockedBy` are draft-local identifiers; GitHub numbers are
+ * assigned only on Stage confirmation Publish.
+ */
+export type TicketDraft = {
+  /** Draft-local id used only within the breakdown for blockedBy references. */
+  localId: string;
+  title: string;
+  /** Ticket body (what to build / acceptance criteria). Parent and Blocked by are applied on publish. */
+  body: string;
+  /** localIds of tickets that must complete before this one can start. */
+  blockedBy: readonly string[];
+};
+
+/** Reviewable Create-tickets draft produced by the Matt skills adapter. */
+export type TicketsDraft = {
+  tickets: readonly TicketDraft[];
+};
+
+/**
+ * Durable orchestration stage recorded on the Workflow manifest.
+ * Extended by later tickets as the workflow advances.
+ * - pr-opened: Workflow PR exists (pre-merge)
+ * - merged: Workflow PR merged; cleanup still available
+ * - completed: post-cleanup; no longer an Active workflow
+ */
+export type WorkflowStage =
+  | "spec-published"
+  | "tickets-published"
+  | "pr-opened"
+  | "merged"
+  | "completed";
+
+/**
+ * One ticket whose Integration unit has been merged, verified, and pushed.
+ * The GitHub ticket remains open until the CI gate succeeds (later ticket).
+ */
+export type IntegratedTicketRef = {
+  number: number;
+  attempt: number;
+  branchName: string;
+};
+
+/** Workflow PR recorded on the Workflow manifest. */
+export type WorkflowPrRef = {
+  number: number;
+  url?: string;
+  headBranch: string;
+  baseBranch: string;
+};
+
+/**
+ * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
+ * Does not alter the spec body.
+ */
+export type WorkflowManifest = {
+  schema: "matt-auto/workflow-manifest";
+  version: 1;
+  workflowId: number;
+  targetBranch: string;
+  stage: WorkflowStage;
+  workerProfile: WorkerProfile;
+  /** Published ticket issue numbers for this Workflow ID (after Create-tickets). */
+  tickets?: readonly number[];
+  /** Integration branch name once the first Integration unit has succeeded. */
+  integrationBranch?: string;
+  /** Tickets whose Integration units have been merged, verified, and pushed. */
+  integratedTickets?: readonly IntegratedTicketRef[];
+  /** Single Workflow PR from Integration branch to Target branch. */
+  workflowPr?: WorkflowPrRef;
+  /** When this is a Follow-up workflow, the original completed Workflow ID. */
+  followUpOf?: number;
+};
+
+/**
+ * Active workflow recovered from GitHub (spec issue + Workflow manifest).
+ * Workflow ID is the published spec issue number.
+ * Completed (post-cleanup) workflows are not Active.
+ */
+export type ActiveWorkflow = {
+  workflowId: number;
+  targetBranch: string;
+  stage: WorkflowStage;
+  workerProfile: WorkerProfile;
+  title?: string;
+  /** Published ticket issue numbers when Create-tickets has completed. */
+  tickets?: readonly number[];
+  /** Integration branch when at least one Integration unit has succeeded. */
+  integrationBranch?: string;
+  /** Tickets already integrated (ticket issues stay open until CI gate). */
+  integratedTickets?: readonly IntegratedTicketRef[];
+  /** Single Workflow PR when opened (or after merge, until cleanup). */
+  workflowPr?: WorkflowPrRef;
+  /** When this is a Follow-up workflow, the original completed Workflow ID. */
+  followUpOf?: number;
+};
+
+/** A ticket that is open and has no open blockers — ready for Implementation. */
+export type ReadyTicket = {
+  number: number;
+  title: string;
+};
+
+/**
+ * Ticket progress and ready frontier computed from GitHub issue state.
+ * Used by Next actions and the Workflow panel after Create-tickets publish.
+ */
+export type TicketProgressSummary = {
+  workflowId: number;
+  total: number;
+  open: number;
+  closed: number;
+  /**
+   * Ready frontier: open tickets with no open blockers that are not already
+   * integrated (integrated open tickets await the CI gate instead).
+   */
+  ready: readonly ReadyTicket[];
+  /** Open tickets still gated by open blockers. */
+  blocked: readonly {
+    number: number;
+    title: string;
+    openBlockers: readonly number[];
+  }[];
+  /** Open integrated tickets awaiting the on-demand CI gate. */
+  awaitingCi: readonly ReadyTicket[];
+};
+
+/** Identity of one Implementation worker attempt (branch + worktree + transcript). */
+export type ImplementationAttemptRef = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  branchName: string;
+  worktreePath: string;
+  workerId: string;
+};
+
+/** Compact passive Workflow panel snapshot while background work is running. */
+export type WorkflowPanelState = {
+  workflowId: number;
+  /** Compact passive lines for a Pi TUI widget (not an interactive dashboard). */
+  lines: readonly string[];
+  workers: readonly {
+    ticketNumber: number;
+    attempt: number;
+    status: ImplementationWorkerStatus;
+    progress?: string;
+    branchName: string;
+  }[];
+  ticketProgress?: TicketProgressSummary;
+  /** Compact Integration unit status when one is pending retry or resolving conflicts. */
+  integration?: {
+    ticketNumber: number;
+    attempt: number;
+    status: "pending-retry" | "conflict-resolution";
+    branchName: string;
+    reason?: string;
+  };
+  /** Compact CI gate status for open integrated tickets (no background polling). */
+  ci?: readonly {
+    ticketNumber: number;
+    attempt: number;
+    status: "awaiting-check" | "failure";
+    integrationBranch: string;
+    summary?: string;
+    url?: string;
+  }[];
+  /** Compact Workflow PR status when opened or merged (pre-cleanup). */
+  workflowPr?: {
+    number: number;
+    status: "open" | "merged";
+    url?: string;
+    baseBranch: string;
+    headBranch: string;
+  };
+};
+
+/**
+ * Worker protocol events derived from a worker's Pi JSON event stream.
+ * Carries progress and Stage results only — no GitHub mutation authority.
+ */
+export type WorkerProtocolEvent =
+  | {
+      type: "progress";
+      workerId: string;
+      message: string;
+    }
+  | {
+      type: "stage-result";
+      workerId: string;
+      outcome:
+        | {
+            status: "completed";
+            summary?: string;
+            /** Local commit only; workers never push. */
+            localCommitSha?: string;
+          }
+        | { status: "failed"; reason: string };
+    }
+  | {
+      type: "process-exit";
+      workerId: string;
+      /** Process exit code; null when terminated by signal. */
+      code: number | null;
+    };
+
+/**
+ * One-shot Stage result for completion, failure, confirmation, or recovery.
+ * Matt Auto reacts to these; it does not poll for decisions.
+ */
+export type StageResult =
+  | {
+      status: "needs-confirmation";
+      stage: "create-spec";
+      draft: SpecDraft;
+      confirmationOptions: readonly StageConfirmationDecision[];
+    }
+  | {
+      status: "needs-confirmation";
+      stage: "create-tickets";
+      draft: TicketsDraft;
+      confirmationOptions: readonly StageConfirmationDecision[];
+    }
+  | {
+      status: "running";
+      stage: "implement";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      workerId: string;
+      branchName: string;
+      worktreePath: string;
+    }
+  | {
+      status: "running";
+      stage: "integrate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      workerId: string;
+      /** Integration branch with the preserved in-progress merge. */
+      integrationBranch: string;
+      /** Integration workspace where the Conflict resolution worker runs. */
+      integrationWorktreePath: string;
+      /** Always true: this running Stage result is a Conflict resolution worker. */
+      conflictResolution: true;
+    }
+  | {
+      status: "needs-disposition";
+      stage: "implement";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      branchName: string;
+      worktreePath: string;
+      workerId: string;
+      summary?: string;
+      dispositionOptions: readonly ImplementationDispositionDecision[];
+    }
+  | {
+      status: "completed";
+      stage: StageId;
+      workflowId: number;
+      /** Ticket issue numbers after Create-tickets publish. */
+      tickets?: readonly number[];
+      /** Ticket progress snapshot after Create-tickets publish. */
+      ticketProgress?: TicketProgressSummary;
+      /** Set when an Implementation disposition or Integration unit completes. */
+      ticketNumber?: number;
+      attempt?: number;
+      disposition?: ImplementationDispositionDecision;
+      /**
+       * True when Close ran a successful Integration unit.
+       * The GitHub ticket remains open until the CI gate succeeds.
+       */
+      integrated?: boolean;
+      /** Integration branch after a successful Integration unit. */
+      integrationBranch?: string;
+      /** Integration workspace path after a successful Integration unit. */
+      integrationWorktreePath?: string;
+      /** Local verification summary after a successful Integration unit. */
+      localVerification?: {
+        ok: true;
+        commands: readonly string[];
+      };
+      /** Branches pushed by the Workflow coordinator (never by workers). */
+      pushedBranches?: readonly string[];
+      branchName?: string;
+      worktreePath?: string;
+      /** On-demand CI gate status after an Integration unit or Check CI action. */
+      ciStatus?: CiStatus;
+      /** True when the CI gate closed the GitHub ticket. */
+      ticketClosed?: boolean;
+      /** Optional CI run URL for inspect recovery. */
+      ciUrl?: string;
+      /** Optional CI summary for panel / recovery. */
+      ciSummary?: string;
+      /** Workflow PR number after open or merge. */
+      workflowPrNumber?: number;
+      /** Workflow PR URL when available. */
+      workflowPrUrl?: string;
+      /** Target branch for the Workflow PR. */
+      targetBranch?: string;
+      /** Branches removed by paired Workflow cleanup (local + remote). */
+      removedBranches?: readonly string[];
+      /** True when paired cleanup removed local workspaces/transcripts. */
+      cleanedLocal?: boolean;
+      /** True when paired cleanup removed matching remote matt-auto branches. */
+      cleanedRemote?: boolean;
+      /** Original Workflow ID when a Follow-up workflow was created. */
+      followUpOf?: number;
+      /** True when this Stage result is a pre-merge Rework attempt. */
+      rework?: boolean;
+    }
+  | {
+      status: "pending-ci";
+      stage: "ci-gate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      integrationBranch: string;
+      integrated: true;
+      ciStatus: "pending";
+      ticketClosed: false;
+      ciUrl?: string;
+      ciSummary?: string;
+      pushedBranches?: readonly string[];
+      localVerification?: { ok: true; commands: readonly string[] };
+      integrationWorktreePath?: string;
+      branchName?: string;
+      worktreePath?: string;
+    }
+  | {
+      status: "needs-ci-recovery";
+      stage: "ci-gate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      integrationBranch: string;
+      integrated: true;
+      ciStatus: "failure";
+      ticketClosed: false;
+      recoveryOptions: readonly CiRecoveryDecision[];
+      ciUrl?: string;
+      ciSummary?: string;
+      branchName?: string;
+      worktreePath?: string;
+    }
+  | {
+      status: "cancelled";
+      stage: StageId;
+    }
+  | {
+      status: "failed";
+      stage: StageId;
+      reason: string;
+      ticketNumber?: number;
+      attempt?: number;
+      workflowId?: number;
+      workflowPrNumber?: number;
+      workflowPrUrl?: string;
+      integrationBranch?: string;
+      targetBranch?: string;
+      removedBranches?: readonly string[];
+      cleanedLocal?: boolean;
+      cleanedRemote?: boolean;
+      followUpOf?: number;
+      rework?: boolean;
+    }
+  | {
+      status: "compatibility-recovery";
+      stage: StageId;
+      reason: string;
+      ticketNumber?: number;
+      attempt?: number;
+      rework?: boolean;
+    };
+
 /**
  * Model + thinking level used by Implementation workers.
  * Distinct from the Workflow home session model.
@@ -108,6 +533,26 @@ export type WorkflowCoordinator = {
    */
   nextActions(): Promise<NextAction[]>;
   /**
+   * Run a Next action by id (for example Create-spec Planning stage).
+   * Planning stages execute in Workflow home and never publish silently.
+   */
+  runNextAction(actionId: string): Promise<StageResult>;
+  /**
+   * Apply Stage confirmation (Publish / Revise / Cancel) for a pending stage.
+   * Publish is the only path that performs remote publication.
+   */
+  confirmStage(decision: StageConfirmationDecision): Promise<StageResult>;
+  /**
+   * Active workflow for the current Target branch, if any.
+   * Recovered from GitHub (Workflow ID + Workflow manifest).
+   */
+  getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
+  /**
+   * Ticket progress and ready frontier for the Active workflow.
+   * `undefined` when there is no Active workflow or tickets are not published yet.
+   */
+  getTicketProgress(): Promise<TicketProgressSummary | undefined>;
+  /**
    * Currently selected Workflow root (defaults to nearest enclosing Git root).
    */
   currentRoot(): Promise<WorkflowRoot>;
@@ -156,4 +601,32 @@ export type WorkflowCoordinator = {
     provider: string,
     modelId: string,
   ): Promise<readonly string[]>;
+  /**
+   * Passive Workflow panel snapshot for the Active workflow.
+   * `undefined` when there is no Active workflow.
+   */
+  getPanelState(): Promise<WorkflowPanelState | undefined>;
+  /**
+   * Apply Implementation disposition (Close / Leave open / Investigate)
+   * after a successful Implementation worker Stage result.
+   * Close starts a serialized Integration unit (merge + Local verification +
+   * coordinator remote writes). The GitHub ticket is not closed yet.
+   */
+  confirmDisposition(
+    decision: ImplementationDispositionDecision,
+  ): Promise<StageResult>;
+  /**
+   * Abort all session-owned Implementation workers.
+   * Used on Workflow home shutdown, reload, or Workflow-root switching.
+   * Leaves GitHub state recoverable (tickets remain open / ready).
+   */
+  abortWorkers(): Promise<void>;
+  /**
+   * Retained Worker transcript events for one attempt (local, uncommitted).
+   */
+  getWorkerTranscript(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+  }): Promise<readonly unknown[]>;
 };

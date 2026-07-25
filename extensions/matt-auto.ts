@@ -4,8 +4,13 @@
  * Product rules live in the Workflow coordinator. This file only wires Pi
  * commands/menus to coordinator ports.
  *
- * Worker profile menus read Pi’s authenticated available-model catalog and
- * write Matt Auto preferences only — they never change the Workflow home model.
+ * Planning stages (Create-spec, Create-tickets) run in Workflow home: the Matt
+ * skills adapter invokes installed skills via a host without modifying skill
+ * definitions, then Stage confirmation (Publish / Revise / Cancel) gates remote
+ * publication through the coordinator.
+ *
+ * Implementation workers are session-owned: the WorkersPort and coordinator
+ * live for the Pi session and abort cleanly on session_shutdown.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -14,31 +19,72 @@ import {
   createGitTopologyPort,
   createModelsPort,
   createPreferencesPort,
+  createCiPort,
+  createRemoteGitPort,
   createSkillsPort,
+  createTrackerPort,
+  createTranscriptPort,
+  createVerificationPort,
+  createWorkersPort,
+  createWorkspacePort,
+  type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
+import type { WorkflowCoordinator } from "../src/types.js";
 import {
+  captureCreateSpecDraft,
+  captureCreateTicketsDraft,
   presentMainMenu,
   presentNextActions,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-function createCoordinatorFor(
-  cwd: string,
-  modelRegistry: Parameters<typeof createModelsPort>[0],
-) {
-  return createWorkflowCoordinator({
-    startPath: cwd,
-    topology: createGitTopologyPort(),
-    models: createModelsPort(modelRegistry),
-    forRoot(rootPath) {
-      return {
-        environment: createEnvironmentPort(rootPath),
-        skills: createSkillsPort(rootPath),
-        preferences: createPreferencesPort(rootPath),
-      };
+function createSkillsHost(getUi: () => MattAutoUi | undefined): SkillsHost {
+  return {
+    async runCreateSpec() {
+      const ui = getUi();
+      if (!ui) {
+        return {
+          ok: false,
+          reason:
+            "Create-spec Planning host has no active UI. Retry from /matt-auto.",
+        };
+      }
+      // Orchestration wrapper around installed to-spec:
+      // capture a reviewable draft only — never publish (coordinator owns that).
+      const draft = await captureCreateSpecDraft(ui);
+      if (!draft) {
+        return {
+          ok: false,
+          reason:
+            "Create-spec draft was not produced. Follow the installed to-spec skill to synthesize a title and body, then retry. Matt Auto does not publish until Stage confirmation Publish.",
+        };
+      }
+      return { ok: true, draft };
     },
-  });
+
+    async runCreateTickets(input) {
+      const ui = getUi();
+      if (!ui) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets Planning host has no active UI. Retry from /matt-auto.",
+        };
+      }
+      // Orchestration wrapper around installed to-tickets:
+      // capture a reviewable breakdown only — never publish (coordinator owns that).
+      const draft = await captureCreateTicketsDraft(ui, input);
+      if (!draft) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets breakdown was not produced. Follow the installed to-tickets skill to synthesize a vertical-slice breakdown with blockedBy edges, then retry. Matt Auto does not publish until Stage confirmation Publish.",
+        };
+      }
+      return { ok: true, draft };
+    },
+  };
 }
 
 function uiFrom(ctx: {
@@ -47,6 +93,7 @@ function uiFrom(ctx: {
       title: string,
       placeholder?: string,
     ) => Promise<string | undefined>;
+    editor?: (title: string, prefill?: string) => Promise<string | undefined>;
   };
 }): MattAutoUi {
   const ui: MattAutoUi = {
@@ -57,10 +104,78 @@ function uiFrom(ctx: {
     const input = ctx.ui.input.bind(ctx.ui);
     ui.input = (title, placeholder) => input(title, placeholder);
   }
+  if (ctx.ui.editor) {
+    const editor = ctx.ui.editor.bind(ctx.ui);
+    ui.editor = (title, prefill) => editor(title, prefill);
+  }
   return ui;
 }
 
 export default function mattAutoExtension(pi: ExtensionAPI) {
+  // Session-scoped resources: workers and coordinator survive across commands.
+  const workers = createWorkersPort();
+  let activeUi: MattAutoUi | undefined;
+  let coordinator: WorkflowCoordinator | undefined;
+  let boundCwd: string | undefined;
+  let boundModelRegistry: Parameters<typeof createModelsPort>[0] | undefined;
+
+  const skillsHost = createSkillsHost(() => activeUi);
+
+  function ensureCoordinator(
+    cwd: string,
+    modelRegistry: Parameters<typeof createModelsPort>[0],
+    ui: MattAutoUi,
+  ): WorkflowCoordinator {
+    activeUi = ui;
+
+    const sameSession =
+      coordinator &&
+      boundCwd === cwd &&
+      boundModelRegistry === modelRegistry;
+    if (sameSession && coordinator) {
+      return coordinator;
+    }
+
+    // Cwd or model registry change: abort prior session-owned workers first.
+    if (coordinator) {
+      void coordinator.abortWorkers();
+    }
+
+    coordinator = createWorkflowCoordinator({
+      startPath: cwd,
+      topology: createGitTopologyPort(),
+      models: createModelsPort(modelRegistry),
+      forRoot(rootPath) {
+        return {
+          environment: createEnvironmentPort(rootPath),
+          skills: createSkillsPort(rootPath, skillsHost),
+          preferences: createPreferencesPort(rootPath),
+          tracker: createTrackerPort(rootPath),
+          workspace: createWorkspacePort(rootPath),
+          workers,
+          transcripts: createTranscriptPort(rootPath),
+          verification: createVerificationPort(),
+          remoteGit: createRemoteGitPort(rootPath),
+          ci: createCiPort(rootPath),
+        };
+      },
+    });
+    boundCwd = cwd;
+    boundModelRegistry = modelRegistry;
+    return coordinator;
+  }
+
+  pi.on("session_shutdown", async () => {
+    // Session-owned workers abort cleanly; GitHub state remains recoverable.
+    if (coordinator) {
+      await coordinator.abortWorkers();
+    }
+    coordinator = undefined;
+    boundCwd = undefined;
+    boundModelRegistry = undefined;
+    activeUi = undefined;
+  });
+
   pi.registerCommand("matt-auto", {
     description:
       "Matt Auto: stage-gated workflow menus and Next actions",
@@ -71,16 +186,16 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const subcommand = args.trim();
-      const coordinator = createCoordinatorFor(ctx.cwd, ctx.modelRegistry);
       const ui = uiFrom(ctx);
+      const active = ensureCoordinator(ctx.cwd, ctx.modelRegistry, ui);
 
       if (subcommand === "" || subcommand === "menu") {
-        await presentMainMenu(coordinator, ui);
+        await presentMainMenu(active, ui);
         return;
       }
 
       if (subcommand === "next") {
-        await presentNextActions(coordinator, ui);
+        await presentNextActions(active, ui);
         return;
       }
 
