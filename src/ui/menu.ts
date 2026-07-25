@@ -99,25 +99,34 @@ async function waitForPipelineWorkers(
     // 1800 * 2s ≈ 1 hour max wait
     await sleep(2000);
     const panel = await coordinator.getPanelState();
-    const workers = panel?.workers.length ?? 0;
-    if (workers === 0) {
-      const next = await coordinator.nextActions();
-      const actionable = next.filter((a) => a.id !== TICKET_PROGRESS_ACTION.id);
-      if (actionable.length > 0) return;
-      // No workers and no actionable next — real idle.
+    // Panel may list pendingDisposition as a "worker" with status
+    // needs-disposition — that is NOT still running. Only wait on live runs.
+    const running =
+      panel?.workers.filter((w) => w.status === "running") ?? [];
+    if (running.length === 0) {
+      log("info", "pipeline:workers-settled", {
+        panelWorkers: panel?.workers.map((w) => ({
+          ticketNumber: w.ticketNumber,
+          status: w.status,
+        })),
+      });
       return;
     }
     if (i > 0 && i % 15 === 0) {
       ui.notify(
-        `Still waiting on ${workers} worker(s)… (${formatPanelLines(panel!).join(" | ")})`,
+        `Still waiting on ${running.length} running worker(s)… (${formatPanelLines(panel!).join(" | ")})`,
         "info",
       );
+      log("debug", "pipeline:wait-workers-tick", {
+        running: running.map((w) => w.ticketNumber),
+      });
     }
   }
   ui.notify(
     "Timed out waiting for workers. Re-run /matt-auto run to continue.",
     "warning",
   );
+  log("warn", "pipeline:wait-workers-timeout");
 }
 
 /** Minimal UI surface needed by Matt Auto menus. */
