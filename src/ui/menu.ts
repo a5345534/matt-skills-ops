@@ -104,6 +104,9 @@ async function waitForPipelineWorkers(
     const running =
       panel?.workers.filter((w) => w.status === "running") ?? [];
     if (running.length === 0) {
+      // If disposition is pending, settle immediately so Auto-Close can run.
+      // If panel is empty, also settle — caller will re-read nextActions
+      // (may hit cooldown after abort/recovery instead of re-Implement thrash).
       log("info", "pipeline:workers-settled", {
         panelWorkers: panel?.workers.map((w) => ({
           ticketNumber: w.ticketNumber,

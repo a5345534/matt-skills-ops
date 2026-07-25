@@ -2801,12 +2801,16 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(workers.state.abortAllCount).toBe(1);
     expect(workers.state.aborts).toContain("implement-42-43-r1");
 
-    // GitHub ticket still open and ready.
+    // GitHub ticket still open and ready in progress summary.
     expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
     const progress = await coordinator.getTicketProgress();
     expect(progress?.ready.map((t) => t.number)).toContain(43);
 
-    // Can relaunch after abort (attempt 2).
+    // Auto pipeline must not immediately re-select the aborted ticket.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+
+    // Explicit re-launch is still allowed (clears cooldown on successful launch).
     const relaunch = await coordinator.runNextAction(
       implementTicketActionId(43),
     );

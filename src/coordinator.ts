@@ -2079,9 +2079,16 @@ export function createWorkflowCoordinator(
 
     // Fallback: many agents finish with exit 0 + local commits but forget the
     // Stage result JSON. Infer completion so the pipeline can advance.
+    // Base must be the Integration branch when present — comparing to main/target
+    // falsely counts already-integrated commits as new ticket work.
     if (event.code === 0 || event.code === null) {
       try {
-        const baseRef = await resolveTargetBranch(bound.preferences);
+        const active = await loadActiveWorkflow(bound);
+        const targetBranch = await resolveTargetBranch(bound.preferences);
+        const baseRef =
+          active?.integrationBranch && active.integrationBranch.length > 0
+            ? active.integrationBranch
+            : targetBranch;
         const ahead = await bound.workspace.hasCommitsAhead({
           worktreePath: worker.worktreePath,
           baseRef,
@@ -2100,7 +2107,7 @@ export function createWorkflowCoordinator(
           await bound.transcripts.append(transcriptKey, {
             type: "stage-result-inferred",
             reason:
-              "Worker exited without Stage result JSON; inferred completed from local commits ahead of base.",
+              "Worker exited without Stage result JSON; inferred completed from local commits ahead of Integration/base.",
             code: event.code,
             headSha: ahead.headSha,
             commitCount: ahead.count,
@@ -3660,6 +3667,8 @@ export function createWorkflowCoordinator(
 
     if (worker) {
       worker.status = "aborted";
+      // Prevent the pipeline from immediately re-selecting the same ticket.
+      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
       await bound.transcripts.append(
         {
           workflowId: worker.workflowId,
