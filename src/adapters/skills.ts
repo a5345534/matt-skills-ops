@@ -26,6 +26,11 @@ export type SkillsHost = {
     ticketNumber: number;
     title: string;
   }): Promise<PrepareImplementOutcome>;
+  prepareResolveConflicts?(input: {
+    ticketNumber: number;
+    ticketBranch: string;
+    integrationBranch: string;
+  }): Promise<PrepareImplementOutcome>;
 };
 
 /** @deprecated Prefer SkillsHost; kept for existing Create-spec wiring. */
@@ -175,6 +180,38 @@ export function createSkillsPort(
           `Implement GitHub issue #${input.ticketNumber}: ${input.title}`,
           "",
           "Work only in this Implementation workspace. Commit locally when done.",
+          "Do not push, edit GitHub issues, or mutate remote workflow state.",
+          "When finished, emit a Stage result on the Worker protocol (completed or failed).",
+        ].join("\n"),
+      };
+    },
+
+    async prepareResolveConflicts(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("resolving-merge-conflicts")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill resolving-merge-conflicts is missing. Install it into a Pi skill location and retry Conflict resolution.",
+        };
+      }
+
+      const conflictHost = host as SkillsHost | undefined;
+      if (conflictHost?.prepareResolveConflicts) {
+        return conflictHost.prepareResolveConflicts(input);
+      }
+
+      return {
+        ok: true,
+        skillCommand: "/resolving-merge-conflicts",
+        prompt: [
+          `/resolving-merge-conflicts`,
+          "",
+          `Resolve the in-progress merge conflict integrating ticket #${input.ticketNumber}.`,
+          `Ticket branch: ${input.ticketBranch}`,
+          `Integration branch: ${input.integrationBranch}`,
+          "",
+          "Work only in this Integration workspace. Always resolve; never --abort.",
           "Do not push, edit GitHub issues, or mutate remote workflow state.",
           "When finished, emit a Stage result on the Worker protocol (completed or failed).",
         ].join("\n"),

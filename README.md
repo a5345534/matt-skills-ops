@@ -120,14 +120,16 @@ Choosing **Close** on a completed Implementation disposition runs one Integratio
 
 1. Ensure a dedicated **Integration workspace** worktree outside the Workflow root on branch `matt-auto/<Workflow ID>` (not Workflow home).
 2. Merge the ticket branch into the Integration branch (local only).
-3. Run **Local verification** — project-discoverable checks (e.g. `package.json` scripts `typecheck` / `test`) in the Integration workspace.
-4. On Local verification failure: **fail closed** — no push, no Workflow manifest update; Next actions offer **Retry Integration #N**.
-5. On success: the Workflow coordinator pushes the Integration branch (and ticket branch) and updates the Workflow manifest (`integrationBranch`, `integratedTickets`).
-6. GitHub tickets remain open until the CI gate (later ticket).
-7. Later Implementation workspaces branch from the Integration branch so dependents see integrated code.
+3. On **merge conflict**: keep the in-progress merge and launch a session-owned **Conflict resolution worker** in the Integration workspace that runs the installed `resolving-merge-conflicts` skill (Matt Auto does not invent a separate conflict resolver).
+4. On successful Conflict resolution (or a clean merge): run **Local verification** — project-discoverable checks (e.g. `package.json` scripts `typecheck` / `test`) in the Integration workspace.
+5. On Local verification failure: **fail closed** — no push, no Workflow manifest update; Next actions offer **Retry Integration #N**.
+6. On Conflict resolution failure or missing Stage result: enter Compatibility / integration recovery without guessing merges; retry re-launches Conflict resolution without re-merging.
+7. On success: the Workflow coordinator pushes the Integration branch (and ticket branch) and updates the Workflow manifest (`integrationBranch`, `integratedTickets`).
+8. GitHub tickets remain open until the CI gate (later ticket).
+9. Later Implementation workspaces branch from the Integration branch so dependents see integrated code.
 
-Frontier multi-select concurrency, conflict-resolution workers, CI gate / ticket close, and Workflow PR land in later tickets.
+Frontier multi-select concurrency, CI gate / ticket close, and Workflow PR land in later tickets.
 
 ## Status
 
-Tickets #2–#7 and #9 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, frontier discovery, the single Implementation worker path, and Integration units (Integration workspace, Local verification, coordinator remote writes). Multi-worker concurrency, CI, conflict recovery, and Workflow PR land in later tickets.
+Tickets #2–#7, #9, and #11 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, frontier discovery, the single Implementation worker path, Integration units (Integration workspace, Local verification, coordinator remote writes), and Conflict resolution workers via `resolving-merge-conflicts`. Multi-worker concurrency, CI, and Workflow PR land in later tickets.

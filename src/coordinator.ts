@@ -81,6 +81,22 @@ type ActiveImplementationWorker = {
 };
 
 /**
+ * Session-owned Conflict resolution worker for an in-progress Integration merge.
+ * Runs the installed resolving-merge-conflicts skill in the Integration workspace.
+ */
+type ActiveConflictWorker = {
+  workerId: string;
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  integrationBranch: string;
+  integrationWorktreePath: string;
+  status: ImplementationWorkerStatus;
+  progress?: string;
+  receivedStageResult: boolean;
+};
+
+/**
  * One completed ticket waiting for (or retrying) a serialized Integration unit.
  * Only one Integration unit runs at a time; tickets do not close yet.
  */
@@ -91,6 +107,15 @@ type PendingIntegration = {
   branchName: string;
   worktreePath: string;
   lastFailure?: string;
+  /**
+   * Set when a merge conflict left an in-progress merge for Conflict resolution.
+   * While present, retries re-launch the Conflict resolution worker instead of re-merging.
+   */
+  conflict?: {
+    integrationBranch: string;
+    integrationWorktreePath: string;
+    message: string;
+  };
 };
 
 /**
@@ -121,6 +146,11 @@ export function createWorkflowCoordinator(
   let pendingIntegration: PendingIntegration | undefined;
   /** Guard against re-entrant Integration unit execution. */
   let integrationInProgress = false;
+  /**
+   * Session-owned Conflict resolution worker for a preserved in-progress merge.
+   * Lifetime is bound to Workflow home; never durable across processes.
+   */
+  let activeConflictWorker: ActiveConflictWorker | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -539,7 +569,14 @@ export function createWorkflowCoordinator(
         `Worker #${pendingDisposition.ticketNumber} r${pendingDisposition.attempt}: needs-disposition`,
       );
     }
-    if (pendingIntegration) {
+    if (activeConflictWorker) {
+      const progressText = activeConflictWorker.progress
+        ? ` — ${activeConflictWorker.progress}`
+        : "";
+      lines.push(
+        `Conflict resolution #${activeConflictWorker.ticketNumber} r${activeConflictWorker.attempt}: ${activeConflictWorker.status}${progressText}`,
+      );
+    } else if (pendingIntegration) {
       const failure = pendingIntegration.lastFailure
         ? ` — ${pendingIntegration.lastFailure}`
         : "";
@@ -784,7 +821,7 @@ export function createWorkflowCoordinator(
 
     if (active.stage === "tickets-published") {
       // While a worker runs, the passive panel owns progress.
-      if (activeWorker) {
+      if (activeWorker || activeConflictWorker) {
         return [];
       }
 
@@ -1483,6 +1520,11 @@ export function createWorkflowCoordinator(
     bound: RootScopedPorts,
     event: WorkerProtocolEvent,
   ): Promise<void> {
+    if (activeConflictWorker?.workerId === event.workerId) {
+      await handleConflictWorkerEvent(bound, event);
+      return;
+    }
+
     const worker =
       activeWorker?.workerId === event.workerId
         ? activeWorker
@@ -1543,6 +1585,89 @@ export function createWorkflowCoordinator(
       type: "compatibility-recovery",
       reason:
         "Implementation worker process exited without a Stage result on the Worker protocol.",
+      code: event.code,
+    });
+  }
+
+  async function handleConflictWorkerEvent(
+    bound: RootScopedPorts,
+    event: WorkerProtocolEvent,
+  ): Promise<void> {
+    const worker = activeConflictWorker;
+    if (!worker || worker.workerId !== event.workerId) {
+      return;
+    }
+
+    const transcriptKey = {
+      workflowId: worker.workflowId,
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+    };
+    await bound.transcripts.append(transcriptKey, event);
+
+    if (event.type === "progress") {
+      worker.progress = event.message;
+      return;
+    }
+
+    if (event.type === "stage-result") {
+      worker.receivedStageResult = true;
+      if (event.outcome.status === "completed") {
+        worker.status = "completed";
+        activeConflictWorker = undefined;
+
+        const unit = pendingIntegration;
+        if (
+          !unit ||
+          unit.ticketNumber !== worker.ticketNumber ||
+          unit.workflowId !== worker.workflowId
+        ) {
+          return;
+        }
+
+        const integrationWorkspace = {
+          branchName: worker.integrationBranch,
+          worktreePath: worker.integrationWorktreePath,
+        };
+        delete unit.conflict;
+        delete unit.lastFailure;
+
+        await finishIntegrationAfterMerge(bound, unit, integrationWorkspace);
+        return;
+      }
+
+      worker.status = "failed";
+      activeConflictWorker = undefined;
+      if (
+        pendingIntegration &&
+        pendingIntegration.ticketNumber === worker.ticketNumber
+      ) {
+        pendingIntegration.lastFailure = `Conflict resolution failed: ${event.outcome.reason}`;
+      }
+      await bound.transcripts.append(transcriptKey, {
+        type: "conflict-resolution-failed",
+        reason: event.outcome.reason,
+      });
+      return;
+    }
+
+    if (worker.receivedStageResult) {
+      return;
+    }
+
+    worker.status = "compatibility-recovery";
+    activeConflictWorker = undefined;
+    const reason =
+      "Conflict resolution worker process exited without a Stage result on the Worker protocol. Matt Auto entered Compatibility recovery rather than guessing merges.";
+    if (
+      pendingIntegration &&
+      pendingIntegration.ticketNumber === worker.ticketNumber
+    ) {
+      pendingIntegration.lastFailure = `Compatibility recovery: ${reason}`;
+    }
+    await bound.transcripts.append(transcriptKey, {
+      type: "compatibility-recovery",
+      reason,
       code: event.code,
     });
   }
@@ -1661,6 +1786,20 @@ export function createWorkflowCoordinator(
         ticketNumber: unit.ticketNumber,
         attempt: unit.attempt,
       };
+    }
+
+    if (activeConflictWorker) {
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason: `A Conflict resolution worker is already running for #${activeConflictWorker.ticketNumber}.`,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+
+    if (unit.conflict) {
+      return launchConflictWorker(bound, unit, unit.conflict);
     }
 
     integrationInProgress = true;
@@ -1786,17 +1925,30 @@ export function createWorkflowCoordinator(
         ticketBranch: unit.branchName,
       });
       if (!mergeResult.ok) {
-        const reason =
-          mergeResult.reason === "conflict"
-            ? `Merge conflict integrating ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`
-            : `Failed to merge ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`;
+        if (mergeResult.reason === "conflict") {
+          const conflict = {
+            integrationBranch: expectedIntegrationBranch,
+            integrationWorktreePath: integrationWorkspace.worktreePath,
+            message: mergeResult.message,
+          };
+          unit.conflict = conflict;
+          unit.lastFailure = `Merge conflict integrating ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`;
+          await bound.transcripts.append(transcriptKey, {
+            type: "integration-unit-conflict",
+            reason: unit.lastFailure,
+            phase: "merge",
+          });
+          integrationInProgress = false;
+          return launchConflictWorker(bound, unit, conflict);
+        }
+
+        const reason = `Failed to merge ${unit.branchName} into ${expectedIntegrationBranch}: ${mergeResult.message}`;
         unit.lastFailure = reason;
         await bound.transcripts.append(transcriptKey, {
           type: "integration-unit-failed",
           reason,
           phase: "merge",
         });
-        // Fail closed: no remote advancement.
         return {
           status: "failed",
           stage: "integrate",
@@ -1811,6 +1963,168 @@ export function createWorkflowCoordinator(
         integrationBranch: expectedIntegrationBranch,
         mergeCommitSha: mergeResult.mergeCommitSha,
       });
+
+      return finishIntegrationAfterMerge(bound, unit, integrationWorkspace);
+    } finally {
+      integrationInProgress = false;
+    }
+  }
+
+
+  async function launchConflictWorker(
+    bound: RootScopedPorts,
+    unit: PendingIntegration,
+    conflict: {
+      integrationBranch: string;
+      integrationWorktreePath: string;
+      message: string;
+    },
+  ): Promise<StageResult> {
+    unit.conflict = conflict;
+
+    const transcriptKey = {
+      workflowId: unit.workflowId,
+      ticketNumber: unit.ticketNumber,
+      attempt: unit.attempt,
+    };
+
+    const workerProfile = await resolveWorkerProfile(bound);
+    if (!workerProfile) {
+      const reason =
+        "Cannot launch a Conflict resolution worker without a Worker profile.";
+      unit.lastFailure = reason;
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+
+    const prepared = await bound.skills.prepareResolveConflicts({
+      ticketNumber: unit.ticketNumber,
+      ticketBranch: unit.branchName,
+      integrationBranch: conflict.integrationBranch,
+    });
+    if (!prepared.ok) {
+      unit.lastFailure = prepared.reason;
+      return {
+        status: "compatibility-recovery",
+        stage: "integrate",
+        reason: prepared.reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+
+    const workerId = `conflict-${unit.workflowId}-${unit.ticketNumber}-r${unit.attempt}`;
+    const worker: ActiveConflictWorker = {
+      workerId,
+      workflowId: unit.workflowId,
+      ticketNumber: unit.ticketNumber,
+      attempt: unit.attempt,
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      status: "running",
+      receivedStageResult: false,
+    };
+    activeConflictWorker = worker;
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "conflict-resolution-launch",
+      workerId,
+      skillCommand: prepared.skillCommand,
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      message: conflict.message,
+    });
+
+    const sink: WorkerEventSink = {
+      onEvent: (event) => handleWorkerEvent(bound, event),
+    };
+
+    try {
+      await bound.workers.launch(
+        {
+          workerId,
+          workflowId: unit.workflowId,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          worktreePath: conflict.integrationWorktreePath,
+          branchName: conflict.integrationBranch,
+          workerProfile: workerProfile.profile,
+          ticketTitle: `Conflict resolution for #${unit.ticketNumber}`,
+          prompt: prepared.prompt,
+          skillCommand: prepared.skillCommand,
+        },
+        sink,
+      );
+    } catch (error) {
+      activeConflictWorker = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      const reason = `Failed to launch Conflict resolution worker: ${message}`;
+      unit.lastFailure = reason;
+      await bound.transcripts.append(transcriptKey, {
+        type: "conflict-resolution-launch-failed",
+        reason,
+      });
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+
+    return {
+      status: "running",
+      stage: "integrate",
+      workflowId: unit.workflowId,
+      ticketNumber: unit.ticketNumber,
+      attempt: unit.attempt,
+      workerId,
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      conflictResolution: true,
+    };
+  }
+
+  async function finishIntegrationAfterMerge(
+    bound: RootScopedPorts,
+    unit: PendingIntegration,
+    integrationWorkspace: { branchName: string; worktreePath: string },
+  ): Promise<StageResult> {
+    const heldGuard = !integrationInProgress;
+    if (heldGuard) {
+      integrationInProgress = true;
+    }
+
+    const transcriptKey = {
+      workflowId: unit.workflowId,
+      ticketNumber: unit.ticketNumber,
+      attempt: unit.attempt,
+    };
+
+    try {
+      const active = await loadActiveWorkflow(bound);
+      if (!active || active.workflowId !== unit.workflowId) {
+        const reason =
+          "No Active workflow matches this Integration unit. Recover Workflow state before retrying.";
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
 
       // Local verification before any remote write.
       const verification = await bound.verification.runLocalVerification(
@@ -1843,8 +2157,8 @@ export function createWorkflowCoordinator(
       // Coordinator-only remote writes: push Integration + ticket branches.
       const pushedBranches: string[] = [];
       try {
-        await bound.remoteGit.pushBranch(expectedIntegrationBranch);
-        pushedBranches.push(expectedIntegrationBranch);
+        await bound.remoteGit.pushBranch(integrationWorkspace.branchName);
+        pushedBranches.push(integrationWorkspace.branchName);
         await bound.remoteGit.pushBranch(unit.branchName);
         pushedBranches.push(unit.branchName);
       } catch (error) {
@@ -1882,7 +2196,7 @@ export function createWorkflowCoordinator(
         targetBranch: active.targetBranch,
         stage: active.stage,
         workerProfile: active.workerProfile,
-        integrationBranch: expectedIntegrationBranch,
+        integrationBranch: integrationWorkspace.branchName,
         integratedTickets,
       };
       if (active.tickets) {
@@ -1914,7 +2228,7 @@ export function createWorkflowCoordinator(
 
       await bound.transcripts.append(transcriptKey, {
         type: "integration-unit-completed",
-        integrationBranch: expectedIntegrationBranch,
+        integrationBranch: integrationWorkspace.branchName,
         pushedBranches,
       });
 
@@ -1927,7 +2241,7 @@ export function createWorkflowCoordinator(
         attempt: unit.attempt,
         disposition: "close",
         integrated: true,
-        integrationBranch: expectedIntegrationBranch,
+        integrationBranch: integrationWorkspace.branchName,
         integrationWorktreePath: integrationWorkspace.worktreePath,
         localVerification: {
           ok: true,
@@ -1938,13 +2252,16 @@ export function createWorkflowCoordinator(
         worktreePath: unit.worktreePath,
       };
     } finally {
-      integrationInProgress = false;
+      if (heldGuard) {
+        integrationInProgress = false;
+      }
     }
   }
 
   async function abortWorkers(): Promise<void> {
     const bound = scoped ?? (await requireScoped());
     const worker = activeWorker;
+    const conflictWorker = activeConflictWorker;
 
     try {
       await bound.workers.abortAll();
@@ -1964,10 +2281,27 @@ export function createWorkflowCoordinator(
       );
     }
 
-    // Clear session-owned worker state. GitHub tickets remain open/ready.
+    if (conflictWorker) {
+      conflictWorker.status = "aborted";
+      await bound.transcripts.append(
+        {
+          workflowId: conflictWorker.workflowId,
+          ticketNumber: conflictWorker.ticketNumber,
+          attempt: conflictWorker.attempt,
+        },
+        { type: "conflict-resolution-aborted" },
+      );
+      if (
+        pendingIntegration &&
+        pendingIntegration.ticketNumber === conflictWorker.ticketNumber
+      ) {
+        pendingIntegration.lastFailure =
+          "Conflict resolution worker aborted with Workflow home. In-progress merge is preserved for retry.";
+      }
+    }
+
     activeWorker = undefined;
-    // Pending disposition is a completed local attempt awaiting user choice;
-    // abort of running workers does not discard it.
+    activeConflictWorker = undefined;
   }
 
   async function getPanelState(): Promise<WorkflowPanelState | undefined> {
@@ -1987,7 +2321,19 @@ export function createWorkflowCoordinator(
             ...(worker.progress ? { progress: worker.progress } : {}),
           },
         ]
-      : [];
+      : activeConflictWorker
+        ? [
+            {
+              ticketNumber: activeConflictWorker.ticketNumber,
+              attempt: activeConflictWorker.attempt,
+              status: activeConflictWorker.status,
+              branchName: activeConflictWorker.integrationBranch,
+              ...(activeConflictWorker.progress
+                ? { progress: activeConflictWorker.progress }
+                : {}),
+            },
+          ]
+        : [];
 
     const state: WorkflowPanelState = {
       workflowId: active.workflowId,
@@ -1997,12 +2343,24 @@ export function createWorkflowCoordinator(
     if (progress) {
       state.ticketProgress = progress;
     }
-    if (pendingIntegration) {
+    if (activeConflictWorker) {
+      state.integration = {
+        ticketNumber: activeConflictWorker.ticketNumber,
+        attempt: activeConflictWorker.attempt,
+        status: "conflict-resolution",
+        branchName: activeConflictWorker.integrationBranch,
+        ...(pendingIntegration?.lastFailure
+          ? { reason: pendingIntegration.lastFailure }
+          : {}),
+      };
+    } else if (pendingIntegration) {
       state.integration = {
         ticketNumber: pendingIntegration.ticketNumber,
         attempt: pendingIntegration.attempt,
         status: "pending-retry",
-        branchName: pendingIntegration.branchName,
+        branchName: pendingIntegration.conflict
+          ? pendingIntegration.conflict.integrationBranch
+          : pendingIntegration.branchName,
         ...(pendingIntegration.lastFailure
           ? { reason: pendingIntegration.lastFailure }
           : {}),

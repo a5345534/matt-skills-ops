@@ -97,8 +97,9 @@ function parseStageResultFromLine(
 }
 
 /**
- * Session-owned Implementation workers as Pi JSON event stream processes.
- * Workers run in the Implementation workspace cwd and never receive remote-write authority.
+ * Session-owned workers as Pi JSON event stream processes.
+ * Implementation workers run in an Implementation workspace; Conflict resolution
+ * workers run in the Integration workspace. Neither receives remote-write authority.
  */
 export function createWorkersPort(): WorkersPort {
   const running = new Map<string, Running>();

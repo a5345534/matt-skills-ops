@@ -69,6 +69,16 @@ export type SkillsPort = {
     ticketNumber: number;
     title: string;
   }): Promise<PrepareImplementOutcome>;
+  /**
+   * Prepare a Conflict resolution worker for the installed `resolving-merge-conflicts` skill.
+   * Returns the prompt/command the worker process should run in the Integration workspace.
+   * Does not invent a separate conflict-resolution skill; does not modify skill definitions.
+   */
+  prepareResolveConflicts(input: {
+    ticketNumber: number;
+    ticketBranch: string;
+    integrationBranch: string;
+  }): Promise<PrepareResolveConflictsOutcome>;
 };
 
 /** Outcome of preparing the installed `implement` skill for a worker. */
@@ -81,6 +91,12 @@ export type PrepareImplementOutcome =
       prompt: string;
     }
   | { ok: false; reason: string };
+
+/**
+ * Outcome of preparing the installed `resolving-merge-conflicts` skill for a worker.
+ * Same shape as PrepareImplementOutcome; separate name for the Matt skills adapter boundary.
+ */
+export type PrepareResolveConflictsOutcome = PrepareImplementOutcome;
 
 /** Outcome of a local merge into the Integration branch. */
 export type IntegrationMergeResult =
@@ -125,7 +141,8 @@ export type WorkspacePort = {
   }): Promise<{ branchName: string; worktreePath: string }>;
   /**
    * Merge a ticket branch into the Integration branch inside the Integration workspace.
-   * Local only — never pushes. On conflict, leaves no remote advancement.
+   * Local only — never pushes. On conflict, preserves the in-progress merge for a
+   * Conflict resolution worker (does not abort) and advances no remote state.
    */
   mergeIntoIntegration(input: {
     workflowId: number;

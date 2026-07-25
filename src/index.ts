@@ -36,6 +36,7 @@ export type {
   NestedGitRepository,
   PreferencesPort,
   PrepareImplementOutcome,
+  PrepareResolveConflictsOutcome,
   RemoteGitPort,
   RootScopedPorts,
   SkillsPort,

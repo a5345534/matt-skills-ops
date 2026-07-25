@@ -190,11 +190,11 @@ export type WorkflowPanelState = {
     branchName: string;
   }[];
   ticketProgress?: TicketProgressSummary;
-  /** Compact Integration unit status when one is pending retry after fail-closed. */
+  /** Compact Integration unit status when one is pending retry or resolving conflicts. */
   integration?: {
     ticketNumber: number;
     attempt: number;
-    status: "pending-retry";
+    status: "pending-retry" | "conflict-resolution";
     branchName: string;
     reason?: string;
   };
@@ -255,6 +255,20 @@ export type StageResult =
       workerId: string;
       branchName: string;
       worktreePath: string;
+    }
+  | {
+      status: "running";
+      stage: "integrate";
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      workerId: string;
+      /** Integration branch with the preserved in-progress merge. */
+      integrationBranch: string;
+      /** Integration workspace where the Conflict resolution worker runs. */
+      integrationWorktreePath: string;
+      /** Always true: this running Stage result is a Conflict resolution worker. */
+      conflictResolution: true;
     }
   | {
       status: "needs-disposition";

@@ -239,8 +239,8 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
           detail.includes("automatic merge failed");
 
         if (isConflict) {
-          // Leave a clean tree for retry; conflict recovery lands in a later ticket.
-          await run(worktreePath, "git", ["merge", "--abort"]);
+          // Preserve the in-progress merge for a Conflict resolution worker.
+          // Never abort here — the installed resolving-merge-conflicts skill resolves it.
           return {
             ok: false,
             reason: "conflict",

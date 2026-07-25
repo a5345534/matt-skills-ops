@@ -93,17 +93,15 @@ const defaultTicketsDraft: TicketsDraft = {
 
 type SkillsFixture = {
   names?: readonly string[];
-  /** Sequential outcomes for runCreateSpec (last value repeats). */
   createSpecOutcomes?: CreateSpecSkillOutcome[];
-  /** Sequential outcomes for runCreateTickets (last value repeats). */
   createTicketsOutcomes?: CreateTicketsSkillOutcome[];
-  /** prepareImplement outcome override. */
   prepareImplementOutcome?: PrepareImplementOutcome;
-  /** Invocations recorded for assertions. */
+  prepareResolveConflictsOutcome?: PrepareImplementOutcome;
   calls?: {
     runCreateSpec: number;
     runCreateTickets: number;
     prepareImplement?: number;
+    prepareResolveConflicts?: number;
   };
 };
 
@@ -121,16 +119,16 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
     runCreateSpec: 0,
     runCreateTickets: 0,
     prepareImplement: 0,
+    prepareResolveConflicts: 0,
   };
-  // Older fixtures may omit prepareImplement on the calls bag.
   const callBag = calls as {
     runCreateSpec: number;
     runCreateTickets: number;
     prepareImplement?: number;
+    prepareResolveConflicts?: number;
   };
-  if (callBag.prepareImplement === undefined) {
-    callBag.prepareImplement = 0;
-  }
+  if (callBag.prepareImplement === undefined) callBag.prepareImplement = 0;
+  if (callBag.prepareResolveConflicts === undefined) callBag.prepareResolveConflicts = 0;
 
   return {
     installedSkillNames: async () => names,
@@ -139,12 +137,7 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
       const index = Math.min(specIndex, specOutcomes.length - 1);
       specIndex += 1;
       const outcome = specOutcomes[index];
-      if (!outcome) {
-        return {
-          ok: false,
-          reason: "No Create-spec skill outcome configured.",
-        };
-      }
+      if (!outcome) return { ok: false, reason: "No Create-spec skill outcome configured." };
       return outcome;
     },
     runCreateTickets: async () => {
@@ -152,29 +145,35 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
       const index = Math.min(ticketsIndex, ticketsOutcomes.length - 1);
       ticketsIndex += 1;
       const outcome = ticketsOutcomes[index];
-      if (!outcome) {
-        return {
-          ok: false,
-          reason: "No Create-tickets skill outcome configured.",
-        };
-      }
+      if (!outcome) return { ok: false, reason: "No Create-tickets skill outcome configured." };
       return outcome;
     },
     prepareImplement: async (input) => {
       callBag.prepareImplement = (callBag.prepareImplement ?? 0) + 1;
-      if (fixture.prepareImplementOutcome) {
-        return fixture.prepareImplementOutcome;
-      }
-      if (!names.includes("implement")) {
-        return {
-          ok: false,
-          reason: "Installed skill implement is missing.",
-        };
-      }
+      if (fixture.prepareImplementOutcome) return fixture.prepareImplementOutcome;
+      if (!names.includes("implement")) return { ok: false, reason: "Installed skill implement is missing." };
       return {
         ok: true,
         skillCommand: "/implement",
         prompt: `/implement\n\nImplement #${input.ticketNumber}: ${input.title}`,
+      };
+    },
+    prepareResolveConflicts: async (input) => {
+      callBag.prepareResolveConflicts = (callBag.prepareResolveConflicts ?? 0) + 1;
+      if (fixture.prepareResolveConflictsOutcome) return fixture.prepareResolveConflictsOutcome;
+      if (!names.includes("resolving-merge-conflicts")) {
+        return { ok: false, reason: "Installed skill resolving-merge-conflicts is missing." };
+      }
+      return {
+        ok: true,
+        skillCommand: "/resolving-merge-conflicts",
+        prompt: [
+          `/resolving-merge-conflicts`,
+          "",
+          `Resolve conflict for #${input.ticketNumber}`,
+          `Ticket branch: ${input.ticketBranch}`,
+          `Integration branch: ${input.integrationBranch}`,
+        ].join("\n"),
       };
     },
   };
@@ -2159,6 +2158,7 @@ function ticketsPublishedFixture(
     verification?: ReturnType<typeof createVerification>;
     remoteGit?: ReturnType<typeof createRemoteGit>;
     workspace?: ReturnType<typeof createWorkspace>;
+    skills?: SkillsFixture;
   } = {},
 ) {
   const tracker = createTracker({
@@ -2185,6 +2185,8 @@ function ticketsPublishedFixture(
     runCreateSpec: 0,
     runCreateTickets: 0,
     prepareImplement: 0,
+    prepareResolveConflicts: 0,
+    ...(options.skills?.calls ?? {}),
   };
   const ports = createPorts({
     defaultRoot: {
@@ -2195,7 +2197,10 @@ function ticketsPublishedFixture(
       transcripts,
       verification,
       remoteGit,
-      skills: { calls: skillsCalls },
+      skills: {
+        ...(options.skills ?? {}),
+        calls: skillsCalls,
+      },
     },
   });
   const coordinator = createWorkflowCoordinator(ports);
@@ -2743,29 +2748,6 @@ describe("Workflow coordinator Integration unit", () => {
     ]);
   });
 
-  it("fails closed on merge conflict with no remote advancement", async () => {
-    const workspace = createWorkspace("/repo", {
-      mergeResult: {
-        ok: false,
-        reason: "conflict",
-        message: "CONFLICT (content): merge conflict in src/app.ts",
-      },
-    });
-    const { coordinator, workers, remoteGit, tracker } =
-      ticketsPublishedFixture({ workspace });
-    const manifestBefore = tracker.state.writeManifestCalls;
-
-    await completeWorker(coordinator, workers, 43);
-    const result = await coordinator.confirmDisposition("close");
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.reason).toMatch(/Merge conflict/i);
-    }
-    expect(remoteGit.state.pushes).toEqual([]);
-    expect(tracker.state.writeManifestCalls).toBe(manifestBefore);
-  });
-
   it("branches dependent Implementation workspaces from the Integration branch after success", async () => {
     const { coordinator, workers, workspace } = ticketsPublishedFixture();
 
@@ -2822,5 +2804,285 @@ describe("Workflow coordinator Integration unit", () => {
     expect(transcript).toContainEqual(
       expect.objectContaining({ type: "integration-unit-completed" }),
     );
+  });
+});
+
+describe("Workflow coordinator Conflict resolution worker", () => {
+  async function completeWorker(
+    coordinator: ReturnType<typeof createWorkflowCoordinator>,
+    workers: ReturnType<typeof createWorkers>,
+    ticketNumber: number,
+    attempt = 1,
+  ) {
+    await coordinator.runNextAction(implementTicketActionId(ticketNumber));
+    const workerId = `implement-42-${ticketNumber}-r${attempt}`;
+    await workers.emit(workerId, {
+      type: "stage-result",
+      workerId,
+      outcome: { status: "completed", summary: `Done #${ticketNumber}` },
+    });
+  }
+
+  function conflictWorkspace() {
+    return createWorkspace("/repo", {
+      mergeResult: {
+        ok: false,
+        reason: "conflict",
+        message: "CONFLICT (content): merge conflict in src/app.ts",
+      },
+    });
+  }
+
+  it("preserves the in-progress merge and launches a Conflict resolution worker in the Integration workspace", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit, tracker, skillsCalls } =
+      ticketsPublishedFixture({ workspace });
+    const manifestBefore = tracker.state.writeManifestCalls;
+
+    await completeWorker(coordinator, workers, 43);
+    const result = await coordinator.confirmDisposition("close");
+
+    expect(result).toMatchObject({
+      status: "running",
+      stage: "integrate",
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+      workerId: "conflict-42-43-r1",
+      integrationBranch: "matt-auto/42",
+      integrationWorktreePath: "/matt-auto-workspaces/42/integration",
+      conflictResolution: true,
+    });
+
+    // Uses the installed resolving-merge-conflicts skill — no invented skill.
+    expect(skillsCalls.prepareResolveConflicts).toBe(1);
+    expect(workers.state.launches).toEqual([
+      expect.objectContaining({
+        workerId: "implement-42-43-r1",
+        skillCommand: "/implement",
+      }),
+      expect.objectContaining({
+        workerId: "conflict-42-43-r1",
+        worktreePath: "/matt-auto-workspaces/42/integration",
+        branchName: "matt-auto/42",
+        skillCommand: "/resolving-merge-conflicts",
+        prompt: expect.stringContaining("/resolving-merge-conflicts"),
+      }),
+    ]);
+    expect(workers.state.launches[1]?.prompt).not.toMatch(
+      /\/resolve-conflicts|\/conflict-resolution/i,
+    );
+
+    // No remote advancement while the merge is still unresolved.
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(manifestBefore);
+
+    // Passive panel shows Conflict resolution; Next actions empty while it runs.
+    const panel = await coordinator.getPanelState();
+    expect(panel?.integration).toMatchObject({
+      ticketNumber: 43,
+      status: "conflict-resolution",
+      branchName: "matt-auto/42",
+    });
+    expect(
+      panel?.lines.some((l) => /Conflict resolution #43/.test(l)),
+    ).toBe(true);
+    expect(await coordinator.nextActions()).toEqual([]);
+  });
+
+  it("on successful resolution resumes Local verification and the coordinator completion path", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit, tracker, verification } =
+      ticketsPublishedFixture({ workspace });
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    // Conflict resolution worker finishes the preserved merge.
+    await workers.emit("conflict-42-43-r1", {
+      type: "stage-result",
+      workerId: "conflict-42-43-r1",
+      outcome: { status: "completed", summary: "Conflicts resolved" },
+    });
+
+    // Local verification + coordinator remote writes resume without re-merge.
+    expect(workspace.state.merges).toHaveLength(1);
+    expect(verification.state.calls).toEqual([
+      "/matt-auto-workspaces/42/integration",
+    ]);
+    expect(remoteGit.state.pushes).toEqual([
+      "matt-auto/42",
+      "matt-auto/42/ticket-43/r1",
+    ]);
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
+      {
+        number: 43,
+        attempt: 1,
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.integration).toBeUndefined();
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "conflict-resolution-launch" }),
+    );
+    expect(transcript).toContainEqual(
+      expect.objectContaining({
+        type: "stage-result",
+        workerId: "conflict-42-43-r1",
+      }),
+    );
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "local-verification" }),
+    );
+    expect(transcript).toContainEqual(
+      expect.objectContaining({ type: "integration-unit-completed" }),
+    );
+  });
+
+  it("on Conflict resolution failure enters recovery without guessing merges or remote advancement", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit, tracker } =
+      ticketsPublishedFixture({ workspace });
+    const manifestBefore = tracker.state.writeManifestCalls;
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    await workers.emit("conflict-42-43-r1", {
+      type: "stage-result",
+      workerId: "conflict-42-43-r1",
+      outcome: {
+        status: "failed",
+        reason: "Could not preserve both intents in src/app.ts",
+      },
+    });
+
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(manifestBefore);
+    // Did not re-merge or invent a resolution.
+    expect(workspace.state.merges).toHaveLength(1);
+
+    const actions = await coordinator.nextActions();
+    expect(actions).toEqual([
+      {
+        id: integrateTicketActionId(43),
+        label: "Retry Integration #43",
+        description: expect.stringMatching(/Conflict resolution failed/i),
+      },
+    ]);
+  });
+
+  it("retries Conflict resolution through the coordinator seam without re-merging", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit, skillsCalls } =
+      ticketsPublishedFixture({ workspace });
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+    await workers.emit("conflict-42-43-r1", {
+      type: "stage-result",
+      workerId: "conflict-42-43-r1",
+      outcome: { status: "failed", reason: "still conflicted" },
+    });
+
+    const retried = await coordinator.runNextAction(
+      integrateTicketActionId(43),
+    );
+    expect(retried).toMatchObject({
+      status: "running",
+      stage: "integrate",
+      conflictResolution: true,
+      workerId: "conflict-42-43-r1",
+    });
+    // In-progress merge preserved: no second merge attempt.
+    expect(workspace.state.merges).toHaveLength(1);
+    expect(skillsCalls.prepareResolveConflicts).toBe(2);
+
+    await workers.emit("conflict-42-43-r1", {
+      type: "stage-result",
+      workerId: "conflict-42-43-r1",
+      outcome: { status: "completed", summary: "Resolved on retry" },
+    });
+
+    expect(remoteGit.state.pushes).toEqual([
+      "matt-auto/42",
+      "matt-auto/42/ticket-43/r1",
+    ]);
+  });
+
+  it("enters Compatibility recovery when the Conflict resolution worker omits a Stage result", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit } = ticketsPublishedFixture({
+      workspace,
+    });
+
+    await completeWorker(coordinator, workers, 43);
+    await coordinator.confirmDisposition("close");
+
+    await workers.emit("conflict-42-43-r1", {
+      type: "process-exit",
+      workerId: "conflict-42-43-r1",
+      code: 1,
+    });
+
+    expect(remoteGit.state.pushes).toEqual([]);
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript).toContainEqual(
+      expect.objectContaining({
+        type: "compatibility-recovery",
+        reason: expect.stringMatching(/without a Stage result/i),
+      }),
+    );
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+    expect(actions[0]?.description).toMatch(/Compatibility recovery/i);
+  });
+
+  it("enters Compatibility recovery when resolving-merge-conflicts is missing", async () => {
+    const workspace = conflictWorkspace();
+    const { coordinator, workers, remoteGit, skillsCalls } =
+      ticketsPublishedFixture({
+        workspace,
+        skills: {
+          prepareResolveConflictsOutcome: {
+            ok: false,
+            reason:
+              "Installed skill resolving-merge-conflicts is missing. Install it into a Pi skill location and retry Conflict resolution.",
+          },
+        },
+      });
+
+    await completeWorker(coordinator, workers, 43);
+    const result = await coordinator.confirmDisposition("close");
+
+    expect(result).toMatchObject({
+      status: "compatibility-recovery",
+      stage: "integrate",
+      ticketNumber: 43,
+    });
+    if (result.status === "compatibility-recovery") {
+      expect(result.reason).toMatch(/resolving-merge-conflicts/i);
+    }
+    expect(skillsCalls.prepareResolveConflicts).toBe(1);
+    expect(
+      workers.state.launches.filter((l) =>
+        l.workerId.startsWith("conflict-"),
+      ),
+    ).toHaveLength(0);
+    expect(remoteGit.state.pushes).toEqual([]);
   });
 });
