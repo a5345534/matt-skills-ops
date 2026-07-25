@@ -294,7 +294,7 @@ describe("selectPipelineAction", () => {
     expect(chosen).toBeUndefined();
   });
 
-  it("prefers create-spec over implement actions", () => {
+  it("prefers in-flight implement over starting a new Create-spec", () => {
     const chosen = selectPipelineAction([
       {
         id: "implement-ticket:12",
@@ -305,6 +305,38 @@ describe("selectPipelineAction", () => {
         id: "create-spec",
         label: "Create spec",
         description: "S",
+      },
+    ]);
+    expect(chosen?.id).toBe("implement-ticket:12");
+  });
+
+  it("does not auto-pick Create-spec when Start Follow-up is also offered (post-cleanup)", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "create-spec",
+        label: "Create spec",
+        description: "S",
+      },
+      {
+        id: "start-follow-up",
+        label: "Start Follow-up workflow",
+        description: "F",
+      },
+    ]);
+    expect(chosen).toBeUndefined();
+  });
+
+  it("still auto-picks Create-spec when it is the only actionable next step", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "create-spec",
+        label: "Create spec",
+        description: "S",
+      },
+      {
+        id: "ticket-progress",
+        label: "Ticket progress",
+        description: "info",
       },
     ]);
     expect(chosen?.id).toBe("create-spec");

@@ -11,6 +11,7 @@ import {
   MERGE_WORKFLOW_PR_ACTION,
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
+  START_FOLLOW_UP_ACTION,
   TICKET_PROGRESS_ACTION,
 } from "../constants.js";
 
@@ -64,18 +65,35 @@ export function selectPipelineAction(
   if (actionable.length === 0) return undefined;
   if (actionable.length === 1) return actionable[0];
 
+  // Do not auto-start a brand-new workflow when both Create-spec and
+  // Start Follow-up are offered (typical post-cleanup). Require a human choice.
+  const startingNewWorkflow =
+    actionable.some((a) => a.id === CREATE_SPEC_ACTION.id) &&
+    actionable.some((a) => a.id === START_FOLLOW_UP_ACTION.id);
+  const inFlight = startingNewWorkflow
+    ? actionable.filter(
+        (a) =>
+          a.id !== CREATE_SPEC_ACTION.id &&
+          a.id !== START_FOLLOW_UP_ACTION.id,
+      )
+    : actionable;
+  if (inFlight.length === 0) return undefined;
+  if (inFlight.length === 1) return inFlight[0];
+
+  // Prefer continuing an in-flight workflow over opening a new Create-spec.
   return (
-    actionable.find((a) => a.id === CREATE_SPEC_ACTION.id) ??
-    actionable.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
-    actionable.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
-    actionable.find((a) => a.id.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) ??
-    actionable.find((a) => a.id.startsWith(CHECK_CI_ACTION_PREFIX)) ??
-    actionable.find((a) => a.id.startsWith(CI_RECOVERY_ACTION_PREFIX)) ??
-    actionable.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
-    actionable.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
-    actionable.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
-    actionable.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
-    actionable.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX))
+    inFlight.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
+    inFlight.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id.startsWith(CHECK_CI_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id.startsWith(CI_RECOVERY_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
+    inFlight.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
+    inFlight.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
+    inFlight.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX)) ??
+    // Create-spec alone among remaining options (e.g. with implement) still auto.
+    inFlight.find((a) => a.id === CREATE_SPEC_ACTION.id)
   );
 }
 
@@ -604,6 +622,21 @@ export async function runPostGrillPipeline(
         step,
         stage: "stage" in result ? result.stage : undefined,
         detail: "reason" in result ? result.reason : undefined,
+      });
+      return;
+    }
+
+    // Workflow fully delivered — do not auto Create-spec / Follow-up next.
+    if (result.status === "completed" && result.stage === "cleanup") {
+      ui.notify(
+        "Workflow cleanup finished. Pipeline stopped — start Create-spec or Follow-up deliberately if needed.",
+        "info",
+      );
+      log("info", "pipeline:stop", {
+        reason: "workflow-complete",
+        step,
+        stage: "cleanup",
+        workflowId: "workflowId" in result ? result.workflowId : undefined,
       });
       return;
     }

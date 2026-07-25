@@ -46,8 +46,13 @@ import {
 type PlanningSession = {
   sendUserMessage: (text: string) => void;
   waitForIdle: () => Promise<void>;
-  /** Recent assistant texts newest-last, including session branch fallback. */
-  getAssistantTexts: () => string[];
+  /**
+   * Snapshot the assistant-text stream length before sending a planning prompt.
+   * Only texts appended after this baseline belong to the current skill turn.
+   */
+  markAssistantBaseline: () => number;
+  /** Assistant texts produced after markAssistantBaseline() (newest-last). */
+  getAssistantTextsSince: (baseline: number) => string[];
 };
 
 function extractAssistantText(message: {
@@ -97,16 +102,19 @@ function createSkillsHost(
       log?.info("runCreateSpec:start");
       const started = Date.now();
 
+      // Only accept drafts produced after this prompt — never reuse older session text.
+      const baseline = planning.markAssistantBaseline();
       planning.sendUserMessage(buildCreateSpecSkillPrompt());
       await planning.waitForIdle();
 
-      const texts = planning.getAssistantTexts();
+      const texts = planning.getAssistantTextsSince(baseline);
       const marked =
         findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---") ??
         texts[texts.length - 1] ??
         "";
       log?.debug("runCreateSpec:assistant", {
         textCount: texts.length,
+        baseline,
         markedChars: marked.length,
         hasMarker: marked.includes("MATT-AUTO-SPEC-DRAFT"),
         ms: Date.now() - started,
@@ -152,37 +160,56 @@ function createSkillsHost(
       });
       const started = Date.now();
 
-      planning.sendUserMessage(buildCreateTicketsSkillPrompt(input));
-      await planning.waitForIdle();
+      const basePrompt = buildCreateTicketsSkillPrompt(input);
+      const retryPrompt = [
+        basePrompt,
+        "",
+        "## Retry (required)",
+        "Your previous reply was missing the Matt Auto tickets draft markers.",
+        "Output ONLY the ---MATT-AUTO-TICKETS-DRAFT--- JSON block this time — no PRD rewrite.",
+      ].join("\n");
 
-      const texts = planning.getAssistantTexts();
-      const marked =
-        findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---") ??
-        texts[texts.length - 1] ??
-        "";
-      log?.debug("runCreateTickets:assistant", {
-        textCount: texts.length,
-        markedChars: marked.length,
-        hasMarker: marked.includes("MATT-AUTO-TICKETS-DRAFT"),
-        ms: Date.now() - started,
-      });
-      const draft = parseTicketsDraftFromAssistantText(marked);
-      if (!draft) {
+      // One automatic retry when the model talks about PRDs instead of tickets.
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const baseline = planning.markAssistantBaseline();
+        planning.sendUserMessage(attempt === 1 ? basePrompt : retryPrompt);
+        await planning.waitForIdle();
+
+        const texts = planning.getAssistantTextsSince(baseline);
+        const marked =
+          findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---") ??
+          texts[texts.length - 1] ??
+          "";
+        log?.debug("runCreateTickets:assistant", {
+          workflowId: input.workflowId,
+          attempt,
+          textCount: texts.length,
+          baseline,
+          markedChars: marked.length,
+          hasMarker: marked.includes("MATT-AUTO-TICKETS-DRAFT"),
+          ms: Date.now() - started,
+        });
+        const draft = parseTicketsDraftFromAssistantText(marked);
+        if (draft) {
+          log?.info("runCreateTickets:ok", {
+            ticketCount: draft.tickets.length,
+            localIds: draft.tickets.map((t) => t.localId),
+            attempt,
+            ms: Date.now() - started,
+          });
+          return { ok: true, draft };
+        }
         log?.warn("runCreateTickets:parse-failed", {
+          attempt,
           preview: marked.slice(0, 300),
         });
-        return {
-          ok: false,
-          reason:
-            "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block. Retry Create-tickets. Nothing was published to GitHub.",
-        };
       }
-      log?.info("runCreateTickets:ok", {
-        ticketCount: draft.tickets.length,
-        localIds: draft.tickets.map((t) => t.localId),
-        ms: Date.now() - started,
-      });
-      return { ok: true, draft };
+
+      return {
+        ok: false,
+        reason:
+          "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block after 2 attempts. Retry Create-tickets. Nothing was published to GitHub.",
+      };
     },
   };
 }
@@ -339,30 +366,16 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         : undefined;
 
       // Planning skills run in this Workflow home session so grill context remains.
+      // Draft parsing uses only assistant texts after markAssistantBaseline() so
+      // older session PRDs / markers cannot be mistaken for a fresh skill result.
       planningSession = {
         sendUserMessage: (text: string) => {
           pi.sendUserMessage(text);
         },
         waitForIdle: () => ctx.waitForIdle(),
-        getAssistantTexts: () => {
-          // Prefer live event stream; fall back to session branch scan.
-          if (assistantTexts.length > 0) return [...assistantTexts];
-          const fromSession: string[] = [];
-          try {
-            for (const entry of ctx.sessionManager.getBranch()) {
-              if (entry.type !== "message") continue;
-              const message = entry.message as {
-                role?: string;
-                content?: unknown;
-              };
-              const text = extractAssistantText(message);
-              if (text.trim()) fromSession.push(text);
-            }
-          } catch {
-            // Session scan is best-effort.
-          }
-          return fromSession;
-        },
+        markAssistantBaseline: () => assistantTexts.length,
+        getAssistantTextsSince: (baseline: number) =>
+          assistantTexts.slice(Math.max(0, baseline)),
       };
 
       const active = ensureCoordinator(
