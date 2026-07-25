@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type {
   CreateSpecSkillOutcome,
+  CreateTicketsSkillOutcome,
   EnvironmentPort,
   GitTopologyPort,
   ModelsPort,
@@ -11,12 +12,14 @@ import type {
   RootScopedPorts,
   SkillsPort,
   TrackerPort,
+  TrackerTicket,
   WorkflowCoordinatorPorts,
 } from "../src/ports.js";
 import type {
   ActiveWorkflow,
   AvailableModel,
   SpecDraft,
+  TicketsDraft,
   WorkerProfile,
   WorkflowManifest,
 } from "../src/types.js";
@@ -28,6 +31,8 @@ import {
   REQUIRED_MATT_SKILLS,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
+  TICKET_ISSUE_LABEL,
+  TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
   WORKFLOW_MANIFEST_SCHEMA,
 } from "../src/constants.js";
@@ -48,33 +53,75 @@ const defaultSpecDraft: SpecDraft = {
   body: "## Problem Statement\n\nUsers need X.\n",
 };
 
+const defaultTicketsDraft: TicketsDraft = {
+  tickets: [
+    {
+      localId: "1",
+      title: "Ship core path",
+      body: "## What to build\n\nCore end-to-end path.\n",
+      blockedBy: [],
+    },
+    {
+      localId: "2",
+      title: "Ship dependent path",
+      body: "## What to build\n\nDepends on core.\n",
+      blockedBy: ["1"],
+    },
+    {
+      localId: "3",
+      title: "Ship parallel path",
+      body: "## What to build\n\nIndependent of core.\n",
+      blockedBy: [],
+    },
+  ],
+};
+
 type SkillsFixture = {
   names?: readonly string[];
   /** Sequential outcomes for runCreateSpec (last value repeats). */
   createSpecOutcomes?: CreateSpecSkillOutcome[];
+  /** Sequential outcomes for runCreateTickets (last value repeats). */
+  createTicketsOutcomes?: CreateTicketsSkillOutcome[];
   /** Invocations recorded for assertions. */
-  calls?: { runCreateSpec: number };
+  calls?: { runCreateSpec: number; runCreateTickets: number };
 };
 
 function createSkills(fixture: SkillsFixture = {}): SkillsPort {
   const names = fixture.names ?? [...REQUIRED_MATT_SKILLS];
-  const outcomes = fixture.createSpecOutcomes ?? [
+  const specOutcomes = fixture.createSpecOutcomes ?? [
     { ok: true as const, draft: defaultSpecDraft },
   ];
-  let outcomeIndex = 0;
-  const calls = fixture.calls ?? { runCreateSpec: 0 };
+  const ticketsOutcomes = fixture.createTicketsOutcomes ?? [
+    { ok: true as const, draft: defaultTicketsDraft },
+  ];
+  let specIndex = 0;
+  let ticketsIndex = 0;
+  const calls = fixture.calls ?? { runCreateSpec: 0, runCreateTickets: 0 };
 
   return {
     installedSkillNames: async () => names,
     runCreateSpec: async () => {
       calls.runCreateSpec += 1;
-      const index = Math.min(outcomeIndex, outcomes.length - 1);
-      outcomeIndex += 1;
-      const outcome = outcomes[index];
+      const index = Math.min(specIndex, specOutcomes.length - 1);
+      specIndex += 1;
+      const outcome = specOutcomes[index];
       if (!outcome) {
         return {
           ok: false,
           reason: "No Create-spec skill outcome configured.",
+        };
+      }
+      return outcome;
+    },
+    runCreateTickets: async () => {
+      calls.runCreateTickets += 1;
+      const index = Math.min(ticketsIndex, ticketsOutcomes.length - 1);
+      ticketsIndex += 1;
+      const outcome = ticketsOutcomes[index];
+      if (!outcome) {
+        return {
+          ok: false,
+          reason: "No Create-tickets skill outcome configured.",
         };
       }
       return outcome;
@@ -88,10 +135,15 @@ type TrackerState = {
     title: string;
     body: string;
     labels: string[];
+    state: "OPEN" | "CLOSED";
+    blockedBy: number[];
+    parent?: number;
   }>;
   manifests: Map<number, WorkflowManifest>;
   createIssueCalls: number;
   writeManifestCalls: number;
+  addBlockedByCalls: Array<{ issue: number; blocker: number }>;
+  addSubIssueCalls: Array<{ parent: number; child: number }>;
   nextNumber: number;
 };
 
@@ -99,6 +151,14 @@ function createTracker(
   initial: {
     active?: ActiveWorkflow;
     failCreate?: boolean;
+    failWriteManifest?: boolean;
+    /** Extra ticket issues already on GitHub (for frontier tests). */
+    tickets?: Array<{
+      number: number;
+      title: string;
+      state?: "OPEN" | "CLOSED";
+      blockedBy?: number[];
+    }>;
   } = {},
 ): { port: TrackerPort; state: TrackerState } {
   const state: TrackerState = {
@@ -106,25 +166,49 @@ function createTracker(
     manifests: new Map(),
     createIssueCalls: 0,
     writeManifestCalls: 0,
+    addBlockedByCalls: [],
+    addSubIssueCalls: [],
     nextNumber: 100,
   };
 
   if (initial.active) {
-    state.manifests.set(initial.active.workflowId, {
+    const manifest: WorkflowManifest = {
       schema: WORKFLOW_MANIFEST_SCHEMA,
       version: 1,
       workflowId: initial.active.workflowId,
       targetBranch: initial.active.targetBranch,
       stage: initial.active.stage,
       workerProfile: initial.active.workerProfile,
-    });
+    };
+    if (initial.active.tickets) {
+      manifest.tickets = [...initial.active.tickets];
+    }
+    state.manifests.set(initial.active.workflowId, manifest);
     state.issues.push({
       number: initial.active.workflowId,
       title: initial.active.title ?? "Existing workflow",
       body: "spec",
       labels: [SPEC_ISSUE_LABEL],
+      state: "OPEN",
+      blockedBy: [],
     });
     state.nextNumber = initial.active.workflowId + 1;
+  }
+
+  for (const ticket of initial.tickets ?? []) {
+    const issue: TrackerState["issues"][number] = {
+      number: ticket.number,
+      title: ticket.title,
+      body: "ticket",
+      labels: [TICKET_ISSUE_LABEL],
+      state: ticket.state ?? "OPEN",
+      blockedBy: [...(ticket.blockedBy ?? [])],
+    };
+    if (initial.active?.workflowId !== undefined) {
+      issue.parent = initial.active.workflowId;
+    }
+    state.issues.push(issue);
+    state.nextNumber = Math.max(state.nextNumber, ticket.number + 1);
   }
 
   const port: TrackerPort = {
@@ -139,11 +223,16 @@ function createTracker(
         title: input.title,
         body: input.body,
         labels: [...input.labels],
+        state: "OPEN",
+        blockedBy: [],
       });
       return { number };
     },
     writeWorkflowManifest: async (issueNumber, manifest) => {
       state.writeManifestCalls += 1;
+      if (initial.failWriteManifest) {
+        throw new Error("GitHub writeWorkflowManifest failed");
+      }
       state.manifests.set(issueNumber, manifest);
     },
     findActiveWorkflow: async (targetBranch) => {
@@ -156,6 +245,9 @@ function createTracker(
             stage: manifest.stage,
             workerProfile: manifest.workerProfile,
           };
+          if (manifest.tickets) {
+            active.tickets = [...manifest.tickets];
+          }
           if (issue?.title) {
             active.title = issue.title;
           }
@@ -163,6 +255,46 @@ function createTracker(
         }
       }
       return undefined;
+    },
+    listTickets: async (issueNumbers) => {
+      const wanted = new Set(issueNumbers);
+      const tickets: TrackerTicket[] = [];
+      for (const issue of state.issues) {
+        if (!wanted.has(issue.number)) continue;
+        tickets.push({
+          number: issue.number,
+          title: issue.title,
+          state: issue.state,
+          blockedBy: issue.blockedBy.map((n) => {
+            const blocker = state.issues.find((i) => i.number === n);
+            return {
+              number: n,
+              state: blocker?.state ?? "OPEN",
+            };
+          }),
+        });
+      }
+      return tickets;
+    },
+    addBlockedBy: async (issueNumber, blockerIssueNumber) => {
+      state.addBlockedByCalls.push({
+        issue: issueNumber,
+        blocker: blockerIssueNumber,
+      });
+      const issue = state.issues.find((i) => i.number === issueNumber);
+      if (issue && !issue.blockedBy.includes(blockerIssueNumber)) {
+        issue.blockedBy.push(blockerIssueNumber);
+      }
+    },
+    addSubIssue: async (parentIssueNumber, childIssueNumber) => {
+      state.addSubIssueCalls.push({
+        parent: parentIssueNumber,
+        child: childIssueNumber,
+      });
+      const child = state.issues.find((i) => i.number === childIssueNumber);
+      if (child) {
+        child.parent = parentIssueNumber;
+      }
     },
   };
 
@@ -729,7 +861,7 @@ describe("Workflow coordinator Next actions", () => {
 
 describe("Workflow coordinator Create-spec Planning stage", () => {
   it("runs Create-spec in Workflow home via the skills adapter and needs Stage confirmation", async () => {
-    const skillsCalls = { runCreateSpec: 0 };
+    const skillsCalls = { runCreateSpec: 0, runCreateTickets: 0 };
     const tracker = createTracker();
     const coordinator = createWorkflowCoordinator(
       createPorts({
@@ -856,7 +988,7 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
       title: "Ship feature X (revised)",
       body: "## Problem Statement\n\nRevised.\n",
     };
-    const skillsCalls = { runCreateSpec: 0 };
+    const skillsCalls = { runCreateSpec: 0, runCreateTickets: 0 };
     const tracker = createTracker();
     const coordinator = createWorkflowCoordinator(
       createPorts({
@@ -1268,5 +1400,408 @@ describe("Workflow coordinator root selection", () => {
     expect(root.kind).toBe("nearest");
     expect(root.status).toBe("unavailable");
     expect(root.unavailableReason).toBe(NO_GIT_REPOSITORY_REASON);
+  });
+});
+
+describe("Workflow coordinator Create-tickets Planning stage", () => {
+  function publishedSpecTracker(
+    overrides: {
+      workflowId?: number;
+      title?: string;
+    } = {},
+  ) {
+    return createTracker({
+      active: {
+        workflowId: overrides.workflowId ?? 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "spec-published",
+        workerProfile: defaultWorkerProfile,
+        title: overrides.title ?? "Existing spec",
+      },
+    });
+  }
+
+  it("runs Create-tickets in Workflow home via the skills adapter and needs Stage confirmation", async () => {
+    const skillsCalls = { runCreateSpec: 0, runCreateTickets: 0 };
+    const tracker = publishedSpecTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: { calls: skillsCalls },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+
+    expect(result).toEqual({
+      status: "needs-confirmation",
+      stage: "create-tickets",
+      draft: defaultTicketsDraft,
+      confirmationOptions: [...STAGE_CONFIRMATION_OPTIONS],
+    });
+    expect(skillsCalls.runCreateTickets).toBe(1);
+    // Planning stage must not publish silently.
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.addBlockedByCalls).toEqual([]);
+    expect(tracker.state.addSubIssueCalls).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+  });
+
+  it("publishes tickets with blocking relationships and records them on the Workflow manifest", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42, title: "Existing spec" });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+    const published = await coordinator.confirmStage("publish");
+
+    expect(published.status).toBe("completed");
+    if (published.status !== "completed") return;
+
+    expect(published.stage).toBe("create-tickets");
+    expect(published.workflowId).toBe(42);
+    // Topological order: local 1 and 3 first (no blockers), then 2.
+    // Stable relative order preserves draft order among ready tickets: 1 then 3 then 2.
+    expect(published.tickets).toEqual([43, 44, 45]);
+    expect(tracker.state.createIssueCalls).toBe(3);
+    expect(tracker.state.addSubIssueCalls).toEqual([
+      { parent: 42, child: 43 },
+      { parent: 42, child: 44 },
+      { parent: 42, child: 45 },
+    ]);
+    expect(tracker.state.addBlockedByCalls).toEqual([
+      { issue: 45, blocker: 43 },
+    ]);
+
+    const ticketIssues = tracker.state.issues.filter((i) => i.number !== 42);
+    expect(ticketIssues.map((i) => i.title)).toEqual([
+      "Ship core path",
+      "Ship parallel path",
+      "Ship dependent path",
+    ]);
+    expect(ticketIssues.every((i) => i.labels.includes(TICKET_ISSUE_LABEL))).toBe(
+      true,
+    );
+
+    const dependent = ticketIssues.find((i) => i.title === "Ship dependent path");
+    expect(dependent?.body).toMatch(/#42 Existing spec/);
+    expect(dependent?.body).toMatch(/#43 Ship core path/);
+    expect(dependent?.blockedBy).toEqual([43]);
+
+    const parallel = ticketIssues.find((i) => i.title === "Ship parallel path");
+    expect(parallel?.body).toMatch(/None — can start immediately/);
+
+    const manifest = tracker.state.manifests.get(42);
+    expect(manifest).toEqual({
+      schema: WORKFLOW_MANIFEST_SCHEMA,
+      version: 1,
+      workflowId: 42,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      stage: "tickets-published",
+      workerProfile: defaultWorkerProfile,
+      tickets: [43, 44, 45],
+    });
+
+    await expect(coordinator.getActiveWorkflow()).resolves.toMatchObject({
+      workflowId: 42,
+      stage: "tickets-published",
+      tickets: [43, 44, 45],
+    });
+  });
+
+  it("computes the ready frontier from GitHub ticket state after publish", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+    const published = await coordinator.confirmStage("publish");
+
+    expect(published.status).toBe("completed");
+    if (published.status !== "completed") return;
+
+    // Ready: core (#43) and parallel (#44). Dependent (#45) blocked by open #43.
+    expect(published.ticketProgress).toEqual({
+      workflowId: 42,
+      total: 3,
+      open: 3,
+      closed: 0,
+      ready: [
+        { number: 43, title: "Ship core path" },
+        { number: 44, title: "Ship parallel path" },
+      ],
+      blocked: [
+        {
+          number: 45,
+          title: "Ship dependent path",
+          openBlockers: [43],
+        },
+      ],
+    });
+
+    await expect(coordinator.getTicketProgress()).resolves.toEqual(
+      published.ticketProgress,
+    );
+
+    // Closing a blocker expands the frontier.
+    const core = tracker.state.issues.find((i) => i.number === 43);
+    if (core) core.state = "CLOSED";
+
+    const afterClose = await coordinator.getTicketProgress();
+    expect(afterClose?.ready.map((t) => t.number).sort((a, b) => a - b)).toEqual([
+      44, 45,
+    ]);
+    expect(afterClose?.closed).toBe(1);
+    expect(afterClose?.open).toBe(2);
+    expect(afterClose?.blocked).toEqual([]);
+  });
+
+  it("shows ticket-progress summary in Next actions after publish", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+    await coordinator.confirmStage("publish");
+
+    const actions = await coordinator.nextActions();
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.id).toBe(TICKET_PROGRESS_ACTION.id);
+    expect(actions[0]?.label).toMatch(/2 ready \/ 3 open \/ 0 closed/);
+    expect(actions[0]?.description).toMatch(/#43/);
+    expect(actions[0]?.description).toMatch(/#44/);
+
+    const viewed = await coordinator.runNextAction(TICKET_PROGRESS_ACTION.id);
+    expect(viewed.status).toBe("completed");
+    if (viewed.status === "completed") {
+      expect(viewed.ticketProgress?.ready).toHaveLength(2);
+    }
+  });
+
+  it("cancels Stage confirmation with no partial remote publication", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+    const cancelled = await coordinator.confirmStage("cancel");
+
+    expect(cancelled).toEqual({
+      status: "cancelled",
+      stage: "create-tickets",
+    });
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.addBlockedByCalls).toEqual([]);
+    expect(tracker.state.addSubIssueCalls).toEqual([]);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+    await expect(coordinator.getActiveWorkflow()).resolves.toMatchObject({
+      stage: "spec-published",
+    });
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_TICKETS_ACTION.id,
+        label: CREATE_TICKETS_ACTION.label,
+        description: CREATE_TICKETS_ACTION.description,
+      },
+    ]);
+  });
+
+  it("revises by re-invoking to-tickets without remote publication", async () => {
+    const revised: TicketsDraft = {
+      tickets: [
+        {
+          localId: "a",
+          title: "Only ticket",
+          body: "Revised breakdown",
+          blockedBy: [],
+        },
+      ],
+    };
+    const skillsCalls = { runCreateSpec: 0, runCreateTickets: 0 };
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            calls: skillsCalls,
+            createTicketsOutcomes: [
+              { ok: true, draft: defaultTicketsDraft },
+              { ok: true, draft: revised },
+            ],
+          },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+    const result = await coordinator.confirmStage("revise");
+
+    expect(result).toEqual({
+      status: "needs-confirmation",
+      stage: "create-tickets",
+      draft: revised,
+      confirmationOptions: [...STAGE_CONFIRMATION_OPTIONS],
+    });
+    expect(skillsCalls.runCreateTickets).toBe(2);
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("enters Compatibility recovery when to-tickets omits a reviewable breakdown", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            createTicketsOutcomes: [
+              { ok: false, reason: "Skill settled without a Stage result." },
+            ],
+          },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+
+    expect(result).toEqual({
+      status: "compatibility-recovery",
+      stage: "create-tickets",
+      reason: "Skill settled without a Stage result.",
+    });
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("enters Compatibility recovery when the breakdown has unknown blockers", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          skills: {
+            createTicketsOutcomes: [
+              {
+                ok: true,
+                draft: {
+                  tickets: [
+                    {
+                      localId: "1",
+                      title: "Broken",
+                      body: "body",
+                      blockedBy: ["missing"],
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+
+    expect(result.status).toBe("compatibility-recovery");
+    if (result.status === "compatibility-recovery") {
+      expect(result.reason).toMatch(/unknown localId/i);
+    }
+  });
+
+  it("fails closed when Create-tickets is requested without an Active workflow", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/Active workflow/i);
+    }
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("fails closed when Create-tickets is requested after tickets are already published", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "tickets-published",
+        workerProfile: defaultWorkerProfile,
+        tickets: [43, 44],
+      },
+      tickets: [
+        { number: 43, title: "A", blockedBy: [] },
+        { number: 44, title: "B", blockedBy: [43] },
+      ],
+    });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.runNextAction(CREATE_TICKETS_ACTION.id);
+
+    expect(result.status).toBe("failed");
+    if (result.status === "failed") {
+      expect(result.reason).toMatch(/tickets-published|unavailable/i);
+    }
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("does not treat Create-tickets as an Implementation worker action surface", async () => {
+    const tracker = publishedSpecTracker({ workflowId: 42 });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([CREATE_TICKETS_ACTION.id]);
+    expect(actions.some((a) => /worker|implement/i.test(a.id))).toBe(false);
   });
 });

@@ -90,6 +90,19 @@ When Workflow preflight passes and there is no Active workflow, Next actions inc
 4. **Cancel** leaves no remote publication. **Revise** re-invokes `to-spec` without publishing.
 5. After publish, Next actions advance to **Create tickets**.
 
+## Create-tickets Planning stage and frontier discovery
+
+When an Active workflow is in stage `spec-published`, Next actions include **Create tickets**:
+
+1. Matt Auto invokes the installed `to-tickets` skill as a Planning stage in Workflow home (skill definitions are not modified).
+2. The breakdown reaches one **Stage confirmation** menu: Publish / Revise / Cancel.
+3. **Publish** creates GitHub ticket issues (with `ready-for-agent`), links them as sub-issues of the Workflow ID, sets native **blocked-by** relationships, and updates the Workflow manifest (`stage: tickets-published`, `tickets: [...]`).
+4. **Cancel** leaves no remote publication. **Revise** re-invokes `to-tickets` without publishing.
+5. After publish, the coordinator computes the **ready frontier** from GitHub issue state (open tickets with no open blockers).
+6. Next actions and the Matt Auto menu show a **ticket-progress summary** (ready / open / closed + frontier).
+
+Implementation workers that launch frontier tickets land in later tickets.
+
 ## Status
 
-Tickets #2–#5 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, and Create-spec Planning stage with Stage confirmation and Workflow manifest. Create-tickets, workers, integration, CI, and Workflow PR land in later tickets.
+Tickets #2–#6 establish the package shell, coordinator seam, preflight menus, Workflow root selection, Worker profile defaults, Create-spec / Create-tickets Planning stages, Workflow manifest, and frontier discovery. Implementation workers, integration, CI, and Workflow PR land in later tickets.

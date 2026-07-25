@@ -10,6 +10,7 @@ export { createPreferencesPort } from "./preferences.js";
 export {
   createSkillsPort,
   type CreateSpecHost,
+  type SkillsHost,
 } from "./skills.js";
 export {
   createTrackerPort,

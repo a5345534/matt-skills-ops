@@ -7,6 +7,9 @@ import type {
   SpecDraft,
   StageConfirmationDecision,
   StageResult,
+  TicketDraft,
+  TicketProgressSummary,
+  TicketsDraft,
   WorkerProfile,
   WorkflowCoordinator,
   WorkflowRoot,
@@ -70,6 +73,34 @@ const CREATE_SPEC_EDITOR_PREFILL = `
 ## Further Notes
 `.trimStart();
 
+const CREATE_TICKETS_EDITOR_TITLE =
+  "Create-tickets breakdown (to-tickets synthesis; Matt Auto publishes only after Stage confirmation)";
+
+const CREATE_TICKETS_EDITOR_PREFILL = `
+# One ticket per --- separator. First line of each block: localId | Title | blockedBy: a,b (or none)
+
+1 | First ready ticket | blockedBy: none
+## What to build
+
+End-to-end behaviour.
+
+## Acceptance criteria
+
+- [ ] Criterion
+
+---
+2 | Dependent ticket | blockedBy: 1
+## What to build
+
+Depends on the first ticket.
+
+## Acceptance criteria
+
+- [ ] Criterion
+`.trimStart();
+
+const TICKET_PROGRESS_HEADER = "--- Ticket progress ---";
+
 function formatCheckLine(check: PreflightCheck): string {
   const mark = check.ok ? "✓" : "✗";
   const summary = check.guidance.split(".")[0] ?? check.guidance;
@@ -109,12 +140,32 @@ export function formatRootOption(root: WorkflowRoot, selected: boolean): string 
   return `${mark} ${root.path} — ${root.kind}, ${formatRootStatus(root)}${current}`;
 }
 
+/** Compact ticket-progress lines for the Workflow panel / main menu. */
+export function formatTicketProgressLines(
+  progress: TicketProgressSummary,
+): string[] {
+  const ready =
+    progress.ready.length === 0
+      ? "Ready frontier: (none)"
+      : `Ready frontier: ${progress.ready.map((t) => `#${t.number} ${t.title}`).join("; ")}`;
+  const blocked =
+    progress.blocked.length === 0
+      ? "Blocked: (none)"
+      : `Blocked: ${progress.blocked.map((t) => `#${t.number} (by ${t.openBlockers.map((n) => `#${n}`).join(", ")})`).join("; ")}`;
+  return [
+    `Tickets: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed (total ${progress.total})`,
+    ready,
+    blocked,
+  ];
+}
+
 /** Build bare `/matt-auto` menu lines from coordinator state. */
 export function buildMainMenuItems(
   preflight: PreflightResult,
   nextActions: NextAction[],
   currentRoot: WorkflowRoot,
   rootCount: number,
+  ticketProgress?: TicketProgressSummary,
 ): string[] {
   const nextLines =
     nextActions.length > 0
@@ -128,12 +179,19 @@ export function buildMainMenuItems(
     formatResolvedProfileLine(preflight.workerProfile),
     PREFLIGHT_HEADER,
     ...preflight.checks.map(formatCheckLine),
+  ];
+
+  if (ticketProgress) {
+    items.push(TICKET_PROGRESS_HEADER, ...formatTicketProgressLines(ticketProgress));
+  }
+
+  items.push(
     NEXT_ACTIONS_HEADER,
     ...nextLines,
     "---",
     CONFIGURE_WORKER_ITEM,
     REFRESH_ITEM,
-  ];
+  );
 
   if (rootCount > 1) {
     items.push(SWITCH_ROOT_ITEM);
@@ -155,16 +213,29 @@ export async function presentMainMenu(
     const roots = await coordinator.listRoots();
     const preflight = await coordinator.preflight();
     const nextActions = await coordinator.nextActions();
+    const ticketProgress = await coordinator.getTicketProgress();
     const items = buildMainMenuItems(
       preflight,
       nextActions,
       currentRoot,
       roots.length,
+      ticketProgress,
     );
     const selected = await ui.select("Matt Auto", items);
 
     if (selected === undefined) return;
     if (selected === REFRESH_ITEM || selected.startsWith("---")) continue;
+
+    if (
+      selected.startsWith("Tickets:") ||
+      selected.startsWith("Ready frontier:") ||
+      selected.startsWith("Blocked:")
+    ) {
+      if (ticketProgress) {
+        ui.notify(formatTicketProgressLines(ticketProgress).join("\n"), "info");
+      }
+      continue;
+    }
 
     if (selected === SWITCH_ROOT_ITEM) {
       await presentRootSwitcher(coordinator, ui);
@@ -234,7 +305,10 @@ async function resolveStageResult(
   let result = initial;
 
   while (result.status === "needs-confirmation") {
-    const decision = await presentStageConfirmation(ui, result.draft);
+    const decision =
+      result.stage === "create-spec"
+        ? await presentStageConfirmation(ui, result.draft)
+        : await presentTicketsStageConfirmation(ui, result.draft);
     if (!decision) {
       result = await coordinator.confirmStage("cancel");
       break;
@@ -245,7 +319,7 @@ async function resolveStageResult(
   return result;
 }
 
-/** Stage confirmation menu: Publish / Revise / Cancel. */
+/** Stage confirmation menu for Create-spec: Publish / Revise / Cancel. */
 export async function presentStageConfirmation(
   ui: MattAutoUi,
   draft: SpecDraft,
@@ -257,6 +331,32 @@ export async function presentStageConfirmation(
     "info",
   );
 
+  return presentConfirmationChoices(ui);
+}
+
+/** Stage confirmation menu for Create-tickets: Publish / Revise / Cancel. */
+export async function presentTicketsStageConfirmation(
+  ui: MattAutoUi,
+  draft: TicketsDraft,
+): Promise<StageConfirmationDecision | undefined> {
+  const lines = draft.tickets.map((ticket) => {
+    const blockers =
+      ticket.blockedBy.length === 0
+        ? "none"
+        : ticket.blockedBy.join(", ");
+    return `• [${ticket.localId}] ${ticket.title} (blocked by: ${blockers})`;
+  });
+  ui.notify(
+    `Stage confirmation for Create-tickets\n${lines.join("\n")}`,
+    "info",
+  );
+
+  return presentConfirmationChoices(ui);
+}
+
+async function presentConfirmationChoices(
+  ui: MattAutoUi,
+): Promise<StageConfirmationDecision | undefined> {
   const selected = await ui.select("Stage confirmation", [
     PUBLISH_ITEM,
     REVISE_ITEM,
@@ -272,14 +372,32 @@ export async function presentStageConfirmation(
 function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
   switch (result.status) {
     case "completed":
+      if (result.stage === "create-spec") {
+        ui.notify(
+          `Published Create-spec as Workflow ID #${result.workflowId}. Workflow manifest written. Next: Create tickets.`,
+          "info",
+        );
+        return;
+      }
+      if (result.ticketProgress) {
+        ui.notify(
+          [
+            `Published Create-tickets for Workflow ID #${result.workflowId}.`,
+            `Tickets: ${(result.tickets ?? []).map((n) => `#${n}`).join(", ") || "(none)"}.`,
+            ...formatTicketProgressLines(result.ticketProgress),
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
       ui.notify(
-        `Published Create-spec as Workflow ID #${result.workflowId}. Workflow manifest written. Next: Create tickets.`,
+        `Stage ${result.stage} completed for Workflow ID #${result.workflowId}.`,
         "info",
       );
       return;
     case "cancelled":
       ui.notify(
-        "Create-spec cancelled. No remote publication was made.",
+        `${result.stage === "create-tickets" ? "Create-tickets" : "Create-spec"} cancelled. No remote publication was made.`,
         "info",
       );
       return;
@@ -295,7 +413,7 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
     case "needs-confirmation":
       // Should have been resolved by resolveStageResult.
       ui.notify(
-        "Create-spec is waiting for Stage confirmation (Publish / Revise / Cancel).",
+        `${result.stage} is waiting for Stage confirmation (Publish / Revise / Cancel).`,
         "warning",
       );
       return;
@@ -333,6 +451,55 @@ export async function captureCreateSpecDraft(
   return { title, body };
 }
 
+/**
+ * Capture a Create-tickets breakdown in Workflow home without publishing.
+ * Used by the Matt skills adapter host; skill definitions stay unmodified.
+ */
+export async function captureCreateTicketsDraft(
+  ui: MattAutoUi,
+  input: { workflowId: number; title?: string },
+): Promise<TicketsDraft | undefined> {
+  const header = input.title
+    ? `Workflow #${input.workflowId}: ${input.title}`
+    : `Workflow #${input.workflowId}`;
+
+  if (ui.editor) {
+    const text = await ui.editor(
+      `${CREATE_TICKETS_EDITOR_TITLE}\n${header}`,
+      CREATE_TICKETS_EDITOR_PREFILL,
+    );
+    if (text === undefined) return undefined;
+    return parseTicketsDraftFromEditor(text);
+  }
+
+  if (!ui.input) {
+    ui.notify(
+      "Create-tickets needs an editor or input UI to capture the to-tickets breakdown without publishing.",
+      "warning",
+    );
+    return undefined;
+  }
+
+  // Minimal single-ticket fallback when only input() is available.
+  const title = await ui.input(
+    `Ticket title for ${header}`,
+    "Title from to-tickets synthesis",
+  );
+  if (title === undefined) return undefined;
+  const body = await ui.input("Ticket body", "What to build / acceptance criteria");
+  if (body === undefined) return undefined;
+  return {
+    tickets: [
+      {
+        localId: "1",
+        title,
+        body,
+        blockedBy: [],
+      },
+    ],
+  };
+}
+
 function parseDraftFromEditor(text: string): SpecDraft | undefined {
   const trimmed = text.trim();
   if (!trimmed) return undefined;
@@ -341,6 +508,55 @@ function parseDraftFromEditor(text: string): SpecDraft | undefined {
   const body = lines.slice(1).join("\n").replace(/^\n+/, "");
   if (!title || !body.trim()) return undefined;
   return { title, body };
+}
+
+/**
+ * Parse a multi-ticket editor capture.
+ * Blocks are separated by a line containing only `---`.
+ * Header line: `localId | Title | blockedBy: a,b` or `blockedBy: none`.
+ */
+export function parseTicketsDraftFromEditor(
+  text: string,
+): TicketsDraft | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+
+  // Drop a leading instruction comment line starting with `# One ticket`.
+  const withoutHelp = trimmed.replace(
+    /^#\s*One ticket[\s\S]*?\n(?=\d)/,
+    "",
+  );
+
+  const blocks = withoutHelp
+    .split(/^---\s*$/m)
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0);
+
+  const tickets: TicketDraft[] = [];
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/);
+    const header = (lines[0] ?? "").trim();
+    const body = lines.slice(1).join("\n").trim();
+    const match =
+      /^([^|]+)\|([^|]+)\|\s*blockedBy:\s*(.+)$/i.exec(header) ??
+      /^([^|]+)\|([^|]+)$/.exec(header);
+    if (!match) continue;
+    const localId = match[1]?.trim() ?? "";
+    const title = match[2]?.trim() ?? "";
+    const blockedRaw = (match[3] ?? "none").trim();
+    const blockedBy =
+      !blockedRaw || /^none$/i.test(blockedRaw)
+        ? []
+        : blockedRaw
+            .split(/[,\s]+/)
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+    if (!localId || !title || !body) continue;
+    tickets.push({ localId, title, body, blockedBy });
+  }
+
+  if (tickets.length === 0) return undefined;
+  return { tickets };
 }
 
 /** Interactive Root selection among discovered Workflow roots. */

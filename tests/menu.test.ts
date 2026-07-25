@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   buildMainMenuItems,
+  formatTicketProgressLines,
+  parseTicketsDraftFromEditor,
   selectAvailableModel,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 import type {
   AvailableModel,
   PreflightResult,
+  TicketProgressSummary,
   WorkflowRoot,
 } from "../src/types.js";
 
@@ -51,6 +54,81 @@ describe("buildMainMenuItems", () => {
       "Effective: anthropic/claude-sonnet-4 (thinking medium) [global]",
     );
     expect(items).toContain("Configure Worker profile…");
+  });
+
+  it("surfaces ticket-progress summary lines when frontier data is present", () => {
+    const progress: TicketProgressSummary = {
+      workflowId: 42,
+      total: 3,
+      open: 2,
+      closed: 1,
+      ready: [{ number: 10, title: "Ready A" }],
+      blocked: [{ number: 11, title: "Blocked B", openBlockers: [10] }],
+    };
+    const items = buildMainMenuItems(
+      preflightWithProfile,
+      [],
+      availableRoot,
+      1,
+      progress,
+    );
+
+    expect(items).toContain("--- Ticket progress ---");
+    expect(items).toContain(
+      "Tickets: 1 ready / 2 open / 1 closed (total 3)",
+    );
+    expect(items.some((line) => line.includes("#10 Ready A"))).toBe(true);
+  });
+});
+
+describe("parseTicketsDraftFromEditor", () => {
+  it("parses a multi-ticket breakdown with blockedBy edges", () => {
+    const draft = parseTicketsDraftFromEditor(`
+1 | First ready ticket | blockedBy: none
+## What to build
+
+Core path.
+
+---
+2 | Dependent ticket | blockedBy: 1
+## What to build
+
+Depends on core.
+`);
+
+    expect(draft).toEqual({
+      tickets: [
+        {
+          localId: "1",
+          title: "First ready ticket",
+          body: "## What to build\n\nCore path.",
+          blockedBy: [],
+        },
+        {
+          localId: "2",
+          title: "Dependent ticket",
+          body: "## What to build\n\nDepends on core.",
+          blockedBy: ["1"],
+        },
+      ],
+    });
+  });
+});
+
+describe("formatTicketProgressLines", () => {
+  it("formats ready frontier and blocked tickets", () => {
+    const lines = formatTicketProgressLines({
+      workflowId: 1,
+      total: 2,
+      open: 2,
+      closed: 0,
+      ready: [{ number: 3, title: "A" }],
+      blocked: [{ number: 4, title: "B", openBlockers: [3] }],
+    });
+
+    expect(lines[0]).toMatch(/1 ready \/ 2 open \/ 0 closed/);
+    expect(lines[1]).toMatch(/#3 A/);
+    expect(lines[2]).toMatch(/#4 \(by #3\)/);
   });
 });
 

@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import {
   WORKFLOW_MANIFEST_MARKER,
   WORKFLOW_MANIFEST_SCHEMA,
 } from "../constants.js";
-import type { TrackerPort } from "../ports.js";
+import type { TrackerPort, TrackerTicket } from "../ports.js";
 import type {
   ActiveWorkflow,
   WorkerProfile,
@@ -55,7 +58,14 @@ function isWorkerProfile(value: unknown): value is WorkerProfile {
 }
 
 function isWorkflowStage(value: unknown): value is WorkflowStage {
-  return value === "spec-published";
+  return value === "spec-published" || value === "tickets-published";
+}
+
+function isTicketNumberList(value: unknown): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.every((n) => typeof n === "number" && Number.isInteger(n) && n > 0)
+  );
 }
 
 /** Serialize a Workflow manifest into the managed GitHub comment body. */
@@ -89,7 +99,7 @@ export function parseWorkflowManifestComment(
     ) {
       return undefined;
     }
-    return {
+    const manifest: WorkflowManifest = {
       schema: WORKFLOW_MANIFEST_SCHEMA,
       version: 1,
       workflowId: parsed.workflowId,
@@ -97,6 +107,55 @@ export function parseWorkflowManifestComment(
       stage: parsed.stage,
       workerProfile: parsed.workerProfile,
     };
+    if (isTicketNumberList(parsed.tickets)) {
+      manifest.tickets = parsed.tickets;
+    }
+    return manifest;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveRepoFullName(
+  cwd: string,
+): Promise<{ owner: string; name: string } | undefined> {
+  const result = await run(cwd, "gh", [
+    "repo",
+    "view",
+    "--json",
+    "nameWithOwner",
+  ]);
+  if (result.code !== 0) return undefined;
+  try {
+    const parsed = JSON.parse(result.stdout) as { nameWithOwner?: string };
+    const full = parsed.nameWithOwner;
+    if (!full || !full.includes("/")) return undefined;
+    const [owner, name] = full.split("/");
+    if (!owner || !name) return undefined;
+    return { owner, name };
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveIssueNodeId(
+  cwd: string,
+  owner: string,
+  name: string,
+  issueNumber: number,
+): Promise<string | undefined> {
+  const result = await run(cwd, "gh", [
+    "api",
+    "graphql",
+    "-f",
+    `query=query { repository(owner:"${owner}", name:"${name}") { issue(number:${issueNumber}) { id } } }`,
+  ]);
+  if (result.code !== 0) return undefined;
+  try {
+    const parsed = JSON.parse(result.stdout) as {
+      data?: { repository?: { issue?: { id?: string } } };
+    };
+    return parsed.data?.repository?.issue?.id;
   } catch {
     return undefined;
   }
@@ -104,9 +163,38 @@ export function parseWorkflowManifestComment(
 
 /**
  * Real TrackerPort backed by `gh` in a Workflow root.
- * Creates issues and managed Workflow manifest comments; never invents repos.
+ * Creates issues, native blocked-by edges, sub-issues, and managed manifests.
  */
 export function createTrackerPort(cwd: string): TrackerPort {
+  async function findManagedManifestComment(
+    issueNumber: number,
+  ): Promise<{ id: string } | undefined> {
+    const viewed = await run(cwd, "gh", [
+      "api",
+      `repos/{owner}/{repo}/issues/${issueNumber}/comments`,
+      "--paginate",
+    ]);
+    if (viewed.code !== 0) return undefined;
+
+    try {
+      const comments = JSON.parse(viewed.stdout) as Array<{
+        id?: number;
+        body?: string;
+      }>;
+      // Prefer the latest managed manifest comment if several exist.
+      for (let i = comments.length - 1; i >= 0; i -= 1) {
+        const comment = comments[i];
+        if (!comment?.body || typeof comment.id !== "number") continue;
+        if (parseWorkflowManifestComment(comment.body)) {
+          return { id: String(comment.id) };
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
   return {
     async createIssue(input) {
       const args = [
@@ -145,18 +233,49 @@ export function createTrackerPort(cwd: string): TrackerPort {
 
     async writeWorkflowManifest(issueNumber, manifest) {
       const body = formatWorkflowManifestComment(manifest);
-      const created = await run(cwd, "gh", [
-        "issue",
-        "comment",
-        String(issueNumber),
-        "--body",
-        body,
-      ]);
-      if (created.code !== 0) {
-        throw new Error(
-          created.stderr.trim() ||
-            `gh issue comment failed with exit code ${created.code}`,
-        );
+      const existing = await findManagedManifestComment(issueNumber);
+
+      // Write via a temp body file so multiline JSON is preserved.
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "matt-auto-manifest-"));
+      const bodyFile = path.join(tmpDir, "body.md");
+      const jsonFile = path.join(tmpDir, "payload.json");
+      try {
+        await writeFile(bodyFile, body, "utf8");
+
+        if (existing) {
+          await writeFile(jsonFile, JSON.stringify({ body }), "utf8");
+          const updated = await run(cwd, "gh", [
+            "api",
+            "-X",
+            "PATCH",
+            `repos/{owner}/{repo}/issues/comments/${existing.id}`,
+            "--input",
+            jsonFile,
+          ]);
+          if (updated.code !== 0) {
+            throw new Error(
+              updated.stderr.trim() ||
+                `gh issue comment update failed with exit code ${updated.code}`,
+            );
+          }
+          return;
+        }
+
+        const created = await run(cwd, "gh", [
+          "issue",
+          "comment",
+          String(issueNumber),
+          "--body-file",
+          bodyFile,
+        ]);
+        if (created.code !== 0) {
+          throw new Error(
+            created.stderr.trim() ||
+              `gh issue comment failed with exit code ${created.code}`,
+          );
+        }
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
       }
     },
 
@@ -206,27 +325,169 @@ export function createTrackerPort(cwd: string): TrackerPort {
           continue;
         }
 
+        // Prefer the last managed manifest comment on the issue.
+        let found: WorkflowManifest | undefined;
         for (const comment of detail.comments ?? []) {
           const manifest = parseWorkflowManifestComment(comment.body ?? "");
-          if (!manifest) continue;
-          if (manifest.targetBranch !== targetBranch) continue;
-          if (manifest.workflowId !== issue.number) continue;
-
-          const active: ActiveWorkflow = {
-            workflowId: manifest.workflowId,
-            targetBranch: manifest.targetBranch,
-            stage: manifest.stage,
-            workerProfile: manifest.workerProfile,
-          };
-          const title = detail.title ?? issue.title;
-          if (title) {
-            active.title = title;
-          }
-          return active;
+          if (manifest) found = manifest;
         }
+        if (!found) continue;
+        if (found.targetBranch !== targetBranch) continue;
+        if (found.workflowId !== issue.number) continue;
+
+        const active: ActiveWorkflow = {
+          workflowId: found.workflowId,
+          targetBranch: found.targetBranch,
+          stage: found.stage,
+          workerProfile: found.workerProfile,
+        };
+        if (found.tickets) {
+          active.tickets = [...found.tickets];
+        }
+        const title = detail.title ?? issue.title;
+        if (title) {
+          active.title = title;
+        }
+        return active;
       }
 
       return undefined;
+    },
+
+    async listTickets(issueNumbers) {
+      if (issueNumbers.length === 0) return [];
+
+      const repo = await resolveRepoFullName(cwd);
+      if (!repo) return [];
+
+      const tickets: TrackerTicket[] = [];
+      for (const number of issueNumbers) {
+        const result = await run(cwd, "gh", [
+          "api",
+          "graphql",
+          "-f",
+          `query=query {
+            repository(owner: "${repo.owner}", name: "${repo.name}") {
+              issue(number: ${number}) {
+                number
+                title
+                state
+                blockedBy(first: 50) {
+                  nodes { number state }
+                }
+              }
+            }
+          }`,
+        ]);
+        if (result.code !== 0) continue;
+        try {
+          const parsed = JSON.parse(result.stdout) as {
+            data?: {
+              repository?: {
+                issue?: {
+                  number: number;
+                  title: string;
+                  state: string;
+                  blockedBy?: {
+                    nodes?: Array<{ number: number; state: string }>;
+                  };
+                } | null;
+              };
+            };
+          };
+          const issue = parsed.data?.repository?.issue;
+          if (!issue) continue;
+          const state = issue.state === "CLOSED" ? "CLOSED" : "OPEN";
+          tickets.push({
+            number: issue.number,
+            title: issue.title,
+            state,
+            blockedBy: (issue.blockedBy?.nodes ?? []).map((node) => ({
+              number: node.number,
+              state: node.state === "CLOSED" ? "CLOSED" : "OPEN",
+            })),
+          });
+        } catch {
+          // skip malformed
+        }
+      }
+      return tickets;
+    },
+
+    async addBlockedBy(issueNumber, blockerIssueNumber) {
+      const repo = await resolveRepoFullName(cwd);
+      if (!repo) {
+        throw new Error("Could not resolve repository for addBlockedBy.");
+      }
+      const [issueId, blockerId] = await Promise.all([
+        resolveIssueNodeId(cwd, repo.owner, repo.name, issueNumber),
+        resolveIssueNodeId(cwd, repo.owner, repo.name, blockerIssueNumber),
+      ]);
+      if (!issueId || !blockerId) {
+        throw new Error(
+          `Could not resolve GraphQL ids for #${issueNumber} blocked by #${blockerIssueNumber}.`,
+        );
+      }
+
+      const result = await run(cwd, "gh", [
+        "api",
+        "graphql",
+        "-f",
+        `query=mutation {
+          addBlockedBy(input: { issueId: "${issueId}", blockingIssueId: "${blockerId}" }) {
+            issue { number }
+          }
+        }`,
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `addBlockedBy failed for #${issueNumber} blocked by #${blockerIssueNumber}`,
+        );
+      }
+      if (result.stdout.includes('"errors"')) {
+        throw new Error(
+          `addBlockedBy GraphQL error for #${issueNumber} blocked by #${blockerIssueNumber}: ${result.stdout}`,
+        );
+      }
+    },
+
+    async addSubIssue(parentIssueNumber, childIssueNumber) {
+      const repo = await resolveRepoFullName(cwd);
+      if (!repo) {
+        throw new Error("Could not resolve repository for addSubIssue.");
+      }
+      const [parentId, childId] = await Promise.all([
+        resolveIssueNodeId(cwd, repo.owner, repo.name, parentIssueNumber),
+        resolveIssueNodeId(cwd, repo.owner, repo.name, childIssueNumber),
+      ]);
+      if (!parentId || !childId) {
+        throw new Error(
+          `Could not resolve GraphQL ids for parent #${parentIssueNumber} / child #${childIssueNumber}.`,
+        );
+      }
+
+      const result = await run(cwd, "gh", [
+        "api",
+        "graphql",
+        "-f",
+        `query=mutation {
+          addSubIssue(input: { issueId: "${parentId}", subIssueId: "${childId}", replaceParent: true }) {
+            issue { number }
+          }
+        }`,
+      ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `addSubIssue failed for parent #${parentIssueNumber} / child #${childIssueNumber}`,
+        );
+      }
+      if (result.stdout.includes('"errors"')) {
+        throw new Error(
+          `addSubIssue GraphQL error for parent #${parentIssueNumber} / child #${childIssueNumber}: ${result.stdout}`,
+        );
+      }
     },
   };
 }

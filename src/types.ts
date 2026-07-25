@@ -47,10 +47,30 @@ export type SpecDraft = {
 };
 
 /**
+ * One ticket in a Create-tickets breakdown.
+ * `localId` and `blockedBy` are draft-local identifiers; GitHub numbers are
+ * assigned only on Stage confirmation Publish.
+ */
+export type TicketDraft = {
+  /** Draft-local id used only within the breakdown for blockedBy references. */
+  localId: string;
+  title: string;
+  /** Ticket body (what to build / acceptance criteria). Parent and Blocked by are applied on publish. */
+  body: string;
+  /** localIds of tickets that must complete before this one can start. */
+  blockedBy: readonly string[];
+};
+
+/** Reviewable Create-tickets draft produced by the Matt skills adapter. */
+export type TicketsDraft = {
+  tickets: readonly TicketDraft[];
+};
+
+/**
  * Durable orchestration stage recorded on the Workflow manifest.
  * Extended by later tickets as the workflow advances.
  */
-export type WorkflowStage = "spec-published";
+export type WorkflowStage = "spec-published" | "tickets-published";
 
 /**
  * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
@@ -63,6 +83,8 @@ export type WorkflowManifest = {
   targetBranch: string;
   stage: WorkflowStage;
   workerProfile: WorkerProfile;
+  /** Published ticket issue numbers for this Workflow ID (after Create-tickets). */
+  tickets?: readonly number[];
 };
 
 /**
@@ -75,6 +97,33 @@ export type ActiveWorkflow = {
   stage: WorkflowStage;
   workerProfile: WorkerProfile;
   title?: string;
+  /** Published ticket issue numbers when Create-tickets has completed. */
+  tickets?: readonly number[];
+};
+
+/** A ticket that is open and has no open blockers — ready for Implementation. */
+export type ReadyTicket = {
+  number: number;
+  title: string;
+};
+
+/**
+ * Ticket progress and ready frontier computed from GitHub issue state.
+ * Used by Next actions and the Workflow panel after Create-tickets publish.
+ */
+export type TicketProgressSummary = {
+  workflowId: number;
+  total: number;
+  open: number;
+  closed: number;
+  /** Ready frontier: open tickets with no open blockers, recommendation-ordered. */
+  ready: readonly ReadyTicket[];
+  /** Open tickets still gated by open blockers. */
+  blocked: readonly {
+    number: number;
+    title: string;
+    openBlockers: readonly number[];
+  }[];
 };
 
 /**
@@ -84,14 +133,24 @@ export type ActiveWorkflow = {
 export type StageResult =
   | {
       status: "needs-confirmation";
-      stage: StageId;
+      stage: "create-spec";
       draft: SpecDraft;
+      confirmationOptions: readonly StageConfirmationDecision[];
+    }
+  | {
+      status: "needs-confirmation";
+      stage: "create-tickets";
+      draft: TicketsDraft;
       confirmationOptions: readonly StageConfirmationDecision[];
     }
   | {
       status: "completed";
       stage: StageId;
       workflowId: number;
+      /** Ticket issue numbers after Create-tickets publish. */
+      tickets?: readonly number[];
+      /** Ticket progress snapshot after Create-tickets publish. */
+      ticketProgress?: TicketProgressSummary;
     }
   | {
       status: "cancelled";
@@ -196,6 +255,11 @@ export type WorkflowCoordinator = {
    * Recovered from GitHub (Workflow ID + Workflow manifest).
    */
   getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
+  /**
+   * Ticket progress and ready frontier for the Active workflow.
+   * `undefined` when there is no Active workflow or tickets are not published yet.
+   */
+  getTicketProgress(): Promise<TicketProgressSummary | undefined>;
   /**
    * Currently selected Workflow root (defaults to nearest enclosing Git root).
    */

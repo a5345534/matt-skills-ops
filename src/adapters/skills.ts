@@ -1,13 +1,26 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { CreateSpecSkillOutcome, SkillsPort } from "../ports.js";
+import type {
+  CreateSpecSkillOutcome,
+  CreateTicketsSkillOutcome,
+  SkillsPort,
+} from "../ports.js";
 
 /**
- * Optional host that performs the actual Create-spec skill invocation.
+ * Optional host that performs Create-spec / Create-tickets skill invocation.
  * The adapter discovers installed skills and delegates invocation without
- * modifying skill definitions. When omitted, runCreateSpec fails closed.
+ * modifying skill definitions. When omitted, run methods fail closed.
  */
+export type SkillsHost = {
+  runCreateSpec?(): Promise<CreateSpecSkillOutcome>;
+  runCreateTickets?(input: {
+    workflowId: number;
+    title?: string;
+  }): Promise<CreateTicketsSkillOutcome>;
+};
+
+/** @deprecated Prefer SkillsHost; kept for existing Create-spec wiring. */
 export type CreateSpecHost = {
   runCreateSpec(): Promise<CreateSpecSkillOutcome>;
 };
@@ -65,12 +78,12 @@ function skillSearchRoots(cwd: string): string[] {
 }
 
 /**
- * Discover installed skill names and invoke Create-spec via an optional host.
+ * Discover installed skill names and invoke Planning skills via an optional host.
  * Does not parse skill bodies for orchestration logic and never modifies SKILL.md.
  */
 export function createSkillsPort(
   cwd: string,
-  host?: CreateSpecHost,
+  host?: SkillsHost | CreateSpecHost,
 ): SkillsPort {
   async function installedSkillNames(): Promise<readonly string[]> {
     const names = new Set<string>();
@@ -93,7 +106,7 @@ export function createSkillsPort(
         };
       }
 
-      if (!host) {
+      if (!host || !("runCreateSpec" in host) || !host.runCreateSpec) {
         return {
           ok: false,
           reason:
@@ -103,6 +116,29 @@ export function createSkillsPort(
 
       // Host invokes the installed skill capability; definitions stay untouched.
       return host.runCreateSpec();
+    },
+
+    async runCreateTickets(input) {
+      const names = await installedSkillNames();
+      if (!names.includes("to-tickets")) {
+        return {
+          ok: false,
+          reason:
+            "Installed skill to-tickets is missing. Install it into a Pi skill location and retry Create-tickets.",
+        };
+      }
+
+      const ticketsHost = host as SkillsHost | undefined;
+      if (!ticketsHost?.runCreateTickets) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets Planning host is not wired. Matt Auto cannot invoke to-tickets without a Workflow-home host.",
+        };
+      }
+
+      // Host invokes the installed skill capability; definitions stay untouched.
+      return ticketsHost.runCreateTickets(input);
     },
   };
 }

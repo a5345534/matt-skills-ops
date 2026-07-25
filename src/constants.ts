@@ -56,3 +56,14 @@ export const WORKFLOW_MANIFEST_SCHEMA = "matt-auto/workflow-manifest" as const;
 
 /** Triage label applied to published specs. */
 export const SPEC_ISSUE_LABEL = "ready-for-agent";
+
+/** Triage label applied to published tickets (agent-grabbable by construction). */
+export const TICKET_ISSUE_LABEL = "ready-for-agent";
+
+/** Next action: ticket-progress summary after Create-tickets publish. */
+export const TICKET_PROGRESS_ACTION = {
+  id: "ticket-progress",
+  label: "Ticket progress",
+  description:
+    "Show ready frontier and ticket progress for the Active workflow.",
+} as const;

@@ -4,10 +4,10 @@
  * Product rules live in the Workflow coordinator. This file only wires Pi
  * commands/menus to coordinator ports.
  *
- * Create-spec runs as a Planning stage in Workflow home: the Matt skills
- * adapter invokes installed `to-spec` via a host without modifying skill
- * definitions, then Stage confirmation (Publish / Revise / Cancel) gates
- * remote publication through the coordinator.
+ * Planning stages (Create-spec, Create-tickets) run in Workflow home: the Matt
+ * skills adapter invokes installed skills via a host without modifying skill
+ * definitions, then Stage confirmation (Publish / Revise / Cancel) gates remote
+ * publication through the coordinator.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,17 +18,18 @@ import {
   createPreferencesPort,
   createSkillsPort,
   createTrackerPort,
-  type CreateSpecHost,
+  type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import {
   captureCreateSpecDraft,
+  captureCreateTicketsDraft,
   presentMainMenu,
   presentNextActions,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-function createCreateSpecHost(ui: MattAutoUi): CreateSpecHost {
+function createSkillsHost(ui: MattAutoUi): SkillsHost {
   return {
     async runCreateSpec() {
       // Orchestration wrapper around installed to-spec:
@@ -43,6 +44,20 @@ function createCreateSpecHost(ui: MattAutoUi): CreateSpecHost {
       }
       return { ok: true, draft };
     },
+
+    async runCreateTickets(input) {
+      // Orchestration wrapper around installed to-tickets:
+      // capture a reviewable breakdown only — never publish (coordinator owns that).
+      const draft = await captureCreateTicketsDraft(ui, input);
+      if (!draft) {
+        return {
+          ok: false,
+          reason:
+            "Create-tickets breakdown was not produced. Follow the installed to-tickets skill to synthesize a vertical-slice breakdown with blockedBy edges, then retry. Matt Auto does not publish until Stage confirmation Publish.",
+        };
+      }
+      return { ok: true, draft };
+    },
   };
 }
 
@@ -51,7 +66,7 @@ function createCoordinatorFor(
   modelRegistry: Parameters<typeof createModelsPort>[0],
   ui: MattAutoUi,
 ) {
-  const createSpecHost = createCreateSpecHost(ui);
+  const skillsHost = createSkillsHost(ui);
   return createWorkflowCoordinator({
     startPath: cwd,
     topology: createGitTopologyPort(),
@@ -59,7 +74,7 @@ function createCoordinatorFor(
     forRoot(rootPath) {
       return {
         environment: createEnvironmentPort(rootPath),
-        skills: createSkillsPort(rootPath, createSpecHost),
+        skills: createSkillsPort(rootPath, skillsHost),
         preferences: createPreferencesPort(rootPath),
         tracker: createTrackerPort(rootPath),
       };

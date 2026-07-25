@@ -2,6 +2,7 @@ import type {
   ActiveWorkflow,
   AvailableModel,
   SpecDraft,
+  TicketsDraft,
   WorkerProfile,
   WorkflowManifest,
 } from "./types.js";
@@ -28,6 +29,14 @@ export type CreateSpecSkillOutcome =
   | { ok: false; reason: string };
 
 /**
+ * Outcome of invoking the installed `to-tickets` skill as a Planning capability.
+ * The adapter never publishes; it only returns a reviewable breakdown or a failure reason.
+ */
+export type CreateTicketsSkillOutcome =
+  | { ok: true; draft: TicketsDraft }
+  | { ok: false; reason: string };
+
+/**
  * Matt skills adapter port.
  * System boundary: skill filesystem / Pi skill catalog / runtime invocation.
  * Discovers and invokes installed skills without modifying their definitions.
@@ -41,6 +50,26 @@ export type SkillsPort = {
    * Does not modify, bundle, or pin skill definitions.
    */
   runCreateSpec(): Promise<CreateSpecSkillOutcome>;
+  /**
+   * Invoke installed `to-tickets` as a Create-tickets Planning-stage capability.
+   * Must not publish to the issue tracker — the Workflow coordinator owns remote writes.
+   * Does not modify, bundle, or pin skill definitions.
+   */
+  runCreateTickets(input: {
+    workflowId: number;
+    title?: string;
+  }): Promise<CreateTicketsSkillOutcome>;
+};
+
+/**
+ * One workflow ticket recovered from GitHub for frontier computation.
+ * System boundary fact: issue number, title, state, and native blocked-by edges.
+ */
+export type TrackerTicket = {
+  number: number;
+  title: string;
+  state: "OPEN" | "CLOSED";
+  blockedBy: readonly { number: number; state: "OPEN" | "CLOSED" }[];
 };
 
 /**
@@ -71,6 +100,26 @@ export type TrackerPort = {
   findActiveWorkflow(
     targetBranch: string,
   ): Promise<ActiveWorkflow | undefined>;
+  /**
+   * Load ticket issues by number for frontier / progress computation.
+   * Missing issues are omitted from the result.
+   */
+  listTickets(issueNumbers: readonly number[]): Promise<readonly TrackerTicket[]>;
+  /**
+   * Add a native GitHub blocked-by relationship:
+   * `issueNumber` is blocked by `blockerIssueNumber`.
+   */
+  addBlockedBy(
+    issueNumber: number,
+    blockerIssueNumber: number,
+  ): Promise<void>;
+  /**
+   * Link a child ticket as a GitHub sub-issue of the Workflow ID parent.
+   */
+  addSubIssue(
+    parentIssueNumber: number,
+    childIssueNumber: number,
+  ): Promise<void>;
 };
 
 /**
