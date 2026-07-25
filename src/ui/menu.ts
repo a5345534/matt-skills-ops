@@ -43,6 +43,8 @@ const WORKER_HEADER = "--- Worker profile ---";
 const REFRESH_ITEM = "Refresh preflight";
 const SWITCH_ROOT_ITEM = "Switch Workflow root…";
 const CONFIGURE_WORKER_ITEM = "Configure Worker profile…";
+const RUN_PIPELINE_ITEM =
+  "▶ Run post-grill pipeline (to-spec → tickets → implement…)";
 const NONE_AVAILABLE = "(none available)";
 
 const SET_GLOBAL_WORKER = "Set global default Worker profile";
@@ -194,6 +196,10 @@ export function buildMainMenuItems(
     ...preflight.checks.map(formatCheckLine),
   ];
 
+  if (preflight.ok && nextActions.length > 0) {
+    items.push(RUN_PIPELINE_ITEM);
+  }
+
   if (panel && panel.workers.length > 0) {
     items.push(PANEL_HEADER, ...formatPanelLines(panel));
   }
@@ -271,6 +277,11 @@ export async function presentMainMenu(
       continue;
     }
 
+    if (selected === RUN_PIPELINE_ITEM) {
+      await runPostGrillPipeline(coordinator, ui);
+      continue;
+    }
+
     if (selected.startsWith("Current:")) {
       await notifyCurrentRoot(currentRoot, ui);
       continue;
@@ -315,10 +326,86 @@ export async function handleNextAction(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
   action: NextAction,
-): Promise<void> {
+): Promise<StageResult> {
   let result = await coordinator.runNextAction(action.id);
   result = await resolveStageResult(coordinator, ui, result);
   notifyStageResult(ui, result);
+  return result;
+}
+
+/**
+ * Post-grill entry: drive Create-spec → Create-tickets → implement/integrate
+ * Next actions while the user keeps confirming stages.
+ * Stops when the user cancels, preflight fails, or no further Next actions exist.
+ */
+export async function runPostGrillPipeline(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  ui.notify(
+    "Matt Auto post-grill pipeline: real /skill:to-spec and /skill:to-tickets run in this Workflow home session. Stage confirmation still gates GitHub publish.",
+    "info",
+  );
+
+  for (let step = 0; step < 50; step += 1) {
+    const preflight = await coordinator.preflight();
+    if (!preflight.ok) {
+      ui.notify(summarizePreflightFailures(preflight), "warning");
+      return;
+    }
+
+    const nextActions = await coordinator.nextActions();
+    if (nextActions.length === 0) {
+      const panel = await coordinator.getPanelState();
+      if (panel && panel.workers.length > 0) {
+        ui.notify(
+          [
+            "Pipeline waiting on session-owned workers.",
+            ...formatPanelLines(panel),
+            "Re-run /matt-auto run or /matt-auto next when workers settle.",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+      ui.notify("Pipeline idle — no Next actions available.", "info");
+      return;
+    }
+
+    // Prefer planning stages, then a single unambiguous action; otherwise ask.
+    const preferred =
+      nextActions.find((a) => a.id === "create-spec") ??
+      nextActions.find((a) => a.id === "create-tickets") ??
+      (nextActions.length === 1 ? nextActions[0] : undefined);
+
+    let action = preferred;
+    if (!action) {
+      const selected = await ui.select(
+        "Pipeline: choose Next action",
+        nextActions.map(formatNextActionLine),
+      );
+      if (!selected) {
+        ui.notify("Pipeline paused.", "info");
+        return;
+      }
+      action = nextActions.find((a) => selected.startsWith(a.label));
+      if (!action) return;
+    } else {
+      ui.notify(`Pipeline next: ${action.label}`, "info");
+    }
+
+    const result = await handleNextAction(coordinator, ui, action);
+    if (
+      result.status === "cancelled" ||
+      result.status === "failed" ||
+      result.status === "compatibility-recovery"
+    ) {
+      ui.notify("Pipeline stopped.", "warning");
+      return;
+    }
+  }
+
+  ui.notify("Pipeline reached step limit — re-run /matt-auto run to continue.", "warning");
 }
 
 async function resolveStageResult(

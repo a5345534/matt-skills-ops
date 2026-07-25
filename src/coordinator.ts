@@ -32,6 +32,7 @@ import {
   UNSUPPORTED_TRACKER_REASON,
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
+import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
 import type {
   RootScopedPorts,
   TrackerTicket,
@@ -325,7 +326,7 @@ export function createWorkflowCoordinator(
   }
 
   function isUsableDraft(draft: SpecDraft): boolean {
-    return draft.title.trim().length > 0 && draft.body.trim().length > 0;
+    return isPublishableSpecDraft(draft);
   }
 
   function validateTicketsDraft(

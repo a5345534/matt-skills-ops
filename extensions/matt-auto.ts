@@ -1,25 +1,23 @@
 /**
  * Matt Auto Pi extension — package shell for `/matt-auto` and `/matt-auto next`.
  *
- * Product rules live in the Workflow coordinator. This file only wires Pi
- * commands/menus to coordinator ports.
+ * Product rules live in the Workflow coordinator. This file wires Pi
+ * commands/menus to coordinator ports and runs Planning skills in Workflow home.
  *
- * Planning stages (Create-spec, Create-tickets) run in Workflow home: the Matt
- * skills adapter invokes installed skills via a host without modifying skill
- * definitions, then Stage confirmation (Publish / Revise / Cancel) gates remote
- * publication through the coordinator.
- *
- * Implementation workers are session-owned: the WorkersPort and coordinator
- * live for the Pi session and abort cleanly on session_shutdown.
+ * Planning stages invoke installed `/skill:to-spec` and `/skill:to-tickets`
+ * (definitions untouched). Stage confirmation gates remote publication.
+ * Implementation workers are session-owned and abort on session_shutdown.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  buildCreateSpecSkillPrompt,
+  buildCreateTicketsSkillPrompt,
+  createCiPort,
   createEnvironmentPort,
   createGitTopologyPort,
   createModelsPort,
   createPreferencesPort,
-  createCiPort,
   createRemoteGitPort,
   createSkillsPort,
   createTrackerPort,
@@ -27,37 +25,78 @@ import {
   createVerificationPort,
   createWorkersPort,
   createWorkspacePort,
+  parseSpecDraftFromAssistantText,
+  parseTicketsDraftFromAssistantText,
   type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type { WorkflowCoordinator } from "../src/types.js";
 import {
-  captureCreateSpecDraft,
-  captureCreateTicketsDraft,
   presentMainMenu,
   presentNextActions,
+  runPostGrillPipeline,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-function createSkillsHost(getUi: () => MattAutoUi | undefined): SkillsHost {
+type PlanningSession = {
+  sendUserMessage: (text: string) => void;
+  waitForIdle: () => Promise<void>;
+  getLastAssistantText: () => string;
+};
+
+function extractAssistantText(message: {
+  role?: string;
+  content?: unknown;
+}): string {
+  if (message.role !== "assistant") return "";
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (part && typeof part === "object" && "type" in part) {
+        const block = part as { type?: string; text?: string };
+        if (block.type === "text" && typeof block.text === "string") {
+          return block.text;
+        }
+      }
+      return "";
+    })
+    .join("");
+}
+
+function createSkillsHost(
+  getUi: () => MattAutoUi | undefined,
+  getPlanning: () => PlanningSession | undefined,
+): SkillsHost {
   return {
     async runCreateSpec() {
       const ui = getUi();
-      if (!ui) {
+      const planning = getPlanning();
+      if (!ui || !planning) {
         return {
           ok: false,
           reason:
-            "Create-spec Planning host has no active UI. Retry from /matt-auto.",
+            "Create-spec Planning host is not ready. Run `/matt-auto` from an interactive Workflow home session.",
         };
       }
-      // Orchestration wrapper around installed to-spec:
-      // capture a reviewable draft only — never publish (coordinator owns that).
-      const draft = await captureCreateSpecDraft(ui);
+
+      ui.notify(
+        "Running installed /skill:to-spec in Workflow home (no GitHub publish yet)…",
+        "info",
+      );
+
+      planning.sendUserMessage(buildCreateSpecSkillPrompt());
+      await planning.waitForIdle();
+
+      const draft = parseSpecDraftFromAssistantText(
+        planning.getLastAssistantText(),
+      );
       if (!draft) {
         return {
           ok: false,
           reason:
-            "Create-spec draft was not produced. Follow the installed to-spec skill to synthesize a title and body, then retry. Matt Auto does not publish until Stage confirmation Publish.",
+            "Create-spec did not produce a publishable draft after /skill:to-spec. Ensure the grilling conversation has enough substance, then retry Create-spec. Matt Auto does not publish empty or placeholder drafts.",
         };
       }
       return { ok: true, draft };
@@ -65,21 +104,31 @@ function createSkillsHost(getUi: () => MattAutoUi | undefined): SkillsHost {
 
     async runCreateTickets(input) {
       const ui = getUi();
-      if (!ui) {
+      const planning = getPlanning();
+      if (!ui || !planning) {
         return {
           ok: false,
           reason:
-            "Create-tickets Planning host has no active UI. Retry from /matt-auto.",
+            "Create-tickets Planning host is not ready. Run `/matt-auto` from an interactive Workflow home session.",
         };
       }
-      // Orchestration wrapper around installed to-tickets:
-      // capture a reviewable breakdown only — never publish (coordinator owns that).
-      const draft = await captureCreateTicketsDraft(ui, input);
+
+      ui.notify(
+        `Running installed /skill:to-tickets for Workflow #${input.workflowId} (no GitHub publish yet)…`,
+        "info",
+      );
+
+      planning.sendUserMessage(buildCreateTicketsSkillPrompt(input));
+      await planning.waitForIdle();
+
+      const draft = parseTicketsDraftFromAssistantText(
+        planning.getLastAssistantText(),
+      );
       if (!draft) {
         return {
           ok: false,
           reason:
-            "Create-tickets breakdown was not produced. Follow the installed to-tickets skill to synthesize a vertical-slice breakdown with blockedBy edges, then retry. Matt Auto does not publish until Stage confirmation Publish.",
+            "Create-tickets did not produce a valid breakdown after /skill:to-tickets. Retry Create-tickets. Matt Auto does not publish until Stage confirmation Publish.",
         };
       }
       return { ok: true, draft };
@@ -112,13 +161,11 @@ function uiFrom(ctx: {
 }
 
 export default function mattAutoExtension(pi: ExtensionAPI) {
-  // Session-scoped resources: workers and coordinator survive across commands.
   const workers = createWorkersPort();
   let activeUi: MattAutoUi | undefined;
   let coordinator: WorkflowCoordinator | undefined;
   let boundCwd: string | undefined;
   let boundModelRegistry: Parameters<typeof createModelsPort>[0] | undefined;
-  // Updated on every /matt-auto invocation so "use home model" stays current.
   let homeModelRef:
     | {
         provider: string;
@@ -129,8 +176,23 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         thinkingLevelMap?: Record<string, string | null>;
       }
     | undefined;
+  let planningSession: PlanningSession | undefined;
+  let lastAssistantText = "";
 
-  const skillsHost = createSkillsHost(() => activeUi);
+  const skillsHost = createSkillsHost(
+    () => activeUi,
+    () => planningSession,
+  );
+
+  pi.on("message_end", async (event) => {
+    const message = event.message as { role?: string; content?: unknown };
+    if (message.role === "assistant") {
+      const text = extractAssistantText(message);
+      if (text.trim()) {
+        lastAssistantText = text;
+      }
+    }
+  });
 
   function ensureCoordinator(
     cwd: string,
@@ -149,7 +211,6 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       return coordinator;
     }
 
-    // Cwd or model registry change: abort prior session-owned workers first.
     if (coordinator) {
       void coordinator.abortWorkers();
     }
@@ -179,7 +240,6 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_shutdown", async () => {
-    // Session-owned workers abort cleanly; GitHub state remains recoverable.
     if (coordinator) {
       await coordinator.abortWorkers();
     }
@@ -187,13 +247,15 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     boundCwd = undefined;
     boundModelRegistry = undefined;
     activeUi = undefined;
+    planningSession = undefined;
+    lastAssistantText = "";
   });
 
   pi.registerCommand("matt-auto", {
     description:
-      "Matt Auto: stage-gated workflow menus and Next actions",
+      "Matt Auto: post-grill pipeline from to-spec through delivery (stage-gated menus)",
     getArgumentCompletions: (prefix) => {
-      const args = ["next"];
+      const args = ["next", "run"];
       const filtered = args.filter((a) => a.startsWith(prefix.trim()));
       return filtered.map((value) => ({ value, label: value }));
     },
@@ -215,6 +277,17 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
               : {}),
           }
         : undefined;
+
+      // Planning skills run in this Workflow home session so grill context remains.
+      planningSession = {
+        sendUserMessage: (text: string) => {
+          lastAssistantText = "";
+          pi.sendUserMessage(text);
+        },
+        waitForIdle: () => ctx.waitForIdle(),
+        getLastAssistantText: () => lastAssistantText,
+      };
+
       const active = ensureCoordinator(
         ctx.cwd,
         ctx.modelRegistry,
@@ -232,8 +305,14 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (subcommand === "run") {
+        // Post-grill entry: drive to-spec → tickets → implement… with stage confirms.
+        await runPostGrillPipeline(active, ui);
+        return;
+      }
+
       ctx.ui.notify(
-        `Unknown Matt Auto argument "${subcommand}". Try \`/matt-auto\` or \`/matt-auto next\`.`,
+        `Unknown Matt Auto argument "${subcommand}". Try \`/matt-auto\`, \`/matt-auto next\`, or \`/matt-auto run\`.`,
         "error",
       );
     },

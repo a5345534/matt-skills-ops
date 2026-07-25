@@ -74,7 +74,13 @@ function createEnvironment(
 
 const defaultSpecDraft: SpecDraft = {
   title: "Ship feature X",
-  body: "## Problem Statement\n\nUsers need X.\n",
+  body: [
+    "## Problem Statement",
+    "Users need feature X so they can complete their primary workflow without workarounds.",
+    "",
+    "## Solution",
+    "Ship a focused first slice of feature X with tests at the coordinator seam.",
+  ].join("\n"),
 };
 
 const defaultTicketsDraft: TicketsDraft = {
@@ -1490,7 +1496,13 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
   it("revises by re-invoking to-spec without remote publication", async () => {
     const revisedDraft: SpecDraft = {
       title: "Ship feature X (revised)",
-      body: "## Problem Statement\n\nRevised.\n",
+      body: [
+        "## Problem Statement",
+        "Users still need feature X, but the first draft understated the edge cases.",
+        "",
+        "## Solution",
+        "Revise the plan to cover edge cases while keeping the same seam.",
+      ].join("\n"),
     };
     const skillsCalls = { runCreateSpec: 0, runCreateTickets: 0 };
     const tracker = createTracker();
