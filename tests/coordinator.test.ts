@@ -42,6 +42,7 @@ import {
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
+  dispositionActionId,
   IMPLEMENTATION_DISPOSITION_OPTIONS,
   implementTicketActionId,
   implementationBranchName,
@@ -332,6 +333,7 @@ function createWorkspace(
         removedLocalBranches: branches,
       };
     },
+    hasCommitsAhead: async () => ({ ahead: false, count: 0 }),
   };
 
   return { port, state };
@@ -2657,7 +2659,7 @@ describe("Workflow coordinator single Implementation worker path", () => {
     ]);
   });
 
-  it("enters Compatibility recovery when the worker exits without a Stage result", async () => {
+  it("enters Compatibility recovery when the worker exits without a Stage result or commits", async () => {
     const { coordinator, workers } = ticketsPublishedFixture();
 
     await coordinator.runNextAction(implementTicketActionId(43));
@@ -2681,9 +2683,47 @@ describe("Workflow coordinator single Implementation worker path", () => {
       ),
     ).toBe(true);
 
-    // Recoverable: ticket remains ready and can be launched again.
+    // Cooldown: do not immediately re-offer the same ticket to the pipeline.
     const actions = await coordinator.nextActions();
-    expect(actions.map((a) => a.id)).toContain(implementTicketActionId(43));
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+    // Sibling ready tickets remain available.
+    expect(actions.map((a) => a.id)).toContain(implementTicketActionId(44));
+  });
+
+  it("infers completion when worker exits 0 with local commits but no Stage result JSON", async () => {
+    const workspace = createWorkspace("/repo");
+    workspace.port.hasCommitsAhead = async () => ({
+      ahead: true,
+      headSha: "deadbeef",
+      count: 1,
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({
+      workspace,
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toContain(dispositionActionId(43));
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(
+      transcript.some(
+        (e) =>
+          typeof e === "object" &&
+          e !== null &&
+          (e as { type?: string }).type === "stage-result-inferred",
+      ),
+    ).toBe(true);
   });
 
   it("aborts the session-owned worker cleanly and leaves GitHub state recoverable", async () => {

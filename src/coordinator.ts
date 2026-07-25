@@ -186,6 +186,9 @@ export function createWorkflowCoordinator(
   let lastCompletedWorkflow:
     | { workflowId: number; title?: string; targetBranch: string }
     | undefined;
+  /** Ticket numbers that recently hit implementation recovery — skip auto re-launch. */
+  const implementationRecoveryCooldown = new Map<number, number>();
+  const IMPLEMENTATION_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -1077,7 +1080,20 @@ export function createWorkflowCoordinator(
         });
       }
 
-      actions.push(...progress.ready.map(formatImplementAction));
+      const now = Date.now();
+      actions.push(
+        ...progress.ready
+          .filter((ticket) => {
+            const cooled = implementationRecoveryCooldown.get(ticket.number);
+            if (cooled === undefined) return true;
+            if (now - cooled >= IMPLEMENTATION_RECOVERY_COOLDOWN_MS) {
+              implementationRecoveryCooldown.delete(ticket.number);
+              return true;
+            }
+            return false;
+          })
+          .map(formatImplementAction),
+      );
 
       // Pre-merge Rework for closed integrated tickets (fresh numbered attempt).
       if (!active.workflowPr || active.stage === "pr-opened") {
@@ -1806,6 +1822,9 @@ export function createWorkflowCoordinator(
       };
     }
 
+    // Successful launch clears recovery cooldown for this ticket.
+    implementationRecoveryCooldown.delete(ticketNumber);
+
     // Workers never touch the issue tracker — only the coordinator does, and
     // launch leaves GitHub recoverable (no issue mutation on start).
     return {
@@ -1880,11 +1899,49 @@ export function createWorkflowCoordinator(
       return;
     }
 
-    // Fail closed: agent settled without a Stage result.
+    // Fallback: many agents finish with exit 0 + local commits but forget the
+    // Stage result JSON. Infer completion so the pipeline can advance.
+    if (event.code === 0 || event.code === null) {
+      try {
+        const baseRef = await resolveTargetBranch(bound.preferences);
+        const ahead = await bound.workspace.hasCommitsAhead({
+          worktreePath: worker.worktreePath,
+          baseRef,
+        });
+        if (ahead.ahead) {
+          worker.receivedStageResult = true;
+          worker.status = "needs-disposition";
+          worker.summary =
+            worker.progress ??
+            `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
+              (ahead.headSha ? ` @ ${ahead.headSha.slice(0, 8)}` : "");
+          pendingDisposition = worker;
+          if (activeWorker?.workerId === worker.workerId) {
+            activeWorker = undefined;
+          }
+          await bound.transcripts.append(transcriptKey, {
+            type: "stage-result-inferred",
+            reason:
+              "Worker exited without Stage result JSON; inferred completed from local commits ahead of base.",
+            code: event.code,
+            headSha: ahead.headSha,
+            commitCount: ahead.count,
+            baseRef,
+          });
+          return;
+        }
+      } catch {
+        // Fall through to recovery.
+      }
+    }
+
+    // Fail closed: agent settled without a Stage result and no local commits.
     worker.status = "compatibility-recovery";
     if (activeWorker?.workerId === worker.workerId) {
       activeWorker = undefined;
     }
+    // Cooldown so /matt-auto run does not immediately re-launch the same ticket.
+    implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
     await bound.transcripts.append(transcriptKey, {
       type: "compatibility-recovery",
       reason:

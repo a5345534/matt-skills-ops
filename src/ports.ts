@@ -163,6 +163,14 @@ export type WorkspacePort = {
     removedWorktrees: readonly string[];
     removedLocalBranches: readonly string[];
   }>;
+  /**
+   * True when the worktree HEAD has commits not contained in baseRef
+   * (used to infer Implementation success if the worker omits Stage result JSON).
+   */
+  hasCommitsAhead(input: {
+    worktreePath: string;
+    baseRef: string;
+  }): Promise<{ ahead: boolean; headSha?: string; count: number }>;
 };
 
 /** Outcome of Local verification in the Integration workspace. */

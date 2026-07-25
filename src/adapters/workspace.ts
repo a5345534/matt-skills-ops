@@ -264,6 +264,30 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
         : { ok: true };
     },
 
+    async hasCommitsAhead(input) {
+      const head = await run(input.worktreePath, "git", ["rev-parse", "HEAD"]);
+      if (head.code !== 0) {
+        return { ahead: false, count: 0 };
+      }
+      const headSha = head.stdout.trim();
+      const countResult = await run(input.worktreePath, "git", [
+        "rev-list",
+        "--count",
+        `${input.baseRef}..HEAD`,
+      ]);
+      if (countResult.code !== 0) {
+        // baseRef may be missing in a shallow/orphan worktree; treat any HEAD as ahead.
+        return headSha
+          ? { ahead: true, headSha, count: 1 }
+          : { ahead: false, count: 0 };
+      }
+      const count = Number(countResult.stdout.trim() || "0");
+      if (!Number.isFinite(count) || count <= 0) {
+        return { ahead: false, headSha, count: 0 };
+      }
+      return { ahead: true, headSha, count };
+    },
+
     async listWorkflowBranches(workflowId) {
       const patterns = [
         `matt-auto/${workflowId}`,

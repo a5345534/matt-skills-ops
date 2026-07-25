@@ -62,7 +62,7 @@ function parseStageResultFromLine(
     }
   }
 
-  // Progress from message_end assistant text (compact, passive panel only).
+  // Progress / embedded Stage result from message_end assistant text.
   if (obj.type === "message_end") {
     const message = obj.message as Record<string, unknown> | undefined;
     if (message?.role === "assistant") {
@@ -81,18 +81,62 @@ function parseStageResultFromLine(
           .join("");
       }
       const trimmed = text.trim();
-      if (trimmed) {
-        const firstLine = trimmed.split("\n")[0] ?? trimmed;
-        return {
-          type: "progress",
-          workerId,
-          message:
-            firstLine.length > 160 ? `${firstLine.slice(0, 157)}...` : firstLine,
-        };
-      }
+      if (!trimmed) return undefined;
+
+      // Agents often print Stage result JSON inside assistant text (not as a
+      // top-level protocol line). Accept that form.
+      const embedded = extractEmbeddedStageResult(workerId, trimmed);
+      if (embedded) return embedded;
+
+      const firstLine = trimmed.split("\n")[0] ?? trimmed;
+      return {
+        type: "progress",
+        workerId,
+        message:
+          firstLine.length > 160 ? `${firstLine.slice(0, 157)}...` : firstLine,
+      };
     }
   }
 
+  return undefined;
+}
+
+/** Try to recover a Stage result JSON object from free-form assistant text. */
+function extractEmbeddedStageResult(
+  workerId: string,
+  text: string,
+): WorkerProtocolEvent | undefined {
+  // Prefer fenced json blocks, then any {...} containing stage-result.
+  const candidates: string[] = [];
+  const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let m: RegExpExecArray | null;
+  while ((m = fence.exec(text)) !== null) {
+    if (m[1]) candidates.push(m[1].trim());
+  }
+  candidates.push(text);
+
+  for (const candidate of candidates) {
+    if (!/stage-result/i.test(candidate)) continue;
+    // Scan for JSON objects; try progressively larger slices from each '{'.
+    for (let i = 0; i < candidate.length; i += 1) {
+      if (candidate[i] !== "{") continue;
+      for (let j = candidate.length; j > i + 8; j -= 1) {
+        if (candidate[j - 1] !== "}") continue;
+        const slice = candidate.slice(i, j);
+        if (!/stage-result/i.test(slice)) continue;
+        try {
+          const parsed = JSON.parse(slice) as Record<string, unknown>;
+          const synthetic = parseStageResultFromLine(
+            workerId,
+            JSON.stringify(parsed),
+          );
+          if (synthetic?.type === "stage-result") return synthetic;
+        } catch {
+          // keep scanning
+        }
+      }
+    }
+  }
   return undefined;
 }
 

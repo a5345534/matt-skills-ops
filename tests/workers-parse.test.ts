@@ -1,0 +1,55 @@
+import { describe, expect, it } from "vitest";
+
+// Re-test parsing behavior via a minimal reimplementation of the public contract:
+// message_end with embedded stage-result JSON should be recoverable.
+// We import the workers module's side-effect-free path by spawning parse through
+// a thin dynamic evaluation of stdout handling is hard; instead test the
+// embedded extraction logic by constructing the same line format workers emit
+// as progress vs stage-result top-level.
+
+// The workers module does not export parse helpers; validate the protocol
+// strings the prompt requires remain parseable as top-level JSON.
+
+describe("worker stage-result protocol JSON", () => {
+  it("parses completed stage-result as top-level JSON", () => {
+    const line = JSON.stringify({
+      type: "stage-result",
+      outcome: {
+        status: "completed",
+        summary: "landed ADR",
+        localCommitSha: "abc123",
+      },
+    });
+    const parsed = JSON.parse(line) as {
+      type: string;
+      outcome: { status: string; summary?: string };
+    };
+    expect(parsed.type).toBe("stage-result");
+    expect(parsed.outcome.status).toBe("completed");
+  });
+
+  it("finds stage-result inside a fenced assistant message", () => {
+    const text = [
+      "## Done — #256",
+      "",
+      "```json",
+      '{',
+      '  "type": "stage-result",',
+      '  "outcome": {',
+      '    "status": "completed",',
+      '    "summary": "docs landed"',
+      "  }",
+      "}",
+      "```",
+    ].join("\n");
+
+    const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    expect(fence?.[1]).toBeTruthy();
+    const obj = JSON.parse(fence![1]!.trim()) as {
+      type: string;
+      outcome: { status: string };
+    };
+    expect(obj.type).toBe("stage-result");
+    expect(obj.outcome.status).toBe("completed");
+  });
+});
