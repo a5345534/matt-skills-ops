@@ -1,3 +1,16 @@
+import {
+  CHECK_CI_ACTION_PREFIX,
+  CI_RECOVERY_ACTION_PREFIX,
+  CLEANUP_WORKFLOW_ACTION,
+  CREATE_SPEC_ACTION,
+  CREATE_TICKETS_ACTION,
+  DISPOSITION_ACTION_PREFIX,
+  IMPLEMENT_TICKET_ACTION_PREFIX,
+  INTEGRATE_TICKET_ACTION_PREFIX,
+  MERGE_WORKFLOW_PR_ACTION,
+  OPEN_WORKFLOW_PR_ACTION,
+  REWORK_TICKET_ACTION_PREFIX,
+} from "../constants.js";
 import type {
   AvailableModel,
   ImplementationDispositionDecision,
@@ -16,6 +29,33 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+
+/**
+ * Choose the next pipeline action without asking the user when rules allow.
+ * Ready implement tickets are already frontier-only (no open blockers).
+ * Picks the first matching priority class; returns undefined only when a human
+ * must choose among unrelated actions.
+ */
+export function selectPipelineAction(
+  nextActions: readonly NextAction[],
+): NextAction | undefined {
+  if (nextActions.length === 0) return undefined;
+  if (nextActions.length === 1) return nextActions[0];
+
+  return (
+    nextActions.find((a) => a.id === CREATE_SPEC_ACTION.id) ??
+    nextActions.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
+    nextActions.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
+    nextActions.find((a) => a.id.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) ??
+    nextActions.find((a) => a.id.startsWith(CHECK_CI_ACTION_PREFIX)) ??
+    nextActions.find((a) => a.id.startsWith(CI_RECOVERY_ACTION_PREFIX)) ??
+    nextActions.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
+    nextActions.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
+    nextActions.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
+    nextActions.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
+    nextActions.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX))
+  );
+}
 
 /** Minimal UI surface needed by Matt Auto menus. */
 export type MattAutoUi = {
@@ -383,19 +423,7 @@ export async function runPostGrillPipeline(
       return;
     }
 
-    // Prefer planning, then disposition/integration/CI, then implement-all ready,
-    // then a single unambiguous action; otherwise ask.
-    const preferred =
-      nextActions.find((a) => a.id === "create-spec") ??
-      nextActions.find((a) => a.id === "create-tickets") ??
-      nextActions.find((a) => a.id.startsWith("disposition:")) ??
-      nextActions.find((a) => a.id.startsWith("integrate:")) ??
-      nextActions.find((a) => a.id.startsWith("check-ci:")) ??
-      nextActions.find((a) => a.id === "open-workflow-pr") ??
-      nextActions.find((a) => a.id === "merge-workflow-pr") ??
-      nextActions.find((a) => a.id === "cleanup-workflow") ??
-      nextActions.find((a) => a.id.startsWith("implement:")) ??
-      (nextActions.length === 1 ? nextActions[0] : undefined);
+    const preferred = selectPipelineAction(nextActions);
 
     let action = preferred;
     if (!action) {

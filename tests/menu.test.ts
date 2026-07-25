@@ -4,6 +4,7 @@ import {
   formatTicketProgressLines,
   parseTicketsDraftFromEditor,
   selectAvailableModel,
+  selectPipelineAction,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 import type {
@@ -257,5 +258,39 @@ describe("selectAvailableModel", () => {
 
     const chosen = await selectAvailableModel(models, ui);
     expect(chosen).toEqual(models[0]);
+  });
+});
+
+describe("selectPipelineAction", () => {
+  it("auto-picks the first frontier implement ticket without asking", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "implement-ticket:12",
+        label: "Implement #12",
+        description: "A",
+      },
+      {
+        id: "implement-ticket:15",
+        label: "Implement #15",
+        description: "B",
+      },
+    ]);
+    expect(chosen?.id).toBe("implement-ticket:12");
+  });
+
+  it("prefers create-spec over implement actions", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "implement-ticket:12",
+        label: "Implement #12",
+        description: "A",
+      },
+      {
+        id: "create-spec",
+        label: "Create spec",
+        description: "S",
+      },
+    ]);
+    expect(chosen?.id).toBe("create-spec");
   });
 });
