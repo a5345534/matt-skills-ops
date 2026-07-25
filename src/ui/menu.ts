@@ -10,6 +10,7 @@ import {
   MERGE_WORKFLOW_PR_ACTION,
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
+  TICKET_PROGRESS_ACTION,
 } from "../constants.js";
 import type {
   AvailableModel,
@@ -39,21 +40,67 @@ import type {
 export function selectPipelineAction(
   nextActions: readonly NextAction[],
 ): NextAction | undefined {
-  if (nextActions.length === 0) return undefined;
-  if (nextActions.length === 1) return nextActions[0];
+  // ticket-progress is informational only — never auto-run it or the pipeline
+  // will "review tickets" and stall / bounce back to the main menu.
+  const actionable = nextActions.filter(
+    (a) => a.id !== TICKET_PROGRESS_ACTION.id,
+  );
+  if (actionable.length === 0) return undefined;
+  if (actionable.length === 1) return actionable[0];
 
   return (
-    nextActions.find((a) => a.id === CREATE_SPEC_ACTION.id) ??
-    nextActions.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
-    nextActions.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
-    nextActions.find((a) => a.id.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) ??
-    nextActions.find((a) => a.id.startsWith(CHECK_CI_ACTION_PREFIX)) ??
-    nextActions.find((a) => a.id.startsWith(CI_RECOVERY_ACTION_PREFIX)) ??
-    nextActions.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
-    nextActions.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
-    nextActions.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
-    nextActions.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
-    nextActions.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX))
+    actionable.find((a) => a.id === CREATE_SPEC_ACTION.id) ??
+    actionable.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
+    actionable.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
+    actionable.find((a) => a.id.startsWith(INTEGRATE_TICKET_ACTION_PREFIX)) ??
+    actionable.find((a) => a.id.startsWith(CHECK_CI_ACTION_PREFIX)) ??
+    actionable.find((a) => a.id.startsWith(CI_RECOVERY_ACTION_PREFIX)) ??
+    actionable.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
+    actionable.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
+    actionable.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
+    actionable.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
+    actionable.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX))
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wait while session-owned workers run. During that window nextActions is empty
+ * on purpose; exiting the pipeline would dump the user back to the main menu.
+ */
+async function waitForPipelineWorkers(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  ui.notify(
+    "Pipeline waiting for Implementation / Conflict workers to finish…",
+    "info",
+  );
+  for (let i = 0; i < 1800; i += 1) {
+    // 1800 * 2s ≈ 1 hour max wait
+    await sleep(2000);
+    const panel = await coordinator.getPanelState();
+    const workers = panel?.workers.length ?? 0;
+    if (workers === 0) {
+      const next = await coordinator.nextActions();
+      const actionable = next.filter((a) => a.id !== TICKET_PROGRESS_ACTION.id);
+      if (actionable.length > 0) return;
+      // No workers and no actionable next — real idle.
+      return;
+    }
+    if (i > 0 && i % 15 === 0) {
+      ui.notify(
+        `Still waiting on ${workers} worker(s)… (${formatPanelLines(panel!).join(" | ")})`,
+        "info",
+      );
+    }
+  }
+  ui.notify(
+    "Timed out waiting for workers. Re-run /matt-auto run to continue.",
+    "warning",
   );
 }
 
@@ -405,21 +452,17 @@ export async function runPostGrillPipeline(
       return;
     }
 
-    const nextActions = await coordinator.nextActions();
+    let nextActions = await coordinator.nextActions();
     if (nextActions.length === 0) {
       const panel = await coordinator.getPanelState();
       if (panel && panel.workers.length > 0) {
-        ui.notify(
-          [
-            "Pipeline waiting on session-owned workers.",
-            ...formatPanelLines(panel),
-            "Re-run /matt-auto run or /matt-auto next when workers settle.",
-          ].join("\n"),
-          "info",
-        );
-        return;
+        await waitForPipelineWorkers(coordinator, ui);
+        continue;
       }
-      ui.notify("Pipeline idle — no Next actions available.", "info");
+      ui.notify(
+        "Pipeline idle — no actionable Next steps (ready frontier may be empty or all tickets blocked).",
+        "info",
+      );
       return;
     }
 
@@ -427,15 +470,30 @@ export async function runPostGrillPipeline(
 
     let action = preferred;
     if (!action) {
+      // Only informational rows (ticket-progress) or unrecognized mix.
+      const actionable = nextActions.filter(
+        (a) => a.id !== TICKET_PROGRESS_ACTION.id,
+      );
+      if (actionable.length === 0) {
+        ui.notify(
+          [
+            "Pipeline paused: tickets exist but no ready frontier to implement.",
+            ...nextActions.map((a) => `• ${a.label} — ${a.description}`),
+            "Unblock tickets or re-run /matt-auto run after fixing blockers.",
+          ].join("\n"),
+          "warning",
+        );
+        return;
+      }
       const selected = await ui.select(
         "Pipeline: choose Next action",
-        nextActions.map(formatNextActionLine),
+        actionable.map(formatNextActionLine),
       );
       if (!selected) {
         ui.notify("Pipeline paused.", "info");
         return;
       }
-      action = nextActions.find((a) => selected.startsWith(a.label));
+      action = actionable.find((a) => selected.startsWith(a.label));
       if (!action) return;
     } else {
       ui.notify(`Pipeline next: ${action.label}`, "info");
@@ -451,6 +509,12 @@ export async function runPostGrillPipeline(
     ) {
       ui.notify("Pipeline stopped.", "warning");
       return;
+    }
+
+    // Implement returns "running" while the worker is live — wait here instead
+    // of falling through to an empty nextActions and exiting to the main menu.
+    if (result.status === "running") {
+      await waitForPipelineWorkers(coordinator, ui);
     }
   }
 

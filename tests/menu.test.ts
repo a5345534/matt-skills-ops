@@ -274,8 +274,24 @@ describe("selectPipelineAction", () => {
         label: "Implement #15",
         description: "B",
       },
+      {
+        id: "ticket-progress",
+        label: "Ticket progress: 2 ready / 2 open / 0 closed",
+        description: "Ready frontier: #12, #15.",
+      },
     ]);
     expect(chosen?.id).toBe("implement-ticket:12");
+  });
+
+  it("never auto-selects ticket-progress alone", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "ticket-progress",
+        label: "Ticket progress: 0 ready / 3 open / 0 closed",
+        description: "Ready frontier: none.",
+      },
+    ]);
+    expect(chosen).toBeUndefined();
   });
 
   it("prefers create-spec over implement actions", () => {
