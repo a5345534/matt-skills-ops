@@ -33,6 +33,15 @@ Load the extension without installing:
 pi -e ./extensions/matt-auto.ts
 ```
 
+## Workflow root selection
+
+Matt Auto resolves the **Workflow root** from the nearest enclosing Git repository:
+
+- Monorepo packages share that single enclosing root
+- Nested independent Git repositories are discoverable and selectable from the Matt Auto menu
+- Git submodules are out of MVP and are not offered as roots
+- Roots without a GitHub remote are marked unavailable with an explicit unsupported-tracker explanation
+
 ## Workflow preflight
 
 Preflight checks (fail closed, no bootstrap inventing):
@@ -61,4 +70,4 @@ Example Worker profile:
 
 ## Status
 
-Ticket #2 establishes the package shell, coordinator seam, and preflight menus. Planning stages, workers, integration, CI, and Workflow PR land in later tickets.
+Tickets #2–#3 establish the package shell, coordinator seam, preflight menus, and Workflow root selection. Planning stages, workers, integration, CI, and Workflow PR land in later tickets.

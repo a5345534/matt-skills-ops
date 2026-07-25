@@ -8,9 +8,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createEnvironmentPort,
+  createGitTopologyPort,
   createPreferencesPort,
   createSkillsPort,
-  resolveGitRoot,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import {
@@ -19,12 +19,17 @@ import {
   type MattAutoUi,
 } from "../src/ui/menu.js";
 
-async function createCoordinatorFor(cwd: string) {
-  const workflowRoot = await resolveGitRoot(cwd);
+function createCoordinatorFor(cwd: string) {
   return createWorkflowCoordinator({
-    environment: createEnvironmentPort(workflowRoot),
-    skills: createSkillsPort(workflowRoot),
-    preferences: createPreferencesPort(workflowRoot),
+    startPath: cwd,
+    topology: createGitTopologyPort(),
+    forRoot(rootPath) {
+      return {
+        environment: createEnvironmentPort(rootPath),
+        skills: createSkillsPort(rootPath),
+        preferences: createPreferencesPort(rootPath),
+      };
+    },
   });
 }
 
@@ -46,7 +51,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const subcommand = args.trim();
-      const coordinator = await createCoordinatorFor(ctx.cwd);
+      const coordinator = createCoordinatorFor(ctx.cwd);
       const ui = uiFrom(ctx);
 
       if (subcommand === "" || subcommand === "menu") {

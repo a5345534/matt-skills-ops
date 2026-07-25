@@ -1,7 +1,7 @@
 import type { WorkerProfile } from "./types.js";
 
 /**
- * Environment facts for Workflow preflight.
+ * Environment facts for Workflow preflight on one Workflow root.
  * System boundary: git remotes, gh auth, branch existence.
  */
 export type EnvironmentPort = {
@@ -39,9 +39,48 @@ export type PreferencesPort = {
   getWorkerProfile(): Promise<WorkerProfile | undefined>;
 };
 
-/** Ports injected into the Workflow coordinator. */
-export type WorkflowCoordinatorPorts = {
+/**
+ * A nested Git repository found under a parent Workflow root.
+ * System boundary: filesystem / git topology (facts only).
+ */
+export type NestedGitRepository = {
+  path: string;
+  /** True when this nested repo is a Git submodule of the parent. */
+  isSubmodule: boolean;
+};
+
+/**
+ * Git repository topology for Root selection.
+ * System boundary: git roots and nested repository layout.
+ * Product rules (submodule exclusion, availability) live in the coordinator.
+ */
+export type GitTopologyPort = {
+  /**
+   * Nearest enclosing Git repository for startPath.
+   * `undefined` when startPath is not inside a Git repository.
+   */
+  nearestGitRoot(startPath: string): Promise<string | undefined>;
+  /**
+   * Nested Git repositories under parentRoot (not including parentRoot itself).
+   * Includes both independent clones and submodules; the coordinator filters.
+   */
+  nestedGitRepositories(
+    parentRoot: string,
+  ): Promise<readonly NestedGitRepository[]>;
+};
+
+/** Root-scoped ports rebound when the selected Workflow root changes. */
+export type RootScopedPorts = {
   environment: EnvironmentPort;
   skills: SkillsPort;
   preferences: PreferencesPort;
+};
+
+/** Ports injected into the Workflow coordinator. */
+export type WorkflowCoordinatorPorts = {
+  /** Working directory used as the Root selection starting point. */
+  startPath: string;
+  topology: GitTopologyPort;
+  /** Create environment / skills / preferences bound to a Workflow root path. */
+  forRoot(rootPath: string): RootScopedPorts;
 };

@@ -38,13 +38,53 @@ export type WorkerProfile = {
   thinkingLevel: string;
 };
 
+/**
+ * Relationship of a discovered Workflow root to the discovery start path.
+ * - nearest: nearest enclosing Git repository (default selection)
+ * - nested-independent: independent Git repo nested under the nearest root
+ */
+export type WorkflowRootKind = "nearest" | "nested-independent";
+
+/** Whether Matt Auto can operate on this Workflow root in the MVP. */
+export type WorkflowRootStatus = "available" | "unavailable";
+
+/**
+ * A Workflow root candidate from Root selection.
+ * Monorepo packages share their enclosing root; submodules are never listed.
+ */
+export type WorkflowRoot = {
+  /** Absolute path of the Git repository (or start path when none exists). */
+  path: string;
+  kind: WorkflowRootKind;
+  status: WorkflowRootStatus;
+  /**
+   * Present when status is "unavailable".
+   * Non-GitHub roots always explain the unsupported-tracker limit.
+   */
+  unavailableReason?: string;
+};
+
 /** Public Workflow coordinator seam. */
 export type WorkflowCoordinator = {
-  /** Run Workflow preflight against injected environment ports. */
+  /** Run Workflow preflight against the currently selected Workflow root. */
   preflight(): Promise<PreflightResult>;
   /**
    * Return only currently available Next actions.
    * Empty when preflight fails or no stage is available yet.
    */
   nextActions(): Promise<NextAction[]>;
+  /**
+   * Currently selected Workflow root (defaults to nearest enclosing Git root).
+   */
+  currentRoot(): Promise<WorkflowRoot>;
+  /**
+   * Discover selectable Workflow roots: nearest + nested independent.
+   * Excludes Git submodules. Marks non-GitHub roots unavailable.
+   */
+  listRoots(): Promise<WorkflowRoot[]>;
+  /**
+   * Switch the selected Workflow root to a previously discovered path.
+   * Throws if the path is not in the discovered set.
+   */
+  selectRoot(rootPath: string): Promise<WorkflowRoot>;
 };
