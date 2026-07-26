@@ -42,6 +42,7 @@ import {
   runControlFilePath,
   runPostGrillPipeline,
   setMenuLogger,
+  writeRunControlFile,
   type MattAutoUi,
 } from "../src/ui/menu.js";
 import { clearWorkflowPanel } from "../src/ui/workflow-panel.js";
@@ -448,25 +449,167 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     assistantTexts.length = 0;
   });
 
-  // Queue Pause/Terminate/menu during auto-waiting wait loop (home agent idle).
-  // Also readable via .pi/matt-auto/run-control when shortcuts are unavailable.
+  /**
+   * Operator stop controls.
+   *
+   * Ctrl+Alt combos often never reach the TUI (terminal/OS eats Alt). Prefer
+   * Ctrl+Shift+*. Handlers act immediately (notify + confirm + coordinator),
+   * and also write the run-control file so the wait loop can observe the stop
+   * even if the confirm path races with auto-wait polling.
+   */
+  async function requestPauseFromShortcut(
+    ctx: { cwd: string; ui: { notify: MattAutoUi["notify"]; confirm?: (title: string, message: string) => Promise<boolean> } },
+  ): Promise<void> {
+    const controlPath = await writeRunControlFile(ctx.cwd, "pause").catch(
+      () => runControlFilePath(ctx.cwd),
+    );
+    queuePipelineWaitControl("pause");
+    ctx.ui.notify(
+      `Matt Auto: Pause shortcut received. Control file: ${controlPath}`,
+      "warning",
+    );
+    logger?.info("shortcut:pause", { cwd: ctx.cwd, controlPath });
+
+    if (!coordinator) {
+      ctx.ui.notify(
+        "No active Matt Auto coordinator — if a run is waiting, it should pick up the control file within ~0.5s.",
+        "warning",
+      );
+      return;
+    }
+    if (coordinator.isRunTerminated()) {
+      ctx.ui.notify("Run already terminated.", "info");
+      return;
+    }
+    if (coordinator.isPipelinePaused()) {
+      ctx.ui.notify("Pipeline already paused.", "info");
+      return;
+    }
+
+    const confirm =
+      typeof ctx.ui.confirm === "function"
+        ? await ctx.ui.confirm(
+            "Pause Matt Auto pipeline?",
+            "Abort session-owned workers and stop auto-advance. GitHub state is unchanged. Resume or Terminate from the control menu afterward.",
+          )
+        : true;
+    if (!confirm) {
+      ctx.ui.notify("Pause cancelled.", "info");
+      return;
+    }
+    const result = await coordinator.pausePipeline();
+    ctx.ui.notify(
+      `Pipeline paused. Aborted ${result.abortedWorkerCount} worker(s). Use Ctrl+Shift+X to terminate or Resume from the paused menu.`,
+      "warning",
+    );
+  }
+
+  async function requestTerminateFromShortcut(
+    ctx: { cwd: string; ui: { notify: MattAutoUi["notify"]; confirm?: (title: string, message: string) => Promise<boolean> } },
+  ): Promise<void> {
+    const controlPath = await writeRunControlFile(ctx.cwd, "terminate").catch(
+      () => runControlFilePath(ctx.cwd),
+    );
+    queuePipelineWaitControl("terminate");
+    ctx.ui.notify(
+      `Matt Auto: Terminate shortcut received. Control file: ${controlPath}`,
+      "warning",
+    );
+    logger?.info("shortcut:terminate", { cwd: ctx.cwd, controlPath });
+
+    if (!coordinator) {
+      ctx.ui.notify(
+        [
+          "No active Matt Auto coordinator in this session.",
+          `If a run is waiting, it should stop after reading: ${controlPath}`,
+          `Emergency: echo terminate-now > ${controlPath}`,
+        ].join("\n"),
+        "warning",
+      );
+      return;
+    }
+    if (coordinator.isRunTerminated()) {
+      ctx.ui.notify("Run already terminated.", "info");
+      return;
+    }
+
+    const confirm =
+      typeof ctx.ui.confirm === "function"
+        ? await ctx.ui.confirm(
+            "Terminate Matt Auto run?",
+            "Abort workers and end this /matt-auto run. Integrated history is preserved when any ticket already integrated or a Workflow PR exists.",
+          )
+        : true;
+    if (!confirm) {
+      ctx.ui.notify("Terminate cancelled.", "info");
+      // Drop the control file so the wait loop does not re-prompt.
+      try {
+        const { unlink } = await import("node:fs/promises");
+        await unlink(runControlFilePath(ctx.cwd));
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    const result = await coordinator.terminateRun();
+    // Wait loop observes isRunTerminated / terminate-now without a second dialog.
+    await writeRunControlFile(ctx.cwd, "terminate-now").catch(() => undefined);
+    ctx.ui.notify(
+      `Run terminated (${result.mode}). Aborted ${result.abortedWorkerCount} worker(s).`,
+      "warning",
+    );
+  }
+
+  async function requestMenuFromShortcut(
+    ctx: { cwd: string; ui: { notify: MattAutoUi["notify"] } },
+  ): Promise<void> {
+    const controlPath = await writeRunControlFile(ctx.cwd, "menu").catch(
+      () => runControlFilePath(ctx.cwd),
+    );
+    queuePipelineWaitControl("menu");
+    ctx.ui.notify(
+      `Matt Auto: control menu queued (Pause/Terminate). File: ${controlPath}`,
+      "info",
+    );
+    logger?.info("shortcut:menu", { cwd: ctx.cwd, controlPath });
+  }
+
+  // Primary (Ctrl+Shift — more reliable than Ctrl+Alt in many terminals).
+  pi.registerShortcut("ctrl+shift+z", {
+    description: "Matt Auto: Pause pipeline (confirm)",
+    handler: async (ctx) => {
+      await requestPauseFromShortcut(ctx);
+    },
+  });
+  pi.registerShortcut("ctrl+shift+x", {
+    description: "Matt Auto: Terminate run (confirm)",
+    handler: async (ctx) => {
+      await requestTerminateFromShortcut(ctx);
+    },
+  });
+  pi.registerShortcut("ctrl+shift+o", {
+    description: "Matt Auto: queue Pause/Terminate control menu",
+    handler: async (ctx) => {
+      await requestMenuFromShortcut(ctx);
+    },
+  });
+  // Legacy aliases (often swallowed by the terminal).
   pi.registerShortcut("ctrl+alt+p", {
-    description: "Matt Auto: queue Pause while /matt-auto run is auto-waiting",
-    handler: () => {
-      queuePipelineWaitControl("pause");
+    description: "Matt Auto: Pause pipeline (alias; prefer Ctrl+Shift+Z)",
+    handler: async (ctx) => {
+      await requestPauseFromShortcut(ctx);
     },
   });
   pi.registerShortcut("ctrl+alt+t", {
-    description: "Matt Auto: queue Terminate while /matt-auto run is auto-waiting",
-    handler: () => {
-      queuePipelineWaitControl("terminate");
+    description: "Matt Auto: Terminate run (alias; prefer Ctrl+Shift+X)",
+    handler: async (ctx) => {
+      await requestTerminateFromShortcut(ctx);
     },
   });
   pi.registerShortcut("ctrl+alt+m", {
-    description:
-      "Matt Auto: open Pause / Terminate control menu while /matt-auto run is auto-waiting",
-    handler: () => {
-      queuePipelineWaitControl("menu");
+    description: "Matt Auto: control menu (alias; prefer Ctrl+Shift+O)",
+    handler: async (ctx) => {
+      await requestMenuFromShortcut(ctx);
     },
   });
 

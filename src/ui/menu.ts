@@ -1,4 +1,4 @@
-import { readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { MattAutoLogger } from "../adapters/logger.js";
 import {
@@ -182,6 +182,20 @@ export function clearPipelineWaitControlQueue(): void {
 /** Absolute path of the out-of-band run control file under a Workflow root. */
 export function runControlFilePath(workflowRoot: string): string {
   return path.join(workflowRoot, ".pi", "matt-auto", "run-control");
+}
+
+/**
+ * Write a run-control request for the wait / pipeline loop (or another shell).
+ * Returns the absolute path written.
+ */
+export async function writeRunControlFile(
+  workflowRoot: string,
+  action: PipelineWaitControlRequest,
+): Promise<string> {
+  const file = runControlFilePath(workflowRoot);
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${action}\n`, "utf8");
+  return file;
 }
 
 /**
@@ -672,11 +686,11 @@ export async function waitForPipelineWorkers(
     ui.notify(
       [
         "Auto-waiting for workers — brief refreshes continuously (no Continue needed).",
-        "Stop controls:",
-        "  • Ctrl+Alt+M — open Pause / Terminate menu (then confirm)",
-        "  • Ctrl+Alt+P — Pause · Ctrl+Alt+T — Terminate (then confirm)",
-        `  • From another shell: echo terminate > ${controlPath}`,
-        `  • Emergency (no confirm): echo terminate-now > ${controlPath}`,
+        "Stop controls (press in the editor; you should see an immediate notify):",
+        "  • Ctrl+Shift+X — Terminate (confirm)  ·  Ctrl+Shift+Z — Pause",
+        "  • Ctrl+Shift+O — control menu",
+        "  • Aliases: Ctrl+Alt+T / P / M (may not work in some terminals)",
+        `  • Reliable from another shell: echo terminate-now > ${controlPath}`,
       ].join("\n"),
       "info",
     );
@@ -688,7 +702,8 @@ export async function waitForPipelineWorkers(
     cwd: process.cwd(),
     detail: activityDetailFromPanel(initialPanel),
   });
-  pendingPipelineWaitControl = undefined;
+  // Do NOT clear pendingPipelineWaitControl here — shortcuts pressed during
+  // implement/disposition must still be visible on the first wait tick.
 
   try {
     // Catch dependents that were launched while a blocker was briefly closed
@@ -1401,14 +1416,16 @@ export async function runPostGrillPipeline(
 ): Promise<void> {
   // Clear prior pause / termination so this run can auto-advance.
   coordinator.beginPipelineRun();
+  // Drop any stale stop request from a previous run / shortcut.
+  await readAndClearRunControlFile(process.cwd());
+  clearPipelineWaitControlQueue();
   const controlPath = runControlFilePath(process.cwd());
   ui.notify(
     [
       "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement…",
       "Stage confirmation is auto-Publish; disposition is auto-Close.",
-      "Stop controls (while waiting): Ctrl+Alt+M menu · Ctrl+Alt+P Pause · Ctrl+Alt+T Terminate (confirm required).",
-      `Out-of-band: echo terminate > ${controlPath}`,
-      `Emergency (no confirm): echo terminate-now > ${controlPath}`,
+      "Stop: Ctrl+Shift+X Terminate · Ctrl+Shift+Z Pause · Ctrl+Shift+O menu (immediate notify+confirm).",
+      `Reliable stop from another shell: echo terminate-now > ${controlPath}`,
     ].join("\n"),
     "info",
   );

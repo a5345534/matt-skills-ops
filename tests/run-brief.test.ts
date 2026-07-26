@@ -203,7 +203,7 @@ describe("buildRunBriefViewModel", () => {
       "  branch: matt-auto/42/ticket-43/r1",
     ]);
     expect(brief.sections.find((s) => s.id === "controls")?.lines.join("\n")).toContain(
-      "Ctrl+Alt+M",
+      "Ctrl+Shift+X",
     );
     // Missing optional sections are absent, not empty placeholders that throw.
     expect(ids).not.toContain("integration");
