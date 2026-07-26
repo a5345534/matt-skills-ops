@@ -69,8 +69,8 @@ Sibling directories outside the Workflow root that hold Integration and Implemen
 _Avoid_: in-repo temporary worktrees
 
 **Workflow cleanup**:
-The post-merge disposal of a completed workflow’s local workspaces, transcripts, and matching remote matt-auto branches. Local and remote cleanup stay paired so leftovers do not drift. After a Workflow PR merges, the default menu action cleans local and remote artifacts together.
-_Avoid_: local-only cleanup, orphan remote branches
+The post-merge disposal of a completed workflow’s local workspaces, transcripts, and matching remote matt-auto branches, then closing the parent Workflow spec issue (Workflow ID) with a completion comment. Local and remote branch cleanup stay paired so leftovers do not drift. Closing the parent is part of delivery completion; if close fails after artifacts are removed, cleanup still succeeds with a warning and the parent may be closed later. Matt Auto does not automatically `git pull` or reload the operator’s Pi session—it notifies them to pull and reload after cleanup.
+_Avoid_: local-only cleanup, orphan remote branches, leaving parent spec open after successful cleanup, silent git pull of the Workflow root
 
 **CI gate**:
 The GitHub Actions verification required before an integrated ticket can close and unblock dependents. Pending CI returns control to Workflow home; Matt Auto checks it only when a user requests the next action.

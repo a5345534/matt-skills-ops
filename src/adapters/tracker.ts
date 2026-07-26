@@ -618,17 +618,26 @@ export function createTrackerPort(cwd: string): TrackerPort {
       }
     },
 
-    async closeIssue(issueNumber) {
-      const result = await run(cwd, "gh", [
+    async closeIssue(issueNumber, options) {
+      const args = [
         "issue",
         "close",
         String(issueNumber),
         "--reason",
         "completed",
-      ]);
+      ];
+      if (options?.comment && options.comment.trim()) {
+        args.push("--comment", options.comment.trim());
+      }
+      const result = await run(cwd, "gh", args);
       if (result.code !== 0) {
+        const detail = (result.stderr || result.stdout || "").trim();
+        // Idempotent: already-closed parent is success for cleanup completion.
+        if (/already closed|not open|is closed/i.test(detail)) {
+          return;
+        }
         throw new Error(
-          result.stderr.trim() ||
+          detail ||
             `gh issue close failed for #${issueNumber} with exit code ${result.code}`,
         );
       }

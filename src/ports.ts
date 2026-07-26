@@ -389,8 +389,14 @@ export type TrackerPort = {
     parentIssueNumber: number,
     childIssueNumber: number,
   ): Promise<void>;
-  /** Close a GitHub issue after Integration unit + CI gate success. */
-  closeIssue(issueNumber: number): Promise<void>;
+  /**
+   * Close a GitHub issue (ticket after CI gate, or parent Workflow spec after cleanup).
+   * Optional comment is posted with the close when supported by gh.
+   */
+  closeIssue(
+    issueNumber: number,
+    options?: { comment?: string },
+  ): Promise<void>;
   /**
    * Reopen a closed GitHub issue for a pre-merge Rework attempt.
    * Does not mutate completed workflow history after a Workflow PR merges.

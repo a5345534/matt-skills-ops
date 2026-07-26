@@ -450,6 +450,10 @@ export type StageResult =
       cleanedLocal?: boolean;
       /** True when paired cleanup removed matching remote matt-auto branches. */
       cleanedRemote?: boolean;
+      /** True when cleanup closed the parent Workflow spec issue (Workflow ID). */
+      parentSpecClosed?: boolean;
+      /** Soft-fail detail when parent close failed after artifact cleanup. */
+      parentSpecCloseWarning?: string;
       /** Original Workflow ID when a Follow-up workflow was created. */
       followUpOf?: number;
       /** True when this Stage result is a pre-merge Rework attempt. */

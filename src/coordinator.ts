@@ -3762,6 +3762,28 @@ export function createWorkflowCoordinator(
     };
     await bound.preferences.clearActiveWorkflowId(active.targetBranch);
 
+    // Close parent Workflow spec (Workflow ID) — part of delivery completion.
+    // Soft-fail: artifacts are already gone; do not fail cleanup if close fails.
+    let parentSpecClosed = false;
+    let parentSpecCloseWarning: string | undefined;
+    const closeComment = [
+      `Workflow #${active.workflowId} cleanup completed.`,
+      active.workflowPr
+        ? `Workflow PR #${active.workflowPr.number}${active.workflowPr.url ? ` (${active.workflowPr.url})` : ""} merged; local workspaces/transcripts and remote matt-auto branches removed.`
+        : `Local workspaces/transcripts and remote matt-auto branches removed.`,
+      "Please `git pull` on the Workflow root and `/reload` Pi so your session picks up the merged work.",
+    ].join("\n\n");
+    try {
+      await bound.tracker.closeIssue(active.workflowId, {
+        comment: closeComment,
+      });
+      parentSpecClosed = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      parentSpecClosed = false;
+      parentSpecCloseWarning = message;
+    }
+
     return {
       status: "completed",
       stage: "cleanup",
@@ -3769,6 +3791,10 @@ export function createWorkflowCoordinator(
       removedBranches: remoteBranches,
       cleanedLocal: true,
       cleanedRemote: true,
+      parentSpecClosed,
+      ...(parentSpecCloseWarning
+        ? { parentSpecCloseWarning }
+        : {}),
       ...(active.workflowPr
         ? {
             workflowPrNumber: active.workflowPr.number,

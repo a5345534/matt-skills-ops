@@ -1439,20 +1439,31 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
         }
       }
       if (result.stage === "cleanup") {
+        const parentClosed =
+          "parentSpecClosed" in result ? result.parentSpecClosed : undefined;
+        const parentWarn =
+          "parentSpecCloseWarning" in result
+            ? result.parentSpecCloseWarning
+            : undefined;
         ui.notify(
           [
             `Workflow cleanup completed for #${result.workflowId}.`,
             result.cleanedLocal && result.cleanedRemote
               ? "Local workspaces/transcripts and remote matt-auto branches removed together."
               : undefined,
-            "GitHub issue/PR/manifest history retained.",
+            parentClosed === true
+              ? `Parent Workflow spec #${result.workflowId} closed.`
+              : parentClosed === false
+                ? `Parent Workflow spec #${result.workflowId} was not closed${parentWarn ? `: ${parentWarn}` : ""}. Close it manually if needed.`
+                : undefined,
+            "Please git pull on the Workflow root and /reload Pi to pick up merged work.",
             result.removedBranches?.length
               ? `Branches: ${result.removedBranches.join(", ")}.`
               : undefined,
           ]
             .filter(Boolean)
             .join(" "),
-          "info",
+          parentClosed === false ? "warning" : "info",
         );
         return;
       }

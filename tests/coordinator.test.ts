@@ -650,6 +650,7 @@ type TrackerState = {
   createIssueCalls: number;
   writeManifestCalls: number;
   closeIssueCalls: number[];
+  closeIssueComments: Array<{ number: number; comment: string }>;
   reopenIssueCalls: number[];
   createPrCalls: Array<{ head: string; base: string; title: string }>;
   mergePrCalls: number[];
@@ -680,6 +681,7 @@ function createTracker(
     createIssueCalls: 0,
     writeManifestCalls: 0,
     closeIssueCalls: [],
+    closeIssueComments: [],
     reopenIssueCalls: [],
     createPrCalls: [],
     mergePrCalls: [],
@@ -818,8 +820,14 @@ function createTracker(
       }
       return tickets;
     },
-    closeIssue: async (issueNumber) => {
+    closeIssue: async (issueNumber, options) => {
       state.closeIssueCalls.push(issueNumber);
+      if (options?.comment) {
+        state.closeIssueComments.push({
+          number: issueNumber,
+          comment: options.comment,
+        });
+      }
       const issue = state.issues.find((i) => i.number === issueNumber);
       if (issue) issue.state = "CLOSED";
     },
@@ -3877,7 +3885,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(ids).toEqual([CLEANUP_WORKFLOW_ACTION.id]);
   });
 
-  it("pairs local and remote matt-auto cleanup after merge and retains GitHub history", async () => {
+  it("pairs local and remote matt-auto cleanup after merge and closes the parent Workflow spec", async () => {
     const fixture = await driveAllTicketsComplete();
     const { coordinator, tracker, workspace, remoteGit, transcripts } = fixture;
     await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
@@ -3890,6 +3898,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
       workflowId: 42,
       cleanedLocal: true,
       cleanedRemote: true,
+      parentSpecClosed: true,
     });
     expect(workspace.state.cleanupCalls).toEqual([42]);
     expect(remoteGit.state.deleted).toHaveLength(1);
@@ -3900,8 +3909,19 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(deleted).toContain("matt-auto/42/ticket-45/r1");
     expect(transcripts.cleanupCalls).toEqual([42]);
 
-    // GitHub issue / PR / manifest history retained.
-    expect(tracker.state.issues.find((i) => i.number === 42)).toBeDefined();
+    // Parent Workflow spec closed with a completion comment; PR/manifest retained.
+    expect(tracker.state.closeIssueCalls).toContain(42);
+    expect(
+      tracker.state.closeIssueComments.some(
+        (c) =>
+          c.number === 42 &&
+          c.comment.includes("git pull") &&
+          c.comment.includes("/reload"),
+      ),
+    ).toBe(true);
+    expect(tracker.state.issues.find((i) => i.number === 42)?.state).toBe(
+      "CLOSED",
+    );
     expect(tracker.state.pullRequests).toHaveLength(1);
     expect(tracker.state.manifests.get(42)?.stage).toBe("completed");
     expect(tracker.state.manifests.get(42)?.workflowPr?.number).toBe(500);
@@ -3911,6 +3931,31 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     const ids = (await coordinator.nextActions()).map((a) => a.id);
     expect(ids).toContain(CREATE_SPEC_ACTION.id);
     expect(ids).toContain(START_FOLLOW_UP_ACTION.id);
+  });
+
+  it("soft-fails parent close after artifact cleanup without failing Cleanup", async () => {
+    const fixture = await driveAllTicketsComplete();
+    const { coordinator, tracker } = fixture;
+    await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+
+    const originalClose = tracker.port.closeIssue.bind(tracker.port);
+    tracker.port.closeIssue = async () => {
+      throw new Error("gh API rate limited");
+    };
+
+    const cleaned = await coordinator.runNextAction(CLEANUP_WORKFLOW_ACTION.id);
+    expect(cleaned).toMatchObject({
+      status: "completed",
+      stage: "cleanup",
+      workflowId: 42,
+      cleanedLocal: true,
+      cleanedRemote: true,
+      parentSpecClosed: false,
+      parentSpecCloseWarning: "gh API rate limited",
+    });
+
+    tracker.port.closeIssue = originalClose;
   });
 
   it("creates a fresh numbered Rework attempt workspace for a closed ticket before merge", async () => {
