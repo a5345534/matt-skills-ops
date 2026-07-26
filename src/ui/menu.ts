@@ -75,13 +75,25 @@ import {
  * Picks the first matching priority class; returns undefined only when a human
  * must choose among unrelated actions.
  */
+function isReworkNextAction(action: NextAction): boolean {
+  return action.id.startsWith(REWORK_TICKET_ACTION_PREFIX);
+}
+
+/**
+ * Auto-advance picker for `/matt-auto run`.
+ *
+ * Never auto-selects Rework: Auto-Close leaves integrated tickets closed, and
+ * auto-Rework would reopen them forever (close → rework → implement → close).
+ * Rework stays available on the interactive Next menu only.
+ */
 export function selectPipelineAction(
   nextActions: readonly NextAction[],
 ): NextAction | undefined {
   // ticket-progress is informational only — never auto-run it or the pipeline
   // will "review tickets" and stall / bounce back to the main menu.
+  // Rework is operator-only — never auto-advance it.
   const actionable = nextActions.filter(
-    (a) => a.id !== TICKET_PROGRESS_ACTION.id,
+    (a) => a.id !== TICKET_PROGRESS_ACTION.id && !isReworkNextAction(a),
   );
   if (actionable.length === 0) return undefined;
   if (actionable.length === 1) return actionable[0];
@@ -102,8 +114,6 @@ export function selectPipelineAction(
   if (inFlight.length === 1) return inFlight[0];
 
   // Prefer continuing an in-flight workflow over opening a new Create-spec.
-  // Rework before Implement: reopening an upstream ticket must win over
-  // launching dependents that only look ready because the blocker was closed.
   return (
     inFlight.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
     inFlight.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
@@ -113,7 +123,6 @@ export function selectPipelineAction(
     inFlight.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
     inFlight.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
     inFlight.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
-    inFlight.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX)) ??
     inFlight.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
     // Create-spec alone among remaining options (e.g. with implement) still auto.
     inFlight.find((a) => a.id === CREATE_SPEC_ACTION.id)
@@ -1564,11 +1573,51 @@ export async function runPostGrillPipeline(
 
     let action = preferred;
     if (!action) {
-      // Only informational rows (ticket-progress) or unrecognized mix.
+      // Only informational rows, rework-only, or unrecognized mix.
       const actionable = nextActions.filter(
         (a) => a.id !== TICKET_PROGRESS_ACTION.id,
       );
-      if (actionable.length === 0) {
+      const autoActionable = actionable.filter((a) => !isReworkNextAction(a));
+      if (autoActionable.length === 0) {
+        // Rework is operator-only. If workers are still live, wait; else stop
+        // without reopening closed integrated tickets (prevents rework loops).
+        if (actionable.some(isReworkNextAction)) {
+          const panel = await coordinator.getPanelState();
+          if (hasLivePipelineWork(panel)) {
+            log("info", "pipeline:wait-workers", {
+              reason: "rework-not-auto",
+              workers: panel?.workers.map((w) => ({
+                ticketNumber: w.ticketNumber,
+                status: w.status,
+              })),
+            });
+            const waitResult = await waitForPipelineWorkers(coordinator, ui);
+            if (waitResult.status === "terminated") {
+              log("info", "pipeline:stop", {
+                reason: "run-terminated",
+                step,
+                mode: waitResult.result.mode,
+              });
+              return;
+            }
+            continue;
+          }
+          ui.notify(
+            [
+              "Pipeline stopped: only Rework actions remain, and Rework is not auto-advanced.",
+              "Closed integrated tickets stay closed so Auto-Close cannot loop into Rework.",
+              "Use /matt-auto next to rework a ticket deliberately, or wait for the ready frontier.",
+              ...actionable.map((a) => `• ${a.label} — ${a.description}`),
+            ].join("\n"),
+            "info",
+          );
+          log("info", "pipeline:stop", {
+            reason: "rework-not-auto",
+            step,
+            nextActions: nextActions.map((a) => a.id),
+          });
+          return;
+        }
         ui.notify(
           [
             "Pipeline paused: tickets exist but no ready frontier to implement.",
@@ -1586,14 +1635,14 @@ export async function runPostGrillPipeline(
       }
       const selected = await ui.select(
         "Pipeline: choose Next action",
-        actionable.map(formatNextActionLine),
+        autoActionable.map(formatNextActionLine),
       );
       if (!selected) {
         ui.notify("Pipeline paused.", "info");
         log("info", "pipeline:stop", { reason: "user-paused", step });
         return;
       }
-      action = actionable.find((a) => selected.startsWith(a.label));
+      action = autoActionable.find((a) => selected.startsWith(a.label));
       if (!action) return;
       log("info", "pipeline:user-choice", { id: action.id });
     } else {

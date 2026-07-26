@@ -675,8 +675,8 @@ describe("selectPipelineAction", () => {
     expect(chosen?.id).toBe("implement-ticket:12");
   });
 
-  it("prefers Rework over Implement so reopened blockers win over dependents", () => {
-    const chosen = selectPipelineAction([
+  it("never auto-selects Rework (operator-only; prevents close→rework loops)", () => {
+    const withImplement = selectPipelineAction([
       {
         id: "implement-ticket:282",
         label: "Implement #282",
@@ -688,7 +688,21 @@ describe("selectPipelineAction", () => {
         description: "blocker",
       },
     ]);
-    expect(chosen?.id).toBe("rework-ticket:281");
+    expect(withImplement?.id).toBe("implement-ticket:282");
+
+    const reworkOnly = selectPipelineAction([
+      {
+        id: "rework-ticket:281",
+        label: "Rework #281",
+        description: "blocker",
+      },
+      {
+        id: "ticket-progress",
+        label: "Ticket progress",
+        description: "info",
+      },
+    ]);
+    expect(reworkOnly).toBeUndefined();
   });
 
   it("does not auto-pick Create-spec when Start Follow-up is also offered (post-cleanup)", () => {
