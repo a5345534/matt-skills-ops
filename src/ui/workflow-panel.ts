@@ -1,5 +1,9 @@
 import type { WorkflowPanelState } from "../types.js";
-import { deriveContextLabel } from "./run-brief.js";
+import { deriveContextLabel, formatRuntimeMs } from "./run-brief.js";
+
+function formatCompactRuntime(ms: number): string {
+  return formatRuntimeMs(ms);
+}
 
 /**
  * Compact secondary Workflow panel view-model.
@@ -89,43 +93,49 @@ export function buildCompactWorkflowPanel(
     );
   }
 
-  // Compact issue list: every ticket + status (same DTO as full brief).
+  // Compact issue table (same columns as full brief, narrower title via shared formatter).
   if (panel.ticketProgress) {
     const progress = panel.ticketProgress;
     const items =
       progress.items && progress.items.length > 0
-        ? progress.items
-        : [
-            ...progress.ready.map((t) => ({
-              number: t.number,
-              title: t.title,
-              status: "ready" as const,
-            })),
-            ...progress.blocked.map((t) => ({
-              number: t.number,
-              title: t.title,
-              status: "blocked" as const,
-            })),
-            ...progress.awaitingCi.map((t) => ({
-              number: t.number,
-              title: t.title,
-              status: "awaiting-ci" as const,
-            })),
-          ].sort((a, b) => a.number - b.number);
+        ? [...progress.items].sort((a, b) => a.number - b.number)
+        : [];
     if (items.length > 0) {
       lines.push(
         `Tickets ${progress.ready.length}r/${progress.open}o/${progress.closed}c`,
       );
+      // Import-free compact rows: # STATUS RUNTIME READY title
       for (const item of items) {
         const worker = panel.workers.find(
           (w) => w.ticketNumber === item.number,
         );
-        const label = worker ? worker.status : item.status;
+        const ready =
+          item.status === "blocked"
+            ? item.openBlockers?.length
+              ? `blk #${item.openBlockers.join(",")}`
+              : "blocked"
+            : item.status === "ready" || item.status === "awaiting-ci"
+              ? "ready"
+              : "—";
+        let status: string = item.status;
+        if (item.status === "closed") status = "closed";
+        else if (worker) {
+          status =
+            worker.status === "needs-disposition"
+              ? `needs-d r${worker.attempt}`
+              : `${worker.status} r${worker.attempt}`;
+        }
+        const runtime =
+          typeof worker?.runtimeMs === "number"
+            ? formatCompactRuntime(worker.runtimeMs)
+            : "—";
         const title =
-          item.title.length > 40
-            ? `${item.title.slice(0, 37)}…`
+          item.title.length > 28
+            ? `${item.title.slice(0, 27)}…`
             : item.title;
-        lines.push(`  #${item.number} [${label}] ${title}`);
+        lines.push(
+          `  ${("" + item.number).padStart(3)} ${ready.padEnd(10)} ${runtime.padEnd(7)} ${status.padEnd(14)} ${title}`,
+        );
       }
     }
   }

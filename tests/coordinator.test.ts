@@ -2657,6 +2657,8 @@ describe("Workflow coordinator single Implementation worker path", () => {
         processAlive: true,
         worktreePath: expect.stringContaining("ticket-43"),
         transcriptPath: expect.stringMatching(/ticket-43.*r1\.jsonl$/),
+        startedAtMs: expect.any(Number),
+        runtimeMs: expect.any(Number),
       },
     ]);
     expect(panel?.lines.some((l) => /Worker #43 r1: running/.test(l))).toBe(

@@ -240,6 +240,8 @@ type ActiveImplementationWorker = {
   summary?: string;
   /** OS pid of the `pi --mode json` child when known. */
   pid?: number;
+  /** Epoch ms when this attempt was launched (R1 runtime base). */
+  startedAtMs: number;
   /** True once a stage-result event was handled for this worker. */
   receivedStageResult: boolean;
 };
@@ -259,6 +261,8 @@ type ActiveConflictWorker = {
   progress?: string;
   /** OS pid of the conflict-resolution child when known. */
   pid?: number;
+  /** Epoch ms when this conflict worker was launched (R1 runtime base). */
+  startedAtMs: number;
   receivedStageResult: boolean;
 };
 
@@ -345,6 +349,8 @@ export function createWorkflowCoordinator(
    * must not continue the run loop. Cleared only by Resume or beginPipelineRun.
    */
   let pipelinePaused = false;
+  /** When set, worker runtime (R1) freezes at this epoch ms while paused. */
+  let pipelinePausedAtMs: number | undefined;
   /** Session-owned Run termination flag until the next explicit pipeline run. */
   let runTerminated = false;
   /** Last operator stop that affected the run loop (panel / brief surface). */
@@ -527,6 +533,7 @@ export function createWorkflowCoordinator(
           branchName,
           worktreePath,
           status: "needs-disposition",
+          startedAtMs: Date.now(),
           receivedStageResult: true,
           summary:
             history.summary ??
@@ -2123,6 +2130,7 @@ export function createWorkflowCoordinator(
         branchName,
         worktreePath,
         status: "needs-disposition",
+        startedAtMs: Date.now(),
         receivedStageResult: true,
         summary:
           plan.summary ??
@@ -2278,6 +2286,7 @@ export function createWorkflowCoordinator(
       branchName: workspace.branchName,
       worktreePath: workspace.worktreePath,
       status: "running",
+      startedAtMs: Date.now(),
       receivedStageResult: false,
     };
     activeWorker = worker;
@@ -2922,6 +2931,7 @@ export function createWorkflowCoordinator(
       integrationBranch: conflict.integrationBranch,
       integrationWorktreePath: conflict.integrationWorktreePath,
       status: "running",
+      startedAtMs: Date.now(),
       receivedStageResult: false,
     };
     activeConflictWorker = worker;
@@ -4145,6 +4155,7 @@ export function createWorkflowCoordinator(
 
   function beginPipelineRun(): void {
     pipelinePaused = false;
+    pipelinePausedAtMs = undefined;
     runTerminated = false;
     lastStopReason = undefined;
     lastTerminationMode = undefined;
@@ -4162,6 +4173,7 @@ export function createWorkflowCoordinator(
     });
 
     pipelinePaused = true;
+    pipelinePausedAtMs = Date.now();
     runTerminated = false;
     lastStopReason = "pipeline-pause";
     lastTerminationMode = undefined;
@@ -4175,6 +4187,7 @@ export function createWorkflowCoordinator(
 
   async function resumePipeline(): Promise<PipelineResumeResult> {
     pipelinePaused = false;
+    pipelinePausedAtMs = undefined;
     if (lastStopReason === "pipeline-pause") {
       lastStopReason = undefined;
     }
@@ -4331,6 +4344,7 @@ export function createWorkflowCoordinator(
     }
 
     pipelinePaused = false;
+    pipelinePausedAtMs = undefined;
     runTerminated = true;
     lastStopReason = "run-termination";
     lastTerminationMode = mode;
@@ -4408,6 +4422,7 @@ export function createWorkflowCoordinator(
       status: ImplementationWorkerStatus;
       progress?: string;
       pid?: number;
+      startedAtMs?: number;
     },
     bound: RootScopedPorts,
   ): WorkflowPanelState["workers"][number] {
@@ -4444,6 +4459,14 @@ export function createWorkflowCoordinator(
     if (worker.progress) {
       entry.progress = worker.progress;
     }
+    if (typeof worker.startedAtMs === "number") {
+      entry.startedAtMs = worker.startedAtMs;
+      const endMs =
+        pipelinePaused && typeof pipelinePausedAtMs === "number"
+          ? pipelinePausedAtMs
+          : Date.now();
+      entry.runtimeMs = Math.max(0, endMs - worker.startedAtMs);
+    }
     return entry;
   }
 
@@ -4467,6 +4490,7 @@ export function createWorkflowCoordinator(
               branchName: worker.branchName,
               worktreePath: worker.worktreePath,
               status: worker.status,
+              startedAtMs: worker.startedAtMs,
               ...(worker.progress ? { progress: worker.progress } : {}),
               ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
             },
@@ -4484,6 +4508,7 @@ export function createWorkflowCoordinator(
                 branchName: activeConflictWorker.integrationBranch,
                 worktreePath: activeConflictWorker.integrationWorktreePath,
                 status: activeConflictWorker.status,
+                startedAtMs: activeConflictWorker.startedAtMs,
                 ...(activeConflictWorker.progress
                   ? { progress: activeConflictWorker.progress }
                   : {}),

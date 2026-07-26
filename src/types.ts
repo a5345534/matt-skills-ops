@@ -268,6 +268,12 @@ export type WorkflowPanelState = {
     transcriptPath?: string;
     /** False when panel still says running but the OS process is gone. */
     processAlive?: boolean;
+    /** Epoch ms when this worker attempt was launched (for R1 runtime). */
+    startedAtMs?: number;
+    /**
+     * Elapsed ms for the current attempt (R1). Frozen while pipeline is paused.
+     */
+    runtimeMs?: number;
   }[];
   ticketProgress?: TicketProgressSummary;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */

@@ -143,14 +143,26 @@ describe("buildRunBriefViewModel", () => {
       "  matt-auto/42/integration → main",
       "  url: https://example.test/pr/99",
     ]);
-    expect(byId.tickets?.lines).toEqual([
+    expect(byId.tickets?.lines[0]).toBe(
       "Summary: 1 ready / 3 open / 1 closed (total 4)",
-      "Issues:",
-      "  #40 [closed] Closed ticket",
-      "  #41 [ci:awaiting-check r1] Awaiting",
-      "  #45 [ready] Ready ticket",
-      "  #46 [blocked (by #45)] Blocked",
-    ]);
+    );
+    expect(byId.tickets?.lines[1]).toMatch(/^#\s+READY\/BLOCK/);
+    expect(byId.tickets?.lines[2]).toMatch(/^-+/);
+    // Aligned table rows (S1 by number; R1 runtime only when worker present).
+    const ticketBody = byId.tickets?.lines.slice(3).join("\n") ?? "";
+    expect(ticketBody).toContain("#40");
+    expect(ticketBody).toContain("closed");
+    expect(ticketBody).toContain("Closed ticket");
+    expect(ticketBody).toContain("#41");
+    expect(ticketBody).toMatch(/awaiting-ci|ci:awaiting/);
+    expect(ticketBody).toContain("#45");
+    expect(ticketBody).toMatch(/ready/);
+    expect(ticketBody).toContain("#46");
+    expect(ticketBody).toMatch(/blocked by #45/);
+    // Column alignment: header and first data row same length structure
+    const header = byId.tickets!.lines[1]!;
+    const row = byId.tickets!.lines[3]!;
+    expect(row.length).toBe(header.length);
     expect(byId.stop?.lines).toEqual(["Last stop: pipeline pause"]);
 
     // Flat lines include section titles and are free of invented dashboard chrome.

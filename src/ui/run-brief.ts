@@ -302,9 +302,20 @@ function workflowPrSection(
   };
 }
 
+/** Column widths for monospaced ticket table (S1 by #, five columns). */
+const COL = {
+  num: 6,
+  ready: 18,
+  runtime: 8,
+  status: 16,
+  title: 36,
+} as const;
+
 /**
- * List every workflow issue with status. Live workers / integration / CI
- * overlays refine tracker status when present.
+ * List every workflow issue as an aligned table:
+ * # | READY/BLOCK | RUNTIME | STATUS | TITLE
+ * Sort: issue number ascending (S1).
+ * RUNTIME: R1 current attempt elapsed (from panel worker.runtimeMs).
  */
 function ticketsSection(
   panel: WorkflowPanelState,
@@ -318,16 +329,17 @@ function ticketsSection(
 
   const items =
     progress.items && progress.items.length > 0
-      ? progress.items
+      ? [...progress.items].sort((a, b) => a.number - b.number)
       : synthesizeItemsFromBuckets(progress);
 
   if (items.length === 0) {
     return { id: "tickets", title: "Tickets", lines };
   }
 
-  lines.push("Issues:");
+  lines.push(formatTicketTableHeader());
+  lines.push(formatTicketTableRule());
   for (const item of items) {
-    lines.push(formatTicketListLine(item, panel));
+    lines.push(formatTicketTableRow(item, panel));
   }
 
   return {
@@ -337,10 +349,46 @@ function ticketsSection(
   };
 }
 
+export function formatRuntimeMs(ms: number | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "—";
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m < 60) return `${m}m${String(s).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h${String(rm).padStart(2, "0")}m`;
+}
+
+function padCell(value: string, width: number): string {
+  const text = value.length > width ? `${value.slice(0, width - 1)}…` : value;
+  return text.padEnd(width, " ");
+}
+
+export function formatTicketTableHeader(): string {
+  return [
+    padCell("#", COL.num),
+    padCell("READY/BLOCK", COL.ready),
+    padCell("RUNTIME", COL.runtime),
+    padCell("STATUS", COL.status),
+    padCell("TITLE", COL.title),
+  ].join(" ");
+}
+
+export function formatTicketTableRule(): string {
+  return [
+    "-".repeat(COL.num),
+    "-".repeat(COL.ready),
+    "-".repeat(COL.runtime),
+    "-".repeat(COL.status),
+    "-".repeat(COL.title),
+  ].join(" ");
+}
+
 function synthesizeItemsFromBuckets(
   progress: NonNullable<WorkflowPanelState["ticketProgress"]>,
 ): NonNullable<WorkflowPanelState["ticketProgress"]>["items"][number][] {
-  // Backward-compatible fallback when older fixtures omit `items`.
   const items: NonNullable<
     WorkflowPanelState["ticketProgress"]
   >["items"][number][] = [];
@@ -372,7 +420,7 @@ function synthesizeItemsFromBuckets(
   return items.sort((a, b) => a.number - b.number);
 }
 
-function formatTicketListLine(
+export function formatTicketTableRow(
   item: NonNullable<
     WorkflowPanelState["ticketProgress"]
   >["items"][number],
@@ -385,36 +433,50 @@ function formatTicketListLine(
       : undefined;
   const ci = panel.ci?.find((c) => c.ticketNumber === item.number);
 
-  let statusLabel: string = item.status;
-  let extra = "";
+  // READY/BLOCK: tracker frontier only (not covered by running).
+  let readyBlock = "—";
+  if (item.status === "ready") readyBlock = "ready";
+  else if (item.status === "blocked") {
+    readyBlock = item.openBlockers?.length
+      ? `blocked by ${item.openBlockers.map((n) => `#${n}`).join(",")}`
+      : "blocked";
+  } else if (item.status === "awaiting-ci") {
+    readyBlock = "ready"; // integrated open tickets were ready to implement
+  }
 
-  // Closed GitHub issues stay "closed" even if stale CI rows remain on panel.
+  // RUNTIME: R1 current attempt only.
+  const runtime = formatRuntimeMs(worker?.runtimeMs);
+
+  // STATUS: lifecycle / live overlay.
+  let status: string = item.status;
   if (item.status === "closed" || item.state === "CLOSED") {
-    statusLabel = "closed";
+    status = "closed";
   } else if (worker) {
-    statusLabel = worker.status;
-    extra = ` r${worker.attempt}`;
-    if (worker.progress) {
-      extra += ` — ${worker.progress}`;
-    }
+    status =
+      worker.status === "needs-disposition"
+        ? `needs-disp r${worker.attempt}`
+        : `${worker.status} r${worker.attempt}`;
   } else if (integration) {
-    statusLabel = `integration:${integration.status}`;
-    extra = ` r${integration.attempt}`;
-    if (integration.reason) {
-      extra += ` — ${integration.reason}`;
-    }
+    status = `integrating r${integration.attempt}`;
   } else if (ci) {
-    statusLabel = `ci:${ci.status}`;
-    extra = ` r${ci.attempt}`;
-    if (ci.summary) {
-      extra += ` — ${ci.summary}`;
-    }
-  } else if (item.status === "blocked" && item.openBlockers?.length) {
-    extra = ` (by ${item.openBlockers.map((n) => `#${n}`).join(", ")})`;
+    status = `ci:${ci.status} r${ci.attempt}`;
+  } else if (item.status === "awaiting-ci") {
+    status = "awaiting-ci";
+  } else if (item.status === "ready") {
+    status = "ready";
+  } else if (item.status === "blocked") {
+    status = "blocked";
   }
 
   const title = item.title.trim() || "(no title)";
-  return `  #${item.number} [${statusLabel}${extra}] ${title}`;
+
+  return [
+    padCell(`#${item.number}`, COL.num),
+    padCell(readyBlock, COL.ready),
+    padCell(runtime, COL.runtime),
+    padCell(status, COL.status),
+    padCell(title, COL.title),
+  ].join(" ");
 }
 
 function stopSection(
