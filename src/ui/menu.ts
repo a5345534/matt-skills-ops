@@ -122,9 +122,9 @@ function sleep(ms: number): Promise<void> {
 
 /** Options for the pipeline worker wait / run-brief refresh loop. */
 export type WaitForPipelineWorkersOptions = {
-  /** Poll interval between panel refreshes. Defaults to 2000ms. */
+  /** Poll interval between panel refreshes. Defaults to 500ms. */
   pollIntervalMs?: number;
-  /** Max poll iterations. Defaults to 1800 (~1 hour at 2s). */
+  /** Max poll iterations. Defaults to 7200 (~1 hour at 0.5s). */
   maxTicks?: number;
   /** Injectable sleep (tests). Defaults to real wall-clock sleep. */
   sleep?: (ms: number) => Promise<void>;
@@ -528,8 +528,8 @@ export async function waitForPipelineWorkers(
   ui: MattAutoUi,
   options: WaitForPipelineWorkersOptions = {},
 ): Promise<WaitForPipelineWorkersResult> {
-  const pollIntervalMs = options.pollIntervalMs ?? 2000;
-  const maxTicks = options.maxTicks ?? 1800;
+  const pollIntervalMs = options.pollIntervalMs ?? 500;
+  const maxTicks = options.maxTicks ?? 7200;
   const sleepFn = options.sleep ?? sleep;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
@@ -677,8 +677,8 @@ export async function waitForPipelineWorkers(
         briefSections: brief.sections.map((s) => s.id),
         briefLines: brief.lines,
       };
-      // Periodic tracker metrics (every ~30s at 2s poll) for rate-limit diagnosis.
-      if (i === 0 || (i + 1) % 15 === 0) {
+      // Periodic tracker metrics (every ~30s at 0.5s poll) for rate-limit diagnosis.
+      if (i === 0 || (i + 1) % 60 === 0) {
         tickPayload.trackerGh = getTrackerGhMetrics();
       }
       log("debug", "pipeline:wait-workers-tick", tickPayload);
