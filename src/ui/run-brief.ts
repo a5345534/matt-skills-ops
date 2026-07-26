@@ -176,6 +176,9 @@ export function deriveContextLabel(panel: WorkflowPanelState): string | undefine
   if (panel.integration?.status === "conflict-resolution") {
     return `Conflict resolution #${panel.integration.ticketNumber} r${panel.integration.attempt}`;
   }
+  if (panel.integration?.status === "running") {
+    return `Integrating #${panel.integration.ticketNumber} r${panel.integration.attempt}`;
+  }
   if (panel.integration?.status === "pending-retry") {
     return `Integration pending retry #${panel.integration.ticketNumber} r${panel.integration.attempt}`;
   }
