@@ -627,6 +627,25 @@ describe("waitForPipelineWorkers", () => {
     );
     expect(result).toEqual({ status: "settled" });
   });
+
+  it("defaults to a select menu with Keep waiting / Pause / Terminate (not shortcuts-only)", async () => {
+    const ui = mockUi();
+    const coordinator = controlCoordinator(() =>
+      basePanel({ workers: [runningWorker()] }),
+    );
+    await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 1,
+      sleep: async () => undefined,
+      // offerRunningControls omitted — default must be menu options
+    });
+    expect(ui.selects.length).toBeGreaterThan(0);
+    const options = ui.selects[0]!.options;
+    expect(options).toContain("Keep waiting (refresh brief)");
+    expect(options).toContain("Pause pipeline…");
+    expect(options).toContain("Terminate run…");
+    expect(ui.notices.some((n) => n.includes("control menu"))).toBe(true);
+  });
 });
 
 describe("run brief Pause / Resume / Terminate confirms", () => {

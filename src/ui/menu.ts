@@ -142,9 +142,10 @@ export type WaitForPipelineWorkersOptions = {
   /** Injectable sleep (tests). Defaults to real wall-clock sleep. */
   sleep?: (ms: number) => Promise<void>;
   /**
-   * When true, every running tick opens the blocking Pause/Terminate menu
-   * (legacy / tests). Default false: auto-poll continuously; Pause/Terminate
-   * while running come from `queuePipelineWaitControl` (shortcuts).
+   * When true (default), every running tick opens a select menu with
+   * Keep waiting / Pause / Terminate so operators do not depend on shortcuts.
+   * Shortcuts and the run-control file still work as secondary paths.
+   * Set false only for pure auto-poll (tests / headless).
    */
   offerRunningControls?: boolean;
 };
@@ -252,7 +253,8 @@ export type RunBriefCoordinator = Pick<
 // --- Run brief controls (Pause / Resume / Terminate) ---
 // Only controls on the full-screen brief; each requires explicit confirmation.
 
-const CONTINUE_WAITING_ITEM = "Continue waiting";
+/** Primary wait control: refresh brief and poll again (does not stop the run). */
+const CONTINUE_WAITING_ITEM = "Keep waiting (refresh brief)";
 const PAUSE_PIPELINE_ITEM = "Pause pipeline…";
 const RESUME_PIPELINE_ITEM = "Resume pipeline…";
 const TERMINATE_RUN_ITEM = "Terminate run…";
@@ -595,8 +597,8 @@ async function presentRunBriefControlMenu(
 
   const selected = await ui.select(
     paused
-      ? `Run brief controls (Workflow #${panel.workflowId} · paused)`
-      : `Run brief controls (Workflow #${panel.workflowId})`,
+      ? `Matt Auto controls · Workflow #${panel.workflowId} · paused`
+      : `Matt Auto controls · Workflow #${panel.workflowId} · pick an option (not a shortcut)`,
     options,
   );
 
@@ -649,6 +651,9 @@ export async function waitForPipelineWorkers(
   const pollIntervalMs = options.pollIntervalMs ?? 500;
   const maxTicks = options.maxTicks ?? 7200;
   const sleepFn = options.sleep ?? sleep;
+  // Default ON: Pause/Terminate must be selectable options. Shortcuts alone
+  // failed in real terminals (Ctrl+Alt often never reaches the editor).
+  const offerRunningControls = options.offerRunningControls !== false;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
   // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
@@ -681,19 +686,29 @@ export async function waitForPipelineWorkers(
     });
   }
 
-  if (!options.offerRunningControls && !initialPaused) {
+  if (!initialPaused) {
     const controlPath = runControlFilePath(process.cwd());
-    ui.notify(
-      [
-        "Auto-waiting for workers — brief refreshes continuously (no Continue needed).",
-        "Stop controls (press in the editor; you should see an immediate notify):",
-        "  • Ctrl+Shift+X — Terminate (confirm)  ·  Ctrl+Shift+Z — Pause",
-        "  • Ctrl+Shift+O — control menu",
-        "  • Aliases: Ctrl+Alt+T / P / M (may not work in some terminals)",
-        `  • Reliable from another shell: echo terminate-now > ${controlPath}`,
-      ].join("\n"),
-      "info",
-    );
+    if (offerRunningControls) {
+      ui.notify(
+        [
+          "Waiting for workers — use the control menu (select an option):",
+          "  • Keep waiting (refresh brief)",
+          "  • Pause pipeline…  /  Terminate run…  (each asks for confirm)",
+          "Optional shortcuts: Ctrl+Shift+X terminate · Ctrl+Shift+Z pause",
+          `Shell fallback: echo terminate-now > ${controlPath}`,
+        ].join("\n"),
+        "info",
+      );
+    } else {
+      ui.notify(
+        [
+          "Auto-waiting (no control menu) — use shortcuts or the control file.",
+          "Ctrl+Shift+X terminate · Ctrl+Shift+Z pause",
+          `Shell: echo terminate-now > ${controlPath}`,
+        ].join("\n"),
+        "info",
+      );
+    }
   }
 
   // Home agent is often idle here — pi-ghostty will not spin. Mirror its
@@ -865,9 +880,8 @@ export async function waitForPipelineWorkers(
       }
       log("debug", "pipeline:wait-workers-tick", tickPayload);
 
-      // Continuous auto-wait by default (no "Continue waiting" gate).
-      // Optional blocking menu for tests / offerRunningControls.
-      // Shortcuts + run-control file queue pause/terminate/menu.
+      // Primary: select menu (Keep waiting / Pause / Terminate).
+      // Secondary: shortcuts + run-control file (consumed first if already queued).
       if (controls) {
         const queued =
           consumePendingWaitControl() ??
@@ -891,7 +905,7 @@ export async function waitForPipelineWorkers(
             continue;
           }
           // menu decline / pause cancel / continue → keep waiting
-        } else if (options.offerRunningControls) {
+        } else if (offerRunningControls) {
           const control = await presentRunBriefControlMenu(controls, ui, panel);
           if (control.action === "terminated") {
             const latest =
@@ -1424,8 +1438,8 @@ export async function runPostGrillPipeline(
     [
       "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement…",
       "Stage confirmation is auto-Publish; disposition is auto-Close.",
-      "Stop: Ctrl+Shift+X Terminate · Ctrl+Shift+Z Pause · Ctrl+Shift+O menu (immediate notify+confirm).",
-      `Reliable stop from another shell: echo terminate-now > ${controlPath}`,
+      "While workers run: select menu — Keep waiting / Pause / Terminate (not shortcuts).",
+      `Shell fallback: echo terminate-now > ${controlPath}`,
     ].join("\n"),
     "info",
   );

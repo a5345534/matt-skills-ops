@@ -508,9 +508,8 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
       id: "controls",
       title: "Controls",
       lines: [
-        "Paused — choose Resume or Terminate in the control menu.",
-        "Ctrl+Shift+X Terminate · Ctrl+Shift+O menu",
-        "Shell (reliable): echo terminate-now > .pi/matt-auto/run-control",
+        "Paused — use the select menu: Resume pipeline… / Terminate run…",
+        "Shell fallback: echo terminate-now > .pi/matt-auto/run-control",
       ],
     };
   }
@@ -518,9 +517,8 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
     id: "controls",
     title: "Controls",
     lines: [
-      "Ctrl+Shift+X — Terminate (confirm) · Ctrl+Shift+Z — Pause",
-      "Ctrl+Shift+O — open control menu",
-      "If shortcuts do nothing: echo terminate-now > .pi/matt-auto/run-control",
+      "Use the select menu below: Keep waiting / Pause / Terminate",
+      "(Shortcuts optional; shell: echo terminate-now > .pi/matt-auto/run-control)",
     ],
   };
 }
