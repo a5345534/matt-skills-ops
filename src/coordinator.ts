@@ -33,6 +33,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import { verifySubmoduleGitlinksReachable } from "./adapters/submodule-gate.js";
 import {
   assertValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
@@ -3355,6 +3356,37 @@ export function createWorkflowCoordinator(
         };
       }
 
+      // Fail closed: submodule gitlinks must exist on the submodule remote
+      // before parent pointer bumps can integrate (issue #30).
+      const submoduleGate = await verifySubmoduleGitlinksReachable(
+        integrationWorkspace.worktreePath,
+      );
+      if (!submoduleGate.ok) {
+        const reason = submoduleGate.reason;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "submodule-gate",
+          ...(submoduleGate.path ? { submodulePath: submoduleGate.path } : {}),
+          ...(submoduleGate.sha ? { submoduleSha: submoduleGate.sha } : {}),
+          ...(submoduleGate.remote ? { submoduleRemote: submoduleGate.remote } : {}),
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+      if (submoduleGate.checked.length > 0) {
+        await bound.transcripts.append(transcriptKey, {
+          type: "submodule-gate",
+          checked: submoduleGate.checked,
+        });
+      }
+
       // Local verification before any remote write.
       const verification = await bound.verification.runLocalVerification(
         integrationWorkspace.worktreePath,
@@ -3980,6 +4012,43 @@ export function createWorkflowCoordinator(
           "Cannot merge the Workflow PR while tickets remain open or awaiting CI. Finish or Rework tickets first.",
         workflowId: active.workflowId,
         workflowPrNumber: active.workflowPr.number,
+      };
+    }
+
+    // Re-check submodule pointers on the Integration branch before merge (#30).
+    try {
+      const targetBranch = await resolveTargetBranch(bound.preferences);
+      const integrationWorkspace =
+        await bound.workspace.ensureIntegrationWorkspace({
+          workflowId: active.workflowId,
+          baseRef: active.integrationBranch ?? targetBranch,
+        });
+      const submoduleGate = await verifySubmoduleGitlinksReachable(
+        integrationWorkspace.worktreePath,
+      );
+      if (!submoduleGate.ok) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: `Cannot merge Workflow PR #${active.workflowPr.number}: ${submoduleGate.reason}`,
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+          ...(active.workflowPr.url
+            ? { workflowPrUrl: active.workflowPr.url }
+            : {}),
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: `Cannot merge Workflow PR #${active.workflowPr.number}: submodule gate failed to run: ${message}`,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
       };
     }
 
