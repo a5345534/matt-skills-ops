@@ -218,12 +218,20 @@ export type ImplementationAttemptRef = {
   workerId: string;
 };
 
-/** Compact passive Workflow panel snapshot while background work is running. */
+/**
+ * Compact passive Workflow panel snapshot while background work is running.
+ * Structured fields are the single source of truth for both the full-screen run
+ * brief and the secondary compact Workflow panel (same DTO; no panel-only GitHub reads).
+ */
 export type WorkflowPanelState = {
   workflowId: number;
   /** Spec issue title when known (Active workflow recovery). */
   title?: string;
-  /** Compact passive lines for a Pi TUI widget (not an interactive dashboard). */
+  /**
+   * Coordinator-built compact lines (legacy/summary).
+   * UI surfaces prefer `buildCompactWorkflowPanel` / `buildRunBriefViewModel` from
+   * the structured fields so panel and brief stay on one derivation path.
+   */
   lines: readonly string[];
   workers: readonly {
     ticketNumber: number;

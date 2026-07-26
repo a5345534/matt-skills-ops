@@ -36,14 +36,25 @@ function runningWorker(
   };
 }
 
-function mockUi(): MattAutoUi & { notices: string[] } {
+function mockUi(
+  extras: Partial<MattAutoUi> = {},
+): MattAutoUi & {
+  notices: string[];
+  widgetCalls: Array<{ key: string; content: string[] | undefined }>;
+  statusCalls: Array<{ key: string; text: string | undefined }>;
+} {
   const notices: string[] = [];
+  const widgetCalls: Array<{ key: string; content: string[] | undefined }> = [];
+  const statusCalls: Array<{ key: string; text: string | undefined }> = [];
   return {
     notices,
+    widgetCalls,
+    statusCalls,
     select: async () => undefined,
     notify: (message) => {
       notices.push(message);
     },
+    ...extras,
   };
 }
 
@@ -205,5 +216,68 @@ describe("waitForPipelineWorkers", () => {
 
     expect(sleeps).toBe(3);
     expect(ui.notices.at(-1)).toMatch(/Timed out waiting for workers/i);
+  });
+
+  it("publishes secondary Workflow panel from the same panel DTO when TUI widgets exist", async () => {
+    const panels: WorkflowPanelState[] = [
+      basePanel({ workers: [runningWorker()] }),
+      basePanel({
+        workers: [
+          {
+            ticketNumber: 19,
+            attempt: 1,
+            status: "needs-disposition",
+            branchName: "matt-auto/42/ticket-19/r1",
+          },
+        ],
+      }),
+    ];
+    let call = 0;
+    const widgetCalls: Array<{ key: string; content: string[] | undefined }> =
+      [];
+    const statusCalls: Array<{ key: string; text: string | undefined }> = [];
+    const ui = mockUi({
+      setWidget: (key, content) => {
+        widgetCalls.push({ key, content });
+      },
+      setStatus: (key, text) => {
+        statusCalls.push({ key, text });
+      },
+    });
+
+    await waitForPipelineWorkers(
+      {
+        getPanelState: async () => panels[Math.min(call++, panels.length - 1)]!,
+      },
+      ui,
+      { pollIntervalMs: 1, maxTicks: 10, sleep: async () => undefined },
+    );
+
+    expect(widgetCalls.length).toBeGreaterThanOrEqual(2);
+    const published = widgetCalls.map((c) => (c.content ?? []).join("\n"));
+    expect(published.some((t) => t.includes("#19 r1: running · alive"))).toBe(
+      true,
+    );
+    expect(published.some((t) => t.includes("Workflow #42"))).toBe(true);
+    expect(statusCalls.some((c) => c.text?.includes("Workflow #42"))).toBe(
+      true,
+    );
+    // Full-screen brief remains primary (still notified).
+    expect(ui.notices.some((n) => n.includes("Workers"))).toBe(true);
+  });
+
+  it("does not throw when TUI widget APIs are absent during wait", async () => {
+    const ui = mockUi(); // no setWidget / setStatus
+    await expect(
+      waitForPipelineWorkers(
+        {
+          getPanelState: async () =>
+            basePanel({ workers: [runningWorker({ processAlive: true })] }),
+        },
+        ui,
+        { pollIntervalMs: 1, maxTicks: 1, sleep: async () => undefined },
+      ),
+    ).resolves.toBeUndefined();
+    expect(ui.notices.length).toBeGreaterThan(0);
   });
 });

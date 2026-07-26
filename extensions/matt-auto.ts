@@ -42,6 +42,7 @@ import {
   setMenuLogger,
   type MattAutoUi,
 } from "../src/ui/menu.js";
+import { clearWorkflowPanel } from "../src/ui/workflow-panel.js";
 
 type PlanningSession = {
   sendUserMessage: (text: string) => void;
@@ -309,6 +310,8 @@ function uiFrom(ctx: {
       placeholder?: string,
     ) => Promise<string | undefined>;
     editor?: (title: string, prefill?: string) => Promise<string | undefined>;
+    setWidget?: MattAutoUi["setWidget"];
+    setStatus?: MattAutoUi["setStatus"];
   };
 }): MattAutoUi {
   const ui: MattAutoUi = {
@@ -322,6 +325,15 @@ function uiFrom(ctx: {
   if (ctx.ui.editor) {
     const editor = ctx.ui.editor.bind(ctx.ui);
     ui.editor = (title, prefill) => editor(title, prefill);
+  }
+  // Secondary compact Workflow panel (optional TUI widgets/status). Absent APIs → no-op.
+  if (typeof ctx.ui.setWidget === "function") {
+    const setWidget = ctx.ui.setWidget.bind(ctx.ui);
+    ui.setWidget = (key, content, options) => setWidget(key, content, options);
+  }
+  if (typeof ctx.ui.setStatus === "function") {
+    const setStatus = ctx.ui.setStatus.bind(ctx.ui);
+    ui.setStatus = (key, text) => setStatus(key, text);
   }
   return ui;
 }
@@ -416,6 +428,9 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (coordinator) {
       await coordinator.abortWorkers();
+    }
+    if (activeUi) {
+      clearWorkflowPanel(activeUi);
     }
     coordinator = undefined;
     boundCwd = undefined;
