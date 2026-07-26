@@ -259,6 +259,218 @@ describe("waitForPipelineWorkers", () => {
     expect(ui.notices[0]).toContain("Needs disposition #19 r1");
   });
 
+  it("settles early when one worker needs disposition while another still runs (P1)", async () => {
+    // Sequence: initial both running → loop tick both running (sleep) →
+    // next tick P1 needs-disposition while peer still running (settle).
+    const panels: WorkflowPanelState[] = [
+      basePanel({
+        workers: [
+          runningWorker({ ticketNumber: 43, workerId: "implement-42-43-r1" }),
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+          }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          runningWorker({
+            ticketNumber: 43,
+            workerId: "implement-42-43-r1",
+            progress: "almost done",
+          }),
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+          }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          {
+            ticketNumber: 43,
+            attempt: 1,
+            status: "needs-disposition",
+            workerId: "implement-42-43-r1",
+            branchName: "matt-auto/42/ticket-43/r1",
+            worktreePath: "/workspaces/42/ticket-43/r1",
+          },
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+          }),
+        ],
+      }),
+    ];
+    let call = 0;
+    const coordinator = {
+      getPanelState: async () => panels[Math.min(call++, panels.length - 1)]!,
+    };
+    const ui = mockUi();
+    const sleep = vi.fn(async () => undefined);
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 10,
+      sleep,
+    });
+
+    expect(result).toEqual({ status: "settled" });
+    // One poll sleep while both running, then P1 settle — not wait for #44.
+    expect(sleep).toHaveBeenCalledTimes(1);
+    const joined = ui.notices.join("\n---\n");
+    expect(joined).toContain("#43 r1: needs-disposition");
+    expect(joined).toContain("#44 r1: running");
+  });
+
+  it("settles immediately when needs-disposition is already present with a running peer", async () => {
+    const coordinator = {
+      getPanelState: async () =>
+        basePanel({
+          workers: [
+            {
+              ticketNumber: 43,
+              attempt: 1,
+              status: "needs-disposition",
+              workerId: "implement-42-43-r1",
+              branchName: "matt-auto/42/ticket-43/r1",
+            },
+            runningWorker({
+              ticketNumber: 44,
+              workerId: "implement-42-44-r1",
+              pid: 9002,
+            }),
+          ],
+        }),
+    };
+    const ui = mockUi();
+    const sleep = vi.fn(async () => undefined);
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 5,
+      sleep,
+    });
+
+    expect(result).toEqual({ status: "settled" });
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("settles early when Integration is pending-retry while an Implementation worker still runs", async () => {
+    // initial running → loop running (sleep) → pending-retry + running (P1 settle)
+    const panels: WorkflowPanelState[] = [
+      basePanel({
+        workers: [
+          runningWorker({ ticketNumber: 44, workerId: "implement-42-44-r1" }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            progress: "peer still going",
+          }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          runningWorker({ ticketNumber: 44, workerId: "implement-42-44-r1" }),
+        ],
+        integration: {
+          ticketNumber: 43,
+          attempt: 1,
+          status: "pending-retry",
+          branchName: "matt-auto/42/ticket-43/r1",
+          reason: "Local verification failed",
+        },
+      }),
+    ];
+    let call = 0;
+    const coordinator = {
+      getPanelState: async () => panels[Math.min(call++, panels.length - 1)]!,
+    };
+    const ui = mockUi();
+    const sleep = vi.fn(async () => undefined);
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 10,
+      sleep,
+    });
+
+    expect(result).toEqual({ status: "settled" });
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("observes multiple running workers across ticks before they all settle", async () => {
+    // initial + two running ticks (2 sleeps) then empty settle.
+    const panels: WorkflowPanelState[] = [
+      basePanel({
+        workers: [
+          runningWorker({ ticketNumber: 43, workerId: "implement-42-43-r1" }),
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+          }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          runningWorker({
+            ticketNumber: 43,
+            workerId: "implement-42-43-r1",
+            progress: "still A",
+          }),
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+            progress: "still B",
+          }),
+        ],
+      }),
+      basePanel({
+        workers: [
+          runningWorker({
+            ticketNumber: 43,
+            workerId: "implement-42-43-r1",
+            progress: "still A2",
+          }),
+          runningWorker({
+            ticketNumber: 44,
+            workerId: "implement-42-44-r1",
+            pid: 9002,
+            progress: "still B2",
+          }),
+        ],
+      }),
+      basePanel({ workers: [] }),
+    ];
+    let call = 0;
+    const coordinator = {
+      getPanelState: async () => panels[Math.min(call++, panels.length - 1)]!,
+    };
+    const ui = mockUi();
+    const sleep = vi.fn(async () => undefined);
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 10,
+      sleep,
+    });
+
+    expect(result).toEqual({ status: "settled" });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    const joined = ui.notices.join("\n---\n");
+    expect(joined).toContain("#43 r1: running");
+    expect(joined).toContain("#44 r1: running");
+  });
+
   it("settles on empty running set without blocking", async () => {
     const coordinator = {
       getPanelState: async () => basePanel({ workers: [] }),
