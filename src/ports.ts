@@ -127,6 +127,18 @@ export type WorkspacePort = {
     baseRef: string;
   }): Promise<{ branchName: string; worktreePath: string }>;
   /**
+   * Ensure an Implementation workspace exists for an existing (or recoverable) attempt.
+   * Reattaches a worktree when the attempt branch already exists; creates branch+worktree
+   * from baseRef only when neither is present. Used when Resume / re-implement reuses the
+   * latest unintegrated attempt instead of opening blind rN+1.
+   */
+  ensureImplementationWorkspace(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    baseRef: string;
+  }): Promise<{ branchName: string; worktreePath: string }>;
+  /**
    * Highest existing attempt number for a ticket under this Workflow ID, or 0 if none.
    */
   latestAttempt(workflowId: number, ticketNumber: number): Promise<number>;
