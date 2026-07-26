@@ -46,6 +46,13 @@ export {
   isValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
 } from "./adapters/preferences.js";
+export {
+  canLaunchImplementationWorker,
+  computeImplementationSlots,
+  countRunningImplementationWorkers,
+  implementationLaunchBlockReason,
+} from "./launch-rules.js";
+export type { ImplementationLaunchBlockReason } from "./launch-rules.js";
 export type {
   CiCheckResult,
   CiPort,
