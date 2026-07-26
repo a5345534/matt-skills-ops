@@ -10,7 +10,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -257,13 +257,198 @@ async function pathExists(p: string): Promise<boolean> {
 
 /**
  * True when the local submodule checkout contains the commit object.
+ * Requires `submoduleDir` to be its own git toplevel (does not walk up into
+ * a parent repo that happens to have fetched the object).
  */
 export async function localHasCommit(
   submoduleDir: string,
   sha: string,
 ): Promise<boolean> {
+  const top = await run(submoduleDir, "git", ["rev-parse", "--show-toplevel"]);
+  if (top.code !== 0) return false;
+  if (path.resolve(top.stdout.trim()) !== path.resolve(submoduleDir)) {
+    return false;
+  }
   const result = await run(submoduleDir, "git", ["cat-file", "-t", sha]);
   return result.code === 0 && result.stdout.trim() === "commit";
+}
+
+/**
+ * Resolve the matt-auto-workspaces/<workflowId> root from an integration or
+ * ticket worktree path (best-effort).
+ */
+export function workflowWorkspaceRoot(
+  worktreePath: string,
+): string | undefined {
+  const normalized = path.resolve(worktreePath).replace(/\\/g, "/");
+  const marker = "/matt-auto-workspaces/";
+  const idx = normalized.indexOf(marker);
+  if (idx < 0) return undefined;
+  const after = normalized.slice(idx + marker.length);
+  const workflowId = after.split("/")[0];
+  if (!workflowId) return undefined;
+  return normalized.slice(0, idx + marker.length + workflowId.length);
+}
+
+/**
+ * Find a local git checkout that already has `sha` for the submodule path.
+ * Integration worktrees often only have the parent gitlink after merge while
+ * the commit object still lives under ticket-N/rM submodule checkouts.
+ */
+export async function findLocalRepoWithCommit(
+  worktreePath: string,
+  submodulePath: string,
+  sha: string,
+): Promise<string | undefined> {
+  const candidates: string[] = [path.join(worktreePath, submodulePath)];
+
+  const wsRoot = workflowWorkspaceRoot(worktreePath);
+  if (wsRoot) {
+    let entries: string[] = [];
+    try {
+      entries = await readdir(wsRoot);
+    } catch {
+      entries = [];
+    }
+    for (const entry of entries) {
+      if (entry === "integration") {
+        candidates.push(path.join(wsRoot, entry, submodulePath));
+        continue;
+      }
+      if (!entry.startsWith("ticket-")) continue;
+      const ticketDir = path.join(wsRoot, entry);
+      let attempts: string[] = [];
+      try {
+        attempts = await readdir(ticketDir);
+      } catch {
+        continue;
+      }
+      for (const attempt of attempts) {
+        candidates.push(path.join(ticketDir, attempt, submodulePath));
+      }
+    }
+  }
+
+  // Also try the Workflow home checkout when worktrees sit beside the root.
+  // e.g. .../aos + .../matt-auto-workspaces/280 → .../aos/aos-core
+  if (wsRoot) {
+    const parentOfWorkspaces = path.dirname(path.dirname(wsRoot));
+    candidates.push(path.join(parentOfWorkspaces, submodulePath));
+  }
+
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    if (await localHasCommit(resolved, sha)) {
+      return resolved;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Best-effort: init submodule checkout and try to fetch `sha` from remote.
+ * Does not fail the gate by itself — caller still verifies localHasCommit.
+ */
+async function tryMaterializeSubmoduleCommit(
+  worktreePath: string,
+  submodulePath: string,
+  sha: string,
+  remoteUrl: string,
+): Promise<string | undefined> {
+  const submoduleDir = path.join(worktreePath, submodulePath);
+
+  // Init / update from parent (may leave empty dir if never populated).
+  await run(worktreePath, "git", [
+    "submodule",
+    "update",
+    "--init",
+    "--",
+    submodulePath,
+  ]);
+
+  if (await localHasCommit(submoduleDir, sha)) {
+    return submoduleDir;
+  }
+
+  // Ensure we have a gitdir to fetch into (clone if still empty).
+  const hasGit = await pathExists(path.join(submoduleDir, ".git")).then(
+    async (nested) =>
+      nested ||
+      (await pathExists(submoduleDir).then(async (dir) => {
+        if (!dir) return false;
+        const probe = await run(submoduleDir, "git", ["rev-parse", "--git-dir"]);
+        return probe.code === 0;
+      })),
+  );
+
+  if (!hasGit) {
+    // Empty placeholder dir — clone remote into place for fetch/push.
+    await run(worktreePath, "rm", ["-rf", submoduleDir]);
+    const clone = await run(worktreePath, "git", [
+      "clone",
+      remoteUrl,
+      submoduleDir,
+    ]);
+    if (clone.code !== 0) {
+      return undefined;
+    }
+  }
+
+  // Try fetching the exact SHA (works when remote already has it).
+  await run(submoduleDir, "git", ["fetch", remoteUrl, sha]);
+  if (await localHasCommit(submoduleDir, sha)) {
+    return submoduleDir;
+  }
+
+  // Fetch all tips then re-check (some hosts reject raw SHA fetch).
+  await run(submoduleDir, "git", ["fetch", remoteUrl]);
+  if (await localHasCommit(submoduleDir, sha)) {
+    return submoduleDir;
+  }
+
+  return undefined;
+}
+
+/**
+ * Resolve a local repo directory that contains `sha` and can push it.
+ * Prefers the worktree submodule checkout; falls back to ticket worktrees.
+ */
+export async function resolveRepoForSubmodulePush(input: {
+  worktreePath: string;
+  submodulePath: string;
+  sha: string;
+  remoteUrl: string;
+}): Promise<{ ok: true; repoDir: string } | { ok: false; reason: string }> {
+  const { worktreePath, submodulePath, sha, remoteUrl } = input;
+  const primary = path.join(worktreePath, submodulePath);
+
+  if (await localHasCommit(primary, sha)) {
+    return { ok: true, repoDir: primary };
+  }
+
+  const materialized = await tryMaterializeSubmoduleCommit(
+    worktreePath,
+    submodulePath,
+    sha,
+    remoteUrl,
+  );
+  if (materialized && (await localHasCommit(materialized, sha))) {
+    return { ok: true, repoDir: materialized };
+  }
+
+  const donor = await findLocalRepoWithCommit(worktreePath, submodulePath, sha);
+  if (donor) {
+    // Prefer pushing from the donor directly (has the object).
+    return { ok: true, repoDir: donor };
+  }
+
+  return {
+    ok: false,
+    reason: `Submodule "${submodulePath}" records SHA ${sha} which is not present on ${remoteUrl}, and no local checkout (integration or ticket worktree) contains that commit — cannot publish the gitlink.`,
+  };
 }
 
 /**
@@ -373,9 +558,25 @@ export async function ensureSubmoduleGitlinksPublished(
 
     let present = await remoteHasCommit(remote, link.sha, worktreePath);
     if (!present) {
-      const submoduleDir = path.join(worktreePath, link.path);
+      // Integration worktrees often only store the parent gitlink after merge;
+      // the commit object usually still lives in ticket-*/r*/<submodule>.
+      const resolved = await resolveRepoForSubmodulePush({
+        worktreePath,
+        submodulePath: link.path,
+        sha: link.sha,
+        remoteUrl: remote,
+      });
+      if (!resolved.ok) {
+        return {
+          ok: false,
+          reason: resolved.reason,
+          path: link.path,
+          sha: link.sha,
+          remote,
+        };
+      }
       const push = await pushSubmoduleCommit({
-        submoduleDir,
+        submoduleDir: resolved.repoDir,
         remoteUrl: remote,
         sha: link.sha,
       });
@@ -392,7 +593,7 @@ export async function ensureSubmoduleGitlinksPublished(
       if (!present) {
         return {
           ok: false,
-          reason: `Pushed submodule "${link.path}" commit ${link.sha} to ${remote} (${push.ref}) but the remote still does not advertise it — re-check credentials or try again.`,
+          reason: `Pushed submodule "${link.path}" commit ${link.sha} to ${remote} (${push.ref}) from ${resolved.repoDir} but the remote still does not advertise it — re-check credentials or try again.`,
           path: link.path,
           sha: link.sha,
           remote,

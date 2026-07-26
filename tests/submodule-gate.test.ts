@@ -6,11 +6,13 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   ensureSubmoduleGitlinksPublished,
+  findLocalRepoWithCommit,
   gitlinkPublishRef,
   listGitlinksAtHead,
   parseGithubRepo,
   remoteHasCommit,
   verifySubmoduleGitlinksReachable,
+  workflowWorkspaceRoot,
 } from "../src/adapters/submodule-gate.js";
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +141,76 @@ describe("ensureSubmoduleGitlinksPublished", () => {
     expect(again.published).toEqual([]);
   }, 30_000);
 
+  it("publishes from a sibling ticket worktree when integration checkout lacks the object", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "matt-submod-sib-"));
+    // Layout mirrors matt-auto-workspaces/<id>/
+    const ws = path.join(root, "matt-auto-workspaces", "280");
+    const bareChild = path.join(root, "child.git");
+    const ticketSub = path.join(ws, "ticket-283", "r1", "child");
+    const integration = path.join(ws, "integration");
+
+    await initBare(bareChild);
+
+    // Seed remote with base commit.
+    const seed = path.join(root, "seed");
+    await initRepo(seed);
+    await writeFile(path.join(seed, "README.md"), "seed\n");
+    await git(seed, ["add", "README.md"]);
+    await git(seed, ["commit", "-m", "seed"]);
+    await git(seed, ["remote", "add", "origin", bareChild]);
+    await git(seed, ["push", "-u", "origin", "main"]);
+    const baseSha = (await git(seed, ["rev-parse", "HEAD"])).stdout.trim();
+
+    // Ticket worktree submodule has a local-only commit (the real object).
+    await mkdir(path.dirname(ticketSub), { recursive: true });
+    await git(path.dirname(ticketSub), [
+      "clone",
+      bareChild,
+      ticketSub,
+    ]);
+    await writeFile(path.join(ticketSub, "feature.txt"), "from ticket\n");
+    await git(ticketSub, ["add", "feature.txt"]);
+    await git(ticketSub, ["commit", "-m", "ticket feature"]);
+    const ticketSha = (await git(ticketSub, ["rev-parse", "HEAD"])).stdout.trim();
+    expect(ticketSha).not.toBe(baseSha);
+
+    // Integration parent records the gitlink but has an EMPTY submodule dir
+    // (no object) — the failure mode from Workflow #280 / #283.
+    await initRepo(integration);
+    await writeFile(path.join(integration, "ROOT.md"), "parent\n");
+    await git(integration, ["add", "ROOT.md"]);
+    await git(integration, ["commit", "-m", "root"]);
+    await writeFile(
+      path.join(integration, ".gitmodules"),
+      `[submodule "child"]\n\tpath = child\n\turl = ${bareChild}\n`,
+    );
+    // Record gitlink without a populated checkout (update-index needs the object
+    // in this repo — fetch it from ticket into a temp alternate then add).
+    await git(integration, ["fetch", ticketSub, ticketSha]);
+    await git(integration, [
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${ticketSha},child`,
+    ]);
+    await git(integration, ["add", ".gitmodules"]);
+    await git(integration, ["commit", "-m", "ghost gitlink only"]);
+    // Leave child as empty directory (no checkout).
+    await mkdir(path.join(integration, "child"), { recursive: true });
+
+    expect(workflowWorkspaceRoot(integration)).toBe(ws);
+    expect(
+      await findLocalRepoWithCommit(integration, "child", ticketSha),
+    ).toBe(path.resolve(ticketSub));
+
+    const ensured = await ensureSubmoduleGitlinksPublished(integration);
+    expect(ensured.ok).toBe(true);
+    if (!ensured.ok) return;
+    expect(ensured.published).toHaveLength(1);
+    expect(ensured.published[0]?.sha).toBe(ticketSha);
+    expect(await remoteHasCommit(bareChild, ticketSha, integration)).toBe(true);
+  }, 30_000);
+
   it("fails closed when the submodule commit is not available locally either", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "matt-submod-miss-"));
     const bareChild = path.join(root, "child.git");
@@ -186,7 +258,9 @@ describe("ensureSubmoduleGitlinksPublished", () => {
     const ensured = await ensureSubmoduleGitlinksPublished(parent);
     expect(ensured.ok).toBe(false);
     if (ensured.ok) return;
-    expect(ensured.reason).toMatch(/does not contain commit|missing/i);
+    expect(ensured.reason).toMatch(
+      /no local checkout|does not contain commit|missing/i,
+    );
     expect(ensured.sha).toBe(orphanSha);
     // silence unused
     expect(ghostSha.length).toBe(40);
