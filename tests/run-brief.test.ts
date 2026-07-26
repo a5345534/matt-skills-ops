@@ -3,6 +3,7 @@ import {
   buildRunBriefViewModel,
   deriveContextLabel,
   formatRunBriefLines,
+  predictRunTerminationMode,
 } from "../src/ui/run-brief.js";
 import type { WorkflowPanelState } from "../src/types.js";
 
@@ -260,5 +261,75 @@ describe("buildRunBriefViewModel", () => {
     const brief = buildRunBriefViewModel(basePanel());
     expect(brief.sections.map((s) => s.id)).toEqual(["workflow", "pipeline"]);
     expect(brief.lines.length).toBeGreaterThan(0);
+  });
+});
+
+describe("predictRunTerminationMode", () => {
+  it("defaults to discard-unintegrated before any integrate/PR", () => {
+    expect(predictRunTerminationMode(basePanel())).toBe("discard-unintegrated");
+  });
+
+  it("is stop-only when a Workflow PR exists", () => {
+    expect(
+      predictRunTerminationMode(
+        basePanel({
+          workflowPr: {
+            number: 1,
+            status: "open",
+            baseBranch: "main",
+            headBranch: "matt-auto/42/integration",
+          },
+        }),
+      ),
+    ).toBe("stop-only");
+  });
+
+  it("is stop-only when CI or closed/awaiting-CI ticket progress shows integrate", () => {
+    expect(
+      predictRunTerminationMode(
+        basePanel({
+          ci: [
+            {
+              ticketNumber: 1,
+              attempt: 1,
+              status: "awaiting-check",
+              integrationBranch: "matt-auto/42/integration",
+            },
+          ],
+        }),
+      ),
+    ).toBe("stop-only");
+
+    expect(
+      predictRunTerminationMode(
+        basePanel({
+          ticketProgress: {
+            workflowId: 42,
+            total: 2,
+            open: 1,
+            closed: 1,
+            ready: [],
+            blocked: [],
+            awaitingCi: [],
+          },
+        }),
+      ),
+    ).toBe("stop-only");
+
+    expect(
+      predictRunTerminationMode(
+        basePanel({
+          ticketProgress: {
+            workflowId: 42,
+            total: 2,
+            open: 2,
+            closed: 0,
+            ready: [],
+            blocked: [],
+            awaitingCi: [{ number: 1, title: "Integrated" }],
+          },
+        }),
+      ),
+    ).toBe("stop-only");
   });
 });
