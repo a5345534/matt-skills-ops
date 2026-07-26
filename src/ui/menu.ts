@@ -49,6 +49,7 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+import { startGhosttyActivity } from "./ghostty-activity.js";
 import {
   buildRunBriefViewModel,
   predictRunTerminationMode,
@@ -498,122 +499,136 @@ export async function waitForPipelineWorkers(
     });
   }
 
-  for (let i = 0; i < maxTicks; i += 1) {
-    const panel = await coordinator.getPanelState();
-    if (!panel) {
-      log("info", "pipeline:workers-settled", {
-        ticks: i + 1,
-        reason: "no-panel",
-      });
-      return { status: "settled" };
-    }
+  // Home agent is often idle here — pi-ghostty will not spin. Mirror its
+  // braille title + OSC 9;4 progress while we wait on session-owned workers.
+  const activity = startGhosttyActivity(ui, {
+    cwd: process.cwd(),
+    detail: activityDetailFromPanel(initialPanel),
+  });
 
-    if (panel.runTerminated || controls?.isRunTerminated?.()) {
-      notifyRunBrief(ui, panel, "warning");
-      log("info", "pipeline:wait-terminated-observed", {
-        ticks: i + 1,
-        workflowId: panel.workflowId,
-      });
-      // Termination already applied (e.g. prior control); surface a synthetic result.
-      return {
-        status: "terminated",
-        result: {
-          mode: panel.terminationMode ?? "stop-only",
-          abortedWorkerCount: 0,
-          affectedAttempts: [],
-          discardedBranches: [],
-          discardedWorktrees: [],
-          runTerminated: true,
-        },
-      };
-    }
-
-    const paused =
-      panel.pipelinePaused === true ||
-      (controls?.isPipelinePaused?.() ?? false);
-    const running = runningWorkers(panel);
-
-    // Paused mode: keep the brief visible until Resume or Terminate.
-    if (paused) {
-      notifyRunBrief(ui, panel, "warning");
-      if (!controls) {
-        // Without control APIs we cannot leave paused mode here.
-        log("warn", "pipeline:paused-without-controls", {
-          workflowId: panel.workflowId,
+  try {
+    for (let i = 0; i < maxTicks; i += 1) {
+      const panel = await coordinator.getPanelState();
+      if (!panel) {
+        log("info", "pipeline:workers-settled", {
+          ticks: i + 1,
+          reason: "no-panel",
         });
         return { status: "settled" };
       }
-      const control = await presentRunBriefControlMenu(controls, ui, panel);
-      if (control.action === "terminated") {
-        const latest = (await coordinator.getPanelState()) ?? panel;
-        notifyRunBrief(ui, latest, "warning");
-        ui.notify(formatTerminateNotify(control.result), "warning");
-        return { status: "terminated", result: control.result };
+
+      activity.tick(activityDetailFromPanel(panel));
+
+      if (panel.runTerminated || controls?.isRunTerminated?.()) {
+        notifyRunBrief(ui, panel, "warning");
+        log("info", "pipeline:wait-terminated-observed", {
+          ticks: i + 1,
+          workflowId: panel.workflowId,
+        });
+        return {
+          status: "terminated",
+          result: {
+            mode: panel.terminationMode ?? "stop-only",
+            abortedWorkerCount: 0,
+            affectedAttempts: [],
+            discardedBranches: [],
+            discardedWorktrees: [],
+            runTerminated: true,
+          },
+        };
       }
-      if (control.action === "resumed") {
-        // Fall through: next loop iteration continues wait/auto-advance.
+
+      const paused =
+        panel.pipelinePaused === true ||
+        (controls?.isPipelinePaused?.() ?? false);
+      const running = runningWorkers(panel);
+
+      if (paused) {
+        notifyRunBrief(ui, panel, "warning");
+        if (!controls) {
+          log("warn", "pipeline:paused-without-controls", {
+            workflowId: panel.workflowId,
+          });
+          return { status: "settled" };
+        }
+        const control = await presentRunBriefControlMenu(controls, ui, panel);
+        if (control.action === "terminated") {
+          const latest = (await coordinator.getPanelState()) ?? panel;
+          notifyRunBrief(ui, latest, "warning");
+          ui.notify(formatTerminateNotify(control.result), "warning");
+          return { status: "terminated", result: control.result };
+        }
+        if (control.action === "resumed") {
+          continue;
+        }
         continue;
       }
-      // Decline / unchanged — re-show paused brief.
-      continue;
-    }
 
-    // Panel may list pendingDisposition as a "worker" with status
-    // needs-disposition — that is NOT still running. Only wait on live runs.
-    if (running.length === 0) {
-      notifyRunBrief(ui, panel);
-      log("info", "pipeline:workers-settled", {
-        ticks: i + 1,
-        panelWorkers: panelWorkerSnapshot(panel),
+      if (running.length === 0) {
+        notifyRunBrief(ui, panel);
+        log("info", "pipeline:workers-settled", {
+          ticks: i + 1,
+          panelWorkers: panelWorkerSnapshot(panel),
+        });
+        return { status: "settled" };
+      }
+
+      const brief = notifyRunBrief(ui, panel);
+      log("debug", "pipeline:wait-workers-tick", {
+        tick: i + 1,
+        runningCount: running.length,
+        running: running.map((w) => ({
+          ticketNumber: w.ticketNumber,
+          attempt: w.attempt,
+          workerId: w.workerId,
+          pid: w.pid,
+          processAlive: w.processAlive,
+          worktreePath: w.worktreePath,
+          transcriptPath: w.transcriptPath,
+          branchName: w.branchName,
+          progress: w.progress,
+        })),
+        briefSections: brief.sections.map((s) => s.id),
+        briefLines: brief.lines,
       });
-      return { status: "settled" };
+
+      if (controls) {
+        const control = await presentRunBriefControlMenu(controls, ui, panel);
+        if (control.action === "terminated") {
+          const latest = (await coordinator.getPanelState()) ?? panel;
+          notifyRunBrief(ui, latest, "warning");
+          ui.notify(formatTerminateNotify(control.result), "warning");
+          return { status: "terminated", result: control.result };
+        }
+        if (control.action === "paused") {
+          continue;
+        }
+      }
+
+      await sleepFn(pollIntervalMs);
     }
 
-    // Refresh the full brief so process-gone / progress stay visible.
-    const brief = notifyRunBrief(ui, panel);
-    log("debug", "pipeline:wait-workers-tick", {
-      tick: i + 1,
-      runningCount: running.length,
-      running: running.map((w) => ({
-        ticketNumber: w.ticketNumber,
-        attempt: w.attempt,
-        workerId: w.workerId,
-        pid: w.pid,
-        processAlive: w.processAlive,
-        worktreePath: w.worktreePath,
-        transcriptPath: w.transcriptPath,
-        branchName: w.branchName,
-        progress: w.progress,
-      })),
-      briefSections: brief.sections.map((s) => s.id),
-      briefLines: brief.lines,
-    });
-
-    // Offer Pause / Terminate (and Continue waiting) while workers run.
-    if (controls) {
-      const control = await presentRunBriefControlMenu(controls, ui, panel);
-      if (control.action === "terminated") {
-        const latest = (await coordinator.getPanelState()) ?? panel;
-        notifyRunBrief(ui, latest, "warning");
-        ui.notify(formatTerminateNotify(control.result), "warning");
-        return { status: "terminated", result: control.result };
-      }
-      if (control.action === "paused") {
-        // Stay in the wait loop; next iteration shows paused mode controls.
-        continue;
-      }
-      // continue / unchanged → poll again after interval
-    }
-
-    await sleepFn(pollIntervalMs);
+    ui.notify(
+      "Timed out waiting for workers. Re-run /matt-auto run to continue.",
+      "warning",
+    );
+    log("warn", "pipeline:wait-workers-timeout");
+    return { status: "timeout" };
+  } finally {
+    activity.stop();
   }
+}
 
-  ui.notify(
-    "Timed out waiting for workers. Re-run /matt-auto run to continue.",
-    "warning",
-  );
-  log("warn", "pipeline:wait-workers-timeout");
-  return { status: "timeout" };
+function activityDetailFromPanel(
+  panel: WorkflowPanelState | undefined,
+): string {
+  if (!panel) return "waiting";
+  if (panel.pipelinePaused) return "paused";
+  if (panel.runTerminated) return "terminated";
+  const running = runningWorkers(panel);
+  const w = running[0];
+  if (w) return `#${w.ticketNumber} r${w.attempt}`;
+  return `wf #${panel.workflowId}`;
 }
 
 /** Minimal UI surface needed by Matt Auto menus. */
@@ -647,6 +662,11 @@ export type MattAutoUi = {
    * When omitted, status publish is a graceful no-op.
    */
   setStatus?(key: string, text: string | undefined): void;
+  /**
+   * Optional window/tab title (Pi `setTitle`). Used with pi-ghostty-compatible
+   * braille spinner + OSC progress while Matt Auto waits on workers.
+   */
+  setTitle?(title: string): void;
 };
 
 const PREFLIGHT_HEADER = "--- Workflow preflight ---";

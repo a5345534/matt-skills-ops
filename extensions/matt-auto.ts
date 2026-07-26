@@ -312,6 +312,7 @@ function uiFrom(ctx: {
     editor?: (title: string, prefill?: string) => Promise<string | undefined>;
     setWidget?: MattAutoUi["setWidget"];
     setStatus?: MattAutoUi["setStatus"];
+    setTitle?: MattAutoUi["setTitle"];
   };
 }): MattAutoUi {
   const ui: MattAutoUi = {
@@ -334,6 +335,11 @@ function uiFrom(ctx: {
   if (typeof ctx.ui.setStatus === "function") {
     const setStatus = ctx.ui.setStatus.bind(ctx.ui);
     ui.setStatus = (key, text) => setStatus(key, text);
+  }
+  // Window/tab title for pi-ghostty-compatible busy spinner during worker waits.
+  if (typeof ctx.ui.setTitle === "function") {
+    const setTitle = ctx.ui.setTitle.bind(ctx.ui);
+    ui.setTitle = (title) => setTitle(title);
   }
   return ui;
 }
