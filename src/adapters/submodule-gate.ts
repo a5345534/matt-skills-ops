@@ -1,13 +1,16 @@
 /**
- * Fail-closed gate: submodule gitlinks (mode 160000) recorded in a worktree
- * must point at commits that exist on the submodule's configured remote.
+ * Fail-closed gate + dual-root publish for submodule gitlinks (mode 160000).
  *
- * Prevents parent-only pointer bumps from integrating when the submodule
- * commit was never pushed (matt-skills-ops #30).
+ * Before parent Integration / Workflow PR merge:
+ * 1. Ensure each gitlink SHA is on the submodule remote (push if local-only).
+ * 2. Fail closed if a SHA is still unreachable after the push attempt.
+ *
+ * Prevents parent-only pointer bumps when the submodule commit was never
+ * published (matt-skills-ops #30 / dual-root delivery).
  */
 
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -18,8 +21,32 @@ export type GitlinkEntry = {
   sha: string;
 };
 
+/** One submodule commit published by Matt Auto before Integration. */
+export type SubmodulePublishedEntry = {
+  path: string;
+  sha: string;
+  remote: string;
+  /** Remote ref that received the commit (object reachability). */
+  ref: string;
+};
+
 export type SubmoduleGateResult =
   | { ok: true; checked: readonly GitlinkEntry[] }
+  | {
+      ok: false;
+      reason: string;
+      path?: string;
+      sha?: string;
+      remote?: string;
+    };
+
+export type SubmoduleEnsureResult =
+  | {
+      ok: true;
+      checked: readonly GitlinkEntry[];
+      /** Commits that were missing on the remote and successfully pushed. */
+      published: readonly SubmodulePublishedEntry[];
+    }
   | {
       ok: false;
       reason: string;
@@ -143,34 +170,39 @@ export async function resolveSubmoduleRemoteUrl(
  * True when the remote advertises the commit object (or a ref that resolves to it).
  * Uses `git ls-remote <url> <sha>` which works for full SHAs on GitHub and most hosts.
  */
+function lsRemoteLineMatchesSha(line: string, sha: string): boolean {
+  const remoteSha = line.trim().split(/\s+/)[0]?.toLowerCase();
+  if (!remoteSha) return false;
+  const want = sha.toLowerCase();
+  return (
+    remoteSha === want ||
+    remoteSha.startsWith(want) ||
+    want.startsWith(remoteSha)
+  );
+}
+
 export async function remoteHasCommit(
   remoteUrl: string,
   sha: string,
   cwd: string,
 ): Promise<boolean> {
-  const fullSha = sha.length >= 40 ? sha : sha;
-  const result = await run(cwd, "git", ["ls-remote", remoteUrl, fullSha]);
-  if (result.code !== 0) {
-    // Fallback: try without explicit ref filter (slower; last resort)
-    const all = await run(cwd, "git", ["ls-remote", remoteUrl]);
-    if (all.code !== 0) return false;
-    return all.stdout.toLowerCase().includes(sha.toLowerCase());
-  }
-  // ls-remote prints "<sha>\t<ref>" when the object is known as a ref tip;
-  // for bare commit SHAs on GitHub, a matching first-column SHA means found.
-  for (const line of result.stdout.split("\n")) {
-    const remoteSha = line.trim().split(/\s+/)[0]?.toLowerCase();
-    if (!remoteSha) continue;
-    if (
-      remoteSha === sha.toLowerCase() ||
-      remoteSha.startsWith(sha.toLowerCase()) ||
-      sha.toLowerCase().startsWith(remoteSha)
-    ) {
-      return true;
+  // 1) Ask for the SHA as a ref name (works when a branch tip equals the SHA).
+  const byName = await run(cwd, "git", ["ls-remote", remoteUrl, sha]);
+  if (byName.code === 0) {
+    for (const line of byName.stdout.split("\n")) {
+      if (lsRemoteLineMatchesSha(line, sha)) return true;
     }
   }
 
-  // GitHub often does not advertise arbitrary commits via ls-remote.
+  // 2) Scan all advertised tips (covers matt-auto/gitlink/* publish refs).
+  const all = await run(cwd, "git", ["ls-remote", remoteUrl]);
+  if (all.code === 0) {
+    for (const line of all.stdout.split("\n")) {
+      if (lsRemoteLineMatchesSha(line, sha)) return true;
+    }
+  }
+
+  // 3) GitHub often does not advertise non-tip commits via ls-remote.
   // Fall back to GitHub REST when the remote is a github.com URL.
   const gh = parseGithubRepo(remoteUrl);
   if (gh) {
@@ -183,7 +215,6 @@ export async function remoteHasCommit(
     if (api.code === 0 && api.stdout.trim().length >= 7) {
       return true;
     }
-    return false;
   }
 
   return false;
@@ -207,8 +238,76 @@ export function parseGithubRepo(
 }
 
 /**
+ * Remote ref used to publish a gitlink SHA without rewriting submodule main.
+ * Makes the object fetchable for parent clones while keeping delivery dual-root.
+ */
+export function gitlinkPublishRef(sha: string): string {
+  const id = sha.toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 12);
+  return `refs/heads/matt-auto/gitlink/${id || "unknown"}`;
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when the local submodule checkout contains the commit object.
+ */
+export async function localHasCommit(
+  submoduleDir: string,
+  sha: string,
+): Promise<boolean> {
+  const result = await run(submoduleDir, "git", ["cat-file", "-t", sha]);
+  return result.code === 0 && result.stdout.trim() === "commit";
+}
+
+/**
+ * Push a local commit object to the submodule remote so the parent gitlink
+ * is fetchable. Uses a dedicated matt-auto/gitlink/* branch (no force to main).
+ */
+export async function pushSubmoduleCommit(input: {
+  submoduleDir: string;
+  remoteUrl: string;
+  sha: string;
+}): Promise<{ ok: true; ref: string } | { ok: false; reason: string }> {
+  const { submoduleDir, remoteUrl, sha } = input;
+  if (!(await pathExists(submoduleDir))) {
+    return {
+      ok: false,
+      reason: `Submodule checkout missing at ${submoduleDir} — cannot push ${sha}.`,
+    };
+  }
+  if (!(await localHasCommit(submoduleDir, sha))) {
+    return {
+      ok: false,
+      reason: `Submodule checkout at ${submoduleDir} does not contain commit ${sha} — cannot publish the gitlink.`,
+    };
+  }
+
+  const ref = gitlinkPublishRef(sha);
+  const push = await run(submoduleDir, "git", [
+    "push",
+    remoteUrl,
+    `${sha}:${ref}`,
+  ]);
+  if (push.code !== 0) {
+    const detail = (push.stderr || push.stdout || "push failed").trim();
+    return {
+      ok: false,
+      reason: `Failed to push submodule commit ${sha} to ${remoteUrl} (${ref}): ${detail}`,
+    };
+  }
+  return { ok: true, ref };
+}
+
+/**
  * Verify every submodule gitlink at HEAD is present on its configured remote.
- * No gitlinks → ok (nothing to check).
+ * No gitlinks → ok (nothing to check). Does not push.
  */
 export async function verifySubmoduleGitlinksReachable(
   worktreePath: string,
@@ -242,4 +341,73 @@ export async function verifySubmoduleGitlinksReachable(
     checked.push(link);
   }
   return { ok: true, checked };
+}
+
+/**
+ * Dual-root delivery: for each gitlink at HEAD, push the commit to the
+ * submodule remote when it is local-only, then re-verify reachability.
+ *
+ * Call this before parent Integration push / Workflow PR merge.
+ */
+export async function ensureSubmoduleGitlinksPublished(
+  worktreePath: string,
+): Promise<SubmoduleEnsureResult> {
+  const gitlinks = await listGitlinksAtHead(worktreePath);
+  if (gitlinks.length === 0) {
+    return { ok: true, checked: [], published: [] };
+  }
+
+  const checked: GitlinkEntry[] = [];
+  const published: SubmodulePublishedEntry[] = [];
+
+  for (const link of gitlinks) {
+    const remote = await resolveSubmoduleRemoteUrl(worktreePath, link.path);
+    if (!remote) {
+      return {
+        ok: false,
+        reason: `Submodule "${link.path}" records SHA ${link.sha} but no remote URL was found in .gitmodules — cannot publish or verify the commit.`,
+        path: link.path,
+        sha: link.sha,
+      };
+    }
+
+    let present = await remoteHasCommit(remote, link.sha, worktreePath);
+    if (!present) {
+      const submoduleDir = path.join(worktreePath, link.path);
+      const push = await pushSubmoduleCommit({
+        submoduleDir,
+        remoteUrl: remote,
+        sha: link.sha,
+      });
+      if (!push.ok) {
+        return {
+          ok: false,
+          reason: push.reason,
+          path: link.path,
+          sha: link.sha,
+          remote,
+        };
+      }
+      present = await remoteHasCommit(remote, link.sha, worktreePath);
+      if (!present) {
+        return {
+          ok: false,
+          reason: `Pushed submodule "${link.path}" commit ${link.sha} to ${remote} (${push.ref}) but the remote still does not advertise it — re-check credentials or try again.`,
+          path: link.path,
+          sha: link.sha,
+          remote,
+        };
+      }
+      published.push({
+        path: link.path,
+        sha: link.sha,
+        remote,
+        ref: push.ref,
+      });
+    }
+
+    checked.push(link);
+  }
+
+  return { ok: true, checked, published };
 }

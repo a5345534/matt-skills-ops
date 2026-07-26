@@ -59,6 +59,23 @@ export {
 export { createRemoteGitPort } from "./remote-git.js";
 export { createCiPort } from "./ci.js";
 export {
+  ensureSubmoduleGitlinksPublished,
+  gitlinkPublishRef,
+  listGitlinksAtHead,
+  localHasCommit,
+  parseGithubRepo,
+  pushSubmoduleCommit,
+  remoteHasCommit,
+  resolveSubmoduleRemoteUrl,
+  verifySubmoduleGitlinksReachable,
+} from "./submodule-gate.js";
+export type {
+  GitlinkEntry,
+  SubmoduleEnsureResult,
+  SubmoduleGateResult,
+  SubmodulePublishedEntry,
+} from "./submodule-gate.js";
+export {
   createMattAutoLogger,
   createSessionLogger,
   type MattAutoLogger,

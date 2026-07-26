@@ -33,7 +33,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
-import { verifySubmoduleGitlinksReachable } from "./adapters/submodule-gate.js";
+import { ensureSubmoduleGitlinksPublished } from "./adapters/submodule-gate.js";
 import {
   assertValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
@@ -3357,9 +3357,9 @@ export function createWorkflowCoordinator(
         };
       }
 
-      // Fail closed: submodule gitlinks must exist on the submodule remote
-      // before parent pointer bumps can integrate (issue #30).
-      const submoduleGate = await verifySubmoduleGitlinksReachable(
+      // Dual-root: push local-only submodule commits, then fail closed if any
+      // gitlink is still missing on the submodule remote (issue #30).
+      const submoduleGate = await ensureSubmoduleGitlinksPublished(
         integrationWorkspace.worktreePath,
       );
       if (!submoduleGate.ok) {
@@ -3381,10 +3381,17 @@ export function createWorkflowCoordinator(
           attempt: unit.attempt,
         };
       }
+      if (submoduleGate.published.length > 0) {
+        await bound.transcripts.append(transcriptKey, {
+          type: "submodule-publish",
+          published: submoduleGate.published,
+        });
+      }
       if (submoduleGate.checked.length > 0) {
         await bound.transcripts.append(transcriptKey, {
           type: "submodule-gate",
           checked: submoduleGate.checked,
+          publishedCount: submoduleGate.published.length,
         });
       }
 
@@ -4016,7 +4023,7 @@ export function createWorkflowCoordinator(
       };
     }
 
-    // Re-check submodule pointers on the Integration branch before merge (#30).
+    // Dual-root: publish + re-check submodule pointers before merge (#30).
     try {
       const targetBranch = await resolveTargetBranch(bound.preferences);
       const integrationWorkspace =
@@ -4024,7 +4031,7 @@ export function createWorkflowCoordinator(
           workflowId: active.workflowId,
           baseRef: active.integrationBranch ?? targetBranch,
         });
-      const submoduleGate = await verifySubmoduleGitlinksReachable(
+      const submoduleGate = await ensureSubmoduleGitlinksPublished(
         integrationWorkspace.worktreePath,
       );
       if (!submoduleGate.ok) {
