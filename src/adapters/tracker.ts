@@ -12,6 +12,12 @@ import {
   buildBatchedListTicketsQuery,
   chunkIssueNumbers,
 } from "./tracker-queries.js";
+import {
+  isGraphqlRateLimitMessage,
+  noteGraphqlRateLimit,
+  recordGraphqlAttempt,
+  recordRestAttempt,
+} from "./tracker-rate-limit.js";
 import type {
   ActiveWorkflow,
   WorkerProfile,
@@ -57,6 +63,14 @@ async function run(
   command: string,
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  const isGraphql =
+    command === "gh" && args.includes("api") && args.includes("graphql");
+  if (isGraphql) {
+    recordGraphqlAttempt();
+  } else if (command === "gh") {
+    recordRestAttempt();
+  }
+
   try {
     const { stdout, stderr } = await execFileAsync(command, args, {
       cwd,
@@ -71,10 +85,18 @@ async function run(
       stderr?: string;
       message?: string;
     };
+    const stderr = err.stderr ?? err.message ?? "";
+    const stdout = err.stdout ?? "";
+    const detail = `${stderr}
+${stdout}`;
+    // gh may surface GraphQL quota errors even on non-graphql subcommands.
+    if (isGraphqlRateLimitMessage(detail)) {
+      noteGraphqlRateLimit(detail);
+    }
     return {
       code: typeof err.code === "number" ? err.code : 1,
-      stdout: err.stdout ?? "",
-      stderr: err.stderr ?? err.message ?? "",
+      stdout,
+      stderr,
     };
   }
 }
@@ -513,7 +535,19 @@ export function createTrackerPort(cwd: string): TrackerPort {
           "-f",
           `query=${query}`,
         ]);
-        if (result.code !== 0) continue;
+        if (result.code !== 0) {
+          const detail = `${result.stderr}
+${result.stdout}`;
+          if (isGraphqlRateLimitMessage(detail)) {
+            noteGraphqlRateLimit(detail);
+            // Fail the whole listTickets so callers can keep stale cache.
+            throw new Error(
+              result.stderr.trim() ||
+                "GitHub GraphQL API rate limit exceeded while listing tickets.",
+            );
+          }
+          continue;
+        }
         try {
           const parsed = JSON.parse(result.stdout) as {
             data?: {

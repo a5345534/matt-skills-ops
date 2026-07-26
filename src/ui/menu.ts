@@ -49,6 +49,7 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+import { getTrackerGhMetrics } from "../adapters/tracker-rate-limit.js";
 import { startGhosttyActivity } from "./ghostty-activity.js";
 import {
   buildRunBriefViewModel,
@@ -612,7 +613,7 @@ export async function waitForPipelineWorkers(
       }
 
       const brief = notifyRunBrief(ui, panel);
-      log("debug", "pipeline:wait-workers-tick", {
+      const tickPayload: Record<string, unknown> = {
         tick: i + 1,
         runningCount: running.length,
         running: running.map((w) => ({
@@ -628,7 +629,12 @@ export async function waitForPipelineWorkers(
         })),
         briefSections: brief.sections.map((s) => s.id),
         briefLines: brief.lines,
-      });
+      };
+      // Periodic tracker metrics (every ~30s at 2s poll) for rate-limit diagnosis.
+      if (i === 0 || (i + 1) % 15 === 0) {
+        tickPayload.trackerGh = getTrackerGhMetrics();
+      }
+      log("debug", "pipeline:wait-workers-tick", tickPayload);
 
       // Continuous auto-wait by default (no "Continue waiting" gate).
       // Optional blocking menu for tests / offerRunningControls.

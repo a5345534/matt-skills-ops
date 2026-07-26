@@ -33,6 +33,11 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import {
+  getTrackerGhMetrics,
+  graphqlBackoffRemainingMs,
+  isInGraphqlBackoff,
+} from "./adapters/tracker-rate-limit.js";
 import { workerTranscriptPath } from "./adapters/transcripts.js";
 import { implementationWorktreePath } from "./adapters/workspace.js";
 import type {
@@ -547,11 +552,50 @@ export function createWorkflowCoordinator(
     }
   }
 
+  /** Short TTL for Active workflow / ticket progress (full reads). */
+  const TRACKER_READ_TTL_MS = 20_000;
+  let activeWorkflowTtl:
+    | {
+        key: string;
+        at: number;
+        value: ActiveWorkflow | undefined;
+      }
+    | undefined;
+  let ticketProgressTtl:
+    | {
+        key: string;
+        at: number;
+        value: TicketProgressSummary;
+      }
+    | undefined;
+
   async function loadActiveWorkflow(
     bound: RootScopedPorts,
+    options: { force?: boolean } = {},
   ): Promise<ActiveWorkflow | undefined> {
     const targetBranch = await resolveTargetBranch(bound.preferences);
     const hint = await bound.preferences.getActiveWorkflowId(targetBranch);
+    const cacheKey = `${targetBranch}:${hint ?? ""}`;
+    const now = Date.now();
+    if (
+      !options.force &&
+      activeWorkflowTtl &&
+      activeWorkflowTtl.key === cacheKey &&
+      now - activeWorkflowTtl.at < TRACKER_READ_TTL_MS
+    ) {
+      return activeWorkflowTtl.value;
+    }
+
+    // Under GraphQL backoff, prefer last known Active workflow.
+    if (
+      !options.force &&
+      isInGraphqlBackoff() &&
+      activeWorkflowTtl &&
+      activeWorkflowTtl.key === cacheKey
+    ) {
+      return activeWorkflowTtl.value;
+    }
+
     const active = await bound.tracker.findActiveWorkflow(
       targetBranch,
       hint,
@@ -565,6 +609,7 @@ export function createWorkflowCoordinator(
     } else if (hint !== undefined) {
       await bound.preferences.clearActiveWorkflowId(targetBranch);
     }
+    activeWorkflowTtl = { key: cacheKey, at: now, value: active };
     return active;
   }
 
@@ -921,6 +966,7 @@ export function createWorkflowCoordinator(
   async function loadTicketProgress(
     bound: RootScopedPorts,
     active: ActiveWorkflow,
+    options: { force?: boolean } = {},
   ): Promise<TicketProgressSummary | undefined> {
     if (!isTicketWorkStage(active.stage) && active.stage !== "merged") {
       return undefined;
@@ -941,8 +987,52 @@ export function createWorkflowCoordinator(
         items: [],
       };
     }
-    const tickets = await bound.tracker.listTickets(numbers);
-    return computeTicketProgress(active.workflowId, tickets, integratedNumbers);
+
+    const cacheKey = `${active.workflowId}:${numbers.join(",")}:${[...integratedNumbers].sort((a, b) => a - b).join(",")}`;
+    const now = Date.now();
+    if (
+      !options.force &&
+      ticketProgressTtl &&
+      ticketProgressTtl.key === cacheKey &&
+      now - ticketProgressTtl.at < TRACKER_READ_TTL_MS
+    ) {
+      return ticketProgressTtl.value;
+    }
+    if (
+      !options.force &&
+      isInGraphqlBackoff() &&
+      ticketProgressTtl &&
+      ticketProgressTtl.key === cacheKey
+    ) {
+      return ticketProgressTtl.value;
+    }
+
+    try {
+      const tickets = await bound.tracker.listTickets(numbers);
+      const progress = computeTicketProgress(
+        active.workflowId,
+        tickets,
+        integratedNumbers,
+      );
+      ticketProgressTtl = { key: cacheKey, at: now, value: progress };
+      cachedTicketProgress = {
+        workflowId: active.workflowId,
+        progress,
+      };
+      return progress;
+    } catch {
+      // Rate limit or transient tracker failure: serve stale progress if any.
+      if (ticketProgressTtl && ticketProgressTtl.key === cacheKey) {
+        return ticketProgressTtl.value;
+      }
+      if (
+        cachedTicketProgress &&
+        cachedTicketProgress.workflowId === active.workflowId
+      ) {
+        return cachedTicketProgress.progress;
+      }
+      return undefined;
+    }
   }
 
   function formatTicketProgressAction(
@@ -1372,7 +1462,9 @@ export function createWorkflowCoordinator(
         );
       }
 
-      const progress = await loadTicketProgress(bound, active);
+      const progress = await loadTicketProgress(bound, active, {
+        force: true,
+      });
       if (!progress) {
         return actions;
       }
@@ -1743,6 +1835,7 @@ export function createWorkflowCoordinator(
 
     try {
       await bound.tracker.writeWorkflowManifest(issueNumber, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       // Issue already exists remotely — drop the session pending draft so a retry
       // cannot create a second spec issue for the same Stage confirmation.
@@ -1879,6 +1972,7 @@ export function createWorkflowCoordinator(
 
     try {
       await bound.tracker.writeWorkflowManifest(current.workflowId, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       pending = undefined;
       const message = error instanceof Error ? error.message : String(error);
@@ -1913,9 +2007,10 @@ export function createWorkflowCoordinator(
     TicketProgressSummary | undefined
   > {
     const bound = await requireScoped();
-    const active = await loadActiveWorkflow(bound);
+    const active = await loadActiveWorkflow(bound, { force: true });
     if (!active) return undefined;
-    return loadTicketProgress(bound, active);
+    // Public progress reads should reflect latest GitHub ticket state.
+    return loadTicketProgress(bound, active, { force: true });
   }
 
   async function startImplementation(ticketNumber: number): Promise<StageResult> {
@@ -3117,6 +3212,7 @@ export function createWorkflowCoordinator(
 
       try {
         await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      invalidatePanelCaches();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const reason = `Pushed ${pushedBranches.join(", ")} but writing the Workflow manifest failed: ${message}. Recover the Workflow manifest on #${active.workflowId} before continuing.`;
@@ -3622,6 +3718,7 @@ export function createWorkflowCoordinator(
 
     try {
       await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -3692,6 +3789,7 @@ export function createWorkflowCoordinator(
     const manifest = manifestFromActive(active, { stage: "merged" });
     try {
       await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -3797,6 +3895,7 @@ export function createWorkflowCoordinator(
     const manifest = manifestFromActive(active, { stage: "completed" });
     try {
       await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -3946,6 +4045,7 @@ export function createWorkflowCoordinator(
 
     try {
       await bound.tracker.writeWorkflowManifest(created.number, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -4041,6 +4141,7 @@ export function createWorkflowCoordinator(
 
     try {
       await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -4243,7 +4344,8 @@ export function createWorkflowCoordinator(
 
   async function terminateRun(): Promise<RunTerminationResult> {
     const bound = scoped ?? (await requireScoped());
-    const active = await loadActiveWorkflow(bound);
+    // Need fresh integratedTickets / workflowPr for T1 vs T2 (not a TTL snapshot).
+    const active = await loadActiveWorkflow(bound, { force: true });
     const mode = resolveTerminationMode(active);
 
     const affectedAttempts = await abortSessionWorkers({
@@ -4480,6 +4582,8 @@ export function createWorkflowCoordinator(
   function invalidatePanelCaches(): void {
     cachedPanelActive = undefined;
     cachedTicketProgress = undefined;
+    activeWorkflowTtl = undefined;
+    ticketProgressTtl = undefined;
   }
 
   async function getPanelState(options?: {
