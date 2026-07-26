@@ -234,7 +234,7 @@ export const CLEANUP_WORKFLOW_ACTION = {
   id: "cleanup-workflow",
   label: "Cleanup workflow",
   description:
-    "Remove local workspaces/transcripts and matching remote matt-auto branches together. Retains GitHub issue/PR/manifest history.",
+    "Remove local workspaces/transcripts and matching remote matt-auto branches, then close the parent Workflow spec issue. Notifies you to git pull and /reload; does not pull or reload automatically.",
 } as const;
 
 /** Next action: start a Follow-up workflow after the original Workflow PR merges. */
