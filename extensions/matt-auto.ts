@@ -38,6 +38,7 @@ import type { WorkflowCoordinator } from "../src/types.js";
 import {
   presentMainMenu,
   presentNextActions,
+  queuePipelineWaitControl,
   runPostGrillPipeline,
   setMenuLogger,
   type MattAutoUi,
@@ -444,6 +445,20 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     activeUi = undefined;
     planningSession = undefined;
     assistantTexts.length = 0;
+  });
+
+  // Queue Pause/Terminate during auto-waiting wait loop (home agent idle; no blocking menu).
+  pi.registerShortcut("ctrl+alt+p", {
+    description: "Matt Auto: queue Pause while /matt-auto run is auto-waiting",
+    handler: () => {
+      queuePipelineWaitControl("pause");
+    },
+  });
+  pi.registerShortcut("ctrl+alt+t", {
+    description: "Matt Auto: queue Terminate while /matt-auto run is auto-waiting",
+    handler: () => {
+      queuePipelineWaitControl("terminate");
+    },
   });
 
   pi.registerCommand("matt-auto", {

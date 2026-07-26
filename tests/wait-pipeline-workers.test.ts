@@ -440,6 +440,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 2,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(pausePipeline).not.toHaveBeenCalled();
@@ -497,6 +498,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 20,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(pausePipeline).toHaveBeenCalledTimes(1);
@@ -553,6 +555,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 10,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(resumePipeline).toHaveBeenCalledTimes(1);
@@ -589,6 +592,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 2,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(terminateRun).not.toHaveBeenCalled();
@@ -632,6 +636,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 5,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(terminateRun).toHaveBeenCalledTimes(1);
@@ -675,6 +680,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       pollIntervalMs: 1,
       maxTicks: 5,
       sleep: async () => undefined,
+      offerRunningControls: true,
     });
 
     expect(result.status).toBe("terminated");
@@ -718,6 +724,7 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
         pollIntervalMs: 1,
         maxTicks: 10,
         sleep: async () => undefined,
+        offerRunningControls: true,
       });
 
       expect(

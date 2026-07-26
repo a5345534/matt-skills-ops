@@ -121,7 +121,33 @@ export type WaitForPipelineWorkersOptions = {
   maxTicks?: number;
   /** Injectable sleep (tests). Defaults to real wall-clock sleep. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * When true, every running tick opens the blocking Pause/Terminate menu
+   * (legacy / tests). Default false: auto-poll continuously; Pause/Terminate
+   * while running come from `queuePipelineWaitControl` (shortcuts).
+   */
+  offerRunningControls?: boolean;
 };
+
+/** Queued operator action while the wait loop auto-polls (no blocking menu). */
+export type PipelineWaitControlRequest = "pause" | "terminate";
+
+let pendingPipelineWaitControl: PipelineWaitControlRequest | undefined;
+
+/**
+ * Request Pause/Terminate during an auto-waiting run (e.g. keyboard shortcut).
+ * Consumed on the next wait-loop tick; still requires confirmation dialogs.
+ */
+export function queuePipelineWaitControl(
+  action: PipelineWaitControlRequest,
+): void {
+  pendingPipelineWaitControl = action;
+}
+
+/** Test helper: clear any queued wait control. */
+export function clearPipelineWaitControlQueue(): void {
+  pendingPipelineWaitControl = undefined;
+}
 
 /** How the run-brief wait loop ended. */
 export type WaitForPipelineWorkersResult =
@@ -499,12 +525,20 @@ export async function waitForPipelineWorkers(
     });
   }
 
+  if (!options.offerRunningControls && !initialPaused) {
+    ui.notify(
+      "Auto-waiting for workers — brief refreshes continuously (no Continue needed). Pause/Terminate: Ctrl+Alt+P / Ctrl+Alt+T (then confirm), or when paused use Resume/Terminate.",
+      "info",
+    );
+  }
+
   // Home agent is often idle here — pi-ghostty will not spin. Mirror its
   // braille title + OSC 9;4 progress while we wait on session-owned workers.
   const activity = startGhosttyActivity(ui, {
     cwd: process.cwd(),
     detail: activityDetailFromPanel(initialPanel),
   });
+  pendingPipelineWaitControl = undefined;
 
   try {
     for (let i = 0; i < maxTicks; i += 1) {
@@ -592,16 +626,35 @@ export async function waitForPipelineWorkers(
         briefLines: brief.lines,
       });
 
+      // Continuous auto-wait by default (no "Continue waiting" gate).
+      // Optional blocking menu for tests / offerRunningControls.
+      // Shortcuts queue pause/terminate via queuePipelineWaitControl.
       if (controls) {
-        const control = await presentRunBriefControlMenu(controls, ui, panel);
-        if (control.action === "terminated") {
-          const latest = (await coordinator.getPanelState()) ?? panel;
-          notifyRunBrief(ui, latest, "warning");
-          ui.notify(formatTerminateNotify(control.result), "warning");
-          return { status: "terminated", result: control.result };
-        }
-        if (control.action === "paused") {
-          continue;
+        const queued = pendingPipelineWaitControl;
+        pendingPipelineWaitControl = undefined;
+
+        if (queued === "pause") {
+          const applied = await applyConfirmedPause(controls, ui, panel);
+          if (applied) continue;
+        } else if (queued === "terminate") {
+          const result = await applyConfirmedTerminate(controls, ui, panel);
+          if (result) {
+            const latest = (await coordinator.getPanelState()) ?? panel;
+            notifyRunBrief(ui, latest, "warning");
+            ui.notify(formatTerminateNotify(result), "warning");
+            return { status: "terminated", result };
+          }
+        } else if (options.offerRunningControls) {
+          const control = await presentRunBriefControlMenu(controls, ui, panel);
+          if (control.action === "terminated") {
+            const latest = (await coordinator.getPanelState()) ?? panel;
+            notifyRunBrief(ui, latest, "warning");
+            ui.notify(formatTerminateNotify(control.result), "warning");
+            return { status: "terminated", result: control.result };
+          }
+          if (control.action === "paused") {
+            continue;
+          }
         }
       }
 
