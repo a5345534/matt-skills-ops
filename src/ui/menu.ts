@@ -270,6 +270,27 @@ function runningWorkers(panel: WorkflowPanelState | undefined) {
   return panel?.workers.filter((w) => w.status === "running") ?? [];
 }
 
+/**
+ * Work that the run loop must drive next (P1), even while other Implementation
+ * workers are still running. Wait settles early so disposition / Integration
+ * retry auto-advance can run without aborting parallel workers.
+ */
+function hasP1RunLoopWork(panel: WorkflowPanelState | undefined): boolean {
+  if (!panel) return false;
+  if (panel.workers.some((w) => w.status === "needs-disposition")) return true;
+  if (panel.integration?.status === "pending-retry") return true;
+  return false;
+}
+
+/** True when the pipeline should keep waiting (live workers / conflict / pause). */
+function hasLivePipelineWork(panel: WorkflowPanelState | undefined): boolean {
+  if (!panel) return false;
+  if (panel.pipelinePaused || panel.runTerminated) return true;
+  if (panel.workers.some((w) => w.status === "running")) return true;
+  if (panel.integration?.status === "conflict-resolution") return true;
+  return false;
+}
+
 function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
   return (
     panel?.workers.map((w) => ({
@@ -492,9 +513,14 @@ async function presentRunBriefControlMenu(
  * from `getPanelState()`. The only controls are Pause / Resume / Terminate —
  * each requires explicit confirmation before coordinator APIs run.
  *
- * Settles when no workers are `running` and the pipeline is not paused
- * (including needs-disposition) so Auto-Close can proceed. Terminate exits
- * the wait with `{ status: "terminated" }` so the pipeline can stop cleanly.
+ * Settles when:
+ * - no workers are `running` and the pipeline is not paused, or
+ * - P1 run-loop work appears (needs-disposition / Integration pending-retry)
+ *   even while other Implementation workers still run, so Auto-Close and
+ *   serial Integration can proceed without aborting parallel workers.
+ *
+ * Terminate exits the wait with `{ status: "terminated" }` so the pipeline
+ * can stop cleanly.
  */
 export async function waitForPipelineWorkers(
   coordinator: Pick<WorkflowCoordinator, "getPanelState"> | RunBriefCoordinator,
@@ -509,11 +535,13 @@ export async function waitForPipelineWorkers(
   const initialPanel = await coordinator.getPanelState();
   const initialRunning = runningWorkers(initialPanel);
   const initialPaused = initialPanel?.pipelinePaused === true;
+  const initialP1 = hasP1RunLoopWork(initialPanel);
 
-  // Already settled (e.g. needs-disposition only) and not paused — do not block.
-  if (initialRunning.length === 0 && !initialPaused) {
+  // Already settled (no live runners, or P1 work ready) and not paused — do not block.
+  if ((initialRunning.length === 0 || initialP1) && !initialPaused) {
     log("info", "pipeline:workers-settled", {
       immediate: true,
+      p1: initialP1,
       panelWorkers: panelWorkerSnapshot(initialPanel),
     });
     if (initialPanel) {
@@ -603,6 +631,19 @@ export async function waitForPipelineWorkers(
           continue;
         }
         continue;
+      }
+
+      // P1: disposition / Integration retry must run even while other workers continue.
+      if (hasP1RunLoopWork(panel)) {
+        notifyRunBrief(ui, panel);
+        log("info", "pipeline:workers-settled", {
+          ticks: i + 1,
+          reason: "p1-run-loop-work",
+          runningCount: running.length,
+          panelWorkers: panelWorkerSnapshot(panel),
+          integration: panel.integration,
+        });
+        return { status: "settled" };
       }
 
       if (running.length === 0) {
@@ -1228,14 +1269,18 @@ export async function runPostGrillPipeline(
     });
     if (nextActions.length === 0) {
       const panel = await coordinator.getPanelState();
-      if (
-        panel &&
-        (panel.workers.length > 0 || panel.pipelinePaused || panel.runTerminated)
-      ) {
+      // Slots full (or no ready launch) while workers / conflict / pause live → wait.
+      // waitForPipelineWorkers settles early on P1 (needs-disposition / pending-retry)
+      // so disposition auto-advance runs while other Implementation workers continue.
+      if (hasLivePipelineWork(panel)) {
         log("info", "pipeline:wait-workers", {
-          workers: panel.workers.map((w) => w.ticketNumber),
-          pipelinePaused: panel.pipelinePaused,
-          runTerminated: panel.runTerminated,
+          workers: panel?.workers.map((w) => ({
+            ticketNumber: w.ticketNumber,
+            status: w.status,
+          })),
+          pipelinePaused: panel?.pipelinePaused,
+          runTerminated: panel?.runTerminated,
+          integration: panel?.integration,
         });
         const waitResult = await waitForPipelineWorkers(coordinator, ui);
         if (waitResult.status === "terminated") {
@@ -1353,8 +1398,10 @@ export async function runPostGrillPipeline(
       return;
     }
 
-    // Implement returns "running" while the worker is live — wait here instead
-    // of falling through to an empty nextActions and exiting to the main menu.
+    // Implement returns "running" while the worker is live. Do NOT wait yet —
+    // continue the loop so remaining free Implementation slots can be filled
+    // from the ready frontier (up to N). Wait only when nextActions is empty
+    // while workers still run (slots full / frontier empty / P1 blocked).
     if (result.status === "running") {
       const panel = await coordinator.getPanelState();
       const ticketNumber =
@@ -1372,17 +1419,9 @@ export async function runPostGrillPipeline(
         worktreePath: worker?.worktreePath,
         transcriptPath: worker?.transcriptPath,
         branchName: worker?.branchName,
+        runningCount: runningWorkers(panel).length,
       });
-      const waitResult = await waitForPipelineWorkers(coordinator, ui);
-      if (waitResult.status === "terminated") {
-        log("info", "pipeline:stop", {
-          reason: "run-terminated",
-          step,
-          mode: waitResult.result.mode,
-          ticketNumber,
-        });
-        return;
-      }
+      continue;
     }
   }
 
