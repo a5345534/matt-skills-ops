@@ -1,8 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { WORKER_CONCURRENCY_WARNING_THRESHOLD } from "../src/constants.js";
 import {
   buildMainMenuItems,
+  concurrencyWarningMessage,
+  confirmConcurrencyWarning,
+  formatResolvedWorkerConcurrencyLine,
   formatTicketProgressLines,
+  needsConcurrencyWarning,
   parseTicketsDraftFromEditor,
+  parseWorkerConcurrencyInput,
+  presentWorkerConcurrencyMenu,
+  promptWorkerConcurrency,
   selectAvailableModel,
   selectPipelineAction,
   type MattAutoUi,
@@ -11,6 +19,7 @@ import type {
   AvailableModel,
   PreflightResult,
   TicketProgressSummary,
+  WorkflowCoordinator,
   WorkflowRoot,
 } from "../src/types.js";
 
@@ -55,6 +64,23 @@ describe("buildMainMenuItems", () => {
       "Effective: anthropic/claude-sonnet-4 (thinking medium) [global]",
     );
     expect(items).toContain("Configure Worker profile…");
+    expect(items).toContain("Configure Worker concurrency…");
+  });
+
+  it("surfaces effective Worker concurrency and source when provided", () => {
+    const items = buildMainMenuItems(
+      preflightWithProfile,
+      [],
+      availableRoot,
+      1,
+      undefined,
+      undefined,
+      { concurrency: 3, source: "global" },
+    );
+
+    expect(items).toContain("--- Worker concurrency ---");
+    expect(items).toContain("Effective Worker concurrency: 3 [global]");
+    expect(items).toContain("Configure Worker concurrency…");
   });
 
   it("surfaces ticket-progress summary lines when frontier data is present", () => {
@@ -283,6 +309,320 @@ describe("selectAvailableModel", () => {
 
     const chosen = await selectAvailableModel(models, ui);
     expect(chosen).toEqual(models[0]);
+  });
+});
+
+describe("Worker concurrency configure helpers", () => {
+  it("formats effective Worker concurrency with source", () => {
+    expect(formatResolvedWorkerConcurrencyLine(2, "default")).toBe(
+      "Effective Worker concurrency: 2 [default]",
+    );
+    expect(formatResolvedWorkerConcurrencyLine(5, "workflow-root")).toBe(
+      "Effective Worker concurrency: 5 [workflow-root]",
+    );
+  });
+
+  it("flags Concurrency warning only above the threshold", () => {
+    expect(needsConcurrencyWarning(1)).toBe(false);
+    expect(needsConcurrencyWarning(4)).toBe(false);
+    expect(needsConcurrencyWarning(5)).toBe(true);
+    expect(needsConcurrencyWarning(WORKER_CONCURRENCY_WARNING_THRESHOLD)).toBe(
+      false,
+    );
+    expect(
+      needsConcurrencyWarning(WORKER_CONCURRENCY_WARNING_THRESHOLD + 1),
+    ).toBe(true);
+  });
+
+  it("uses glossary terms in the Concurrency warning message", () => {
+    const message = concurrencyWarningMessage(8);
+    expect(message).toMatch(/Concurrency warning/);
+    expect(message).toMatch(/Worker concurrency 8/);
+    expect(message).toMatch(/warning threshold of 4/);
+    expect(message).toMatch(/no Matt Auto hard upper limit/);
+    expect(message).toMatch(/will not re-prompt/);
+  });
+
+  it("parses positive integer Worker concurrency and rejects invalid input", () => {
+    expect(parseWorkerConcurrencyInput("3")).toEqual({ ok: true, value: 3 });
+    expect(parseWorkerConcurrencyInput(" 12 ")).toEqual({
+      ok: true,
+      value: 12,
+    });
+    expect(parseWorkerConcurrencyInput("1")).toEqual({ ok: true, value: 1 });
+
+    expect(parseWorkerConcurrencyInput("")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("0")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("-2")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("1.5")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("2e1")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("abc")).toMatchObject({ ok: false });
+    expect(parseWorkerConcurrencyInput("3x")).toMatchObject({ ok: false });
+
+    const invalid = parseWorkerConcurrencyInput("nope");
+    if (invalid.ok) throw new Error("expected invalid");
+    expect(invalid.reason).toMatch(/positive integer/i);
+    expect(invalid.reason).toMatch(/Worker concurrency/);
+  });
+});
+
+describe("promptWorkerConcurrency", () => {
+  it("saves N ≤ 4 without a Concurrency warning confirm", async () => {
+    const selects: string[] = [];
+    const notifies: Array<{ message: string; type?: string }> = [];
+    const ui: MattAutoUi = {
+      input: async () => "3",
+      select: async (_title, options) => {
+        selects.push(...options);
+        return options[0];
+      },
+      notify: (message, type) => {
+        notifies.push(type === undefined ? { message } : { message, type });
+      },
+    };
+
+    await expect(promptWorkerConcurrency(ui, "global default")).resolves.toBe(
+      3,
+    );
+    expect(selects).toHaveLength(0);
+    expect(notifies.some((n) => /Concurrency warning/.test(n.message))).toBe(
+      false,
+    );
+  });
+
+  it("requires Concurrency warning confirm for N > 4 and saves on confirm", async () => {
+    const ui: MattAutoUi = {
+      input: async () => "8",
+      select: async (title, options) => {
+        expect(title).toBe("Concurrency warning");
+        expect(options[0]).toMatch(/Confirm Worker concurrency/);
+        return options[0];
+      },
+      notify: (message, type) => {
+        if (type === "warning") {
+          expect(message).toMatch(/Concurrency warning/);
+          expect(message).toMatch(/Worker concurrency 8/);
+        }
+      },
+    };
+
+    await expect(promptWorkerConcurrency(ui, "global default")).resolves.toBe(
+      8,
+    );
+  });
+
+  it("decline of Concurrency warning leaves no value to write", async () => {
+    const notifies: string[] = [];
+    const ui: MattAutoUi = {
+      input: async () => "9",
+      select: async (_title, options) =>
+        options.find((o) => o === "Cancel") ?? options[1],
+      notify: (message) => {
+        notifies.push(message);
+      },
+    };
+
+    await expect(
+      promptWorkerConcurrency(ui, "Workflow-root override"),
+    ).resolves.toBeUndefined();
+    expect(notifies.some((m) => /declined/.test(m))).toBe(true);
+    expect(notifies.some((m) => /unchanged/.test(m))).toBe(true);
+  });
+
+  it("notifies a clear validation error for invalid input and does not confirm", async () => {
+    const notifies: Array<{ message: string; type?: string }> = [];
+    let selectCalled = false;
+    const ui: MattAutoUi = {
+      input: async () => "1.5",
+      select: async () => {
+        selectCalled = true;
+        return undefined;
+      },
+      notify: (message, type) => {
+        notifies.push(type === undefined ? { message } : { message, type });
+      },
+    };
+
+    await expect(
+      promptWorkerConcurrency(ui, "global default"),
+    ).resolves.toBeUndefined();
+    expect(selectCalled).toBe(false);
+    expect(notifies).toHaveLength(1);
+    expect(notifies[0]?.type).toBe("error");
+    expect(notifies[0]?.message).toMatch(/positive integer/i);
+  });
+
+  it("boundary N = 4 saves without warning; N = 5 requires warning", async () => {
+    let warningSelects = 0;
+    const uiAtThreshold: MattAutoUi = {
+      input: async () => "4",
+      select: async () => {
+        warningSelects += 1;
+        return "Confirm Worker concurrency";
+      },
+      notify: () => {},
+    };
+    await expect(
+      promptWorkerConcurrency(uiAtThreshold, "global default"),
+    ).resolves.toBe(4);
+    expect(warningSelects).toBe(0);
+
+    const uiAbove: MattAutoUi = {
+      input: async () => "5",
+      select: async () => "Confirm Worker concurrency",
+      notify: () => {},
+    };
+    await expect(
+      promptWorkerConcurrency(uiAbove, "global default"),
+    ).resolves.toBe(5);
+  });
+});
+
+describe("confirmConcurrencyWarning", () => {
+  it("returns true only when Confirm Worker concurrency is selected", async () => {
+    await expect(
+      confirmConcurrencyWarning(
+        {
+          select: async () => "Confirm Worker concurrency",
+          notify: () => {},
+        },
+        7,
+      ),
+    ).resolves.toBe(true);
+
+    await expect(
+      confirmConcurrencyWarning(
+        {
+          select: async () => "Cancel",
+          notify: () => {},
+        },
+        7,
+      ),
+    ).resolves.toBe(false);
+  });
+});
+
+describe("presentWorkerConcurrencyMenu", () => {
+  function fakeCoordinator(initial?: {
+    global?: number;
+    root?: number;
+  }): WorkflowCoordinator & {
+    store: { global?: number; root?: number };
+  } {
+    const store: { global?: number; root?: number } = {};
+    if (initial?.global !== undefined) store.global = initial.global;
+    if (initial?.root !== undefined) store.root = initial.root;
+    const coordinator = {
+      store,
+      getGlobalWorkerConcurrency: async () => store.global,
+      getRootWorkerConcurrency: async () => store.root,
+      setGlobalWorkerConcurrency: async (n: number) => {
+        store.global = n;
+      },
+      setRootWorkerConcurrency: async (n: number) => {
+        store.root = n;
+      },
+      clearRootWorkerConcurrency: async () => {
+        delete store.root;
+      },
+    };
+    return coordinator as unknown as WorkflowCoordinator & {
+      store: { global?: number; root?: number };
+    };
+  }
+
+  it("sets global and root concurrency from the menu", async () => {
+    const coordinator = fakeCoordinator();
+    const inputs = ["3", "2"];
+    const selections = [
+      "Set global default Worker concurrency",
+      "Set Workflow-root Worker concurrency override",
+      "← Back",
+    ];
+    const ui: MattAutoUi = {
+      input: async () => inputs.shift(),
+      select: async (_title, _options) => selections.shift(),
+      notify: () => {},
+    };
+
+    await presentWorkerConcurrencyMenu(coordinator, ui);
+    expect(coordinator.store.global).toBe(3);
+    expect(coordinator.store.root).toBe(2);
+  });
+
+  it("clears root override so effective falls back to global/default", async () => {
+    const coordinator = fakeCoordinator({ global: 3, root: 8 });
+    const selections = [
+      "Clear Workflow-root Worker concurrency override",
+      "← Back",
+    ];
+    const notifies: string[] = [];
+    const ui: MattAutoUi = {
+      select: async (_title, options) => {
+        // Clear option only present while root is set.
+        if (selections[0] === "Clear Workflow-root Worker concurrency override") {
+          expect(options).toContain(
+            "Clear Workflow-root Worker concurrency override",
+          );
+        }
+        return selections.shift();
+      },
+      notify: (message) => {
+        notifies.push(message);
+      },
+    };
+
+    await presentWorkerConcurrencyMenu(coordinator, ui);
+    expect(coordinator.store.root).toBeUndefined();
+    expect(coordinator.store.global).toBe(3);
+    expect(notifies.some((m) => /falls back to the global default/.test(m))).toBe(
+      true,
+    );
+  });
+
+  it("does not write when Concurrency warning is declined", async () => {
+    const coordinator = fakeCoordinator({ global: 2 });
+    const selections = [
+      "Set global default Worker concurrency",
+      "Cancel", // decline Concurrency warning
+      "← Back",
+    ];
+    const ui: MattAutoUi = {
+      input: async () => "10",
+      select: async (_title, options) => {
+        const next = selections.shift();
+        if (next === "Cancel") {
+          expect(options).toContain("Cancel");
+        }
+        return next;
+      },
+      notify: () => {},
+    };
+
+    await presentWorkerConcurrencyMenu(coordinator, ui);
+    expect(coordinator.store.global).toBe(2);
+  });
+
+  it("rejects invalid input without mutating preferences", async () => {
+    const coordinator = fakeCoordinator({ global: 2 });
+    const setSpy = vi.spyOn(coordinator, "setGlobalWorkerConcurrency");
+    const selections = [
+      "Set global default Worker concurrency",
+      "← Back",
+    ];
+    const notifies: Array<{ message: string; type?: string }> = [];
+    const ui: MattAutoUi = {
+      input: async () => "0",
+      select: async () => selections.shift(),
+      notify: (message, type) => {
+        notifies.push(type === undefined ? { message } : { message, type });
+      },
+    };
+
+    await presentWorkerConcurrencyMenu(coordinator, ui);
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(coordinator.store.global).toBe(2);
+    expect(notifies.some((n) => n.type === "error")).toBe(true);
   });
 });
 

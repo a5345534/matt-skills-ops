@@ -45,6 +45,11 @@ export {
   assertValidWorkerConcurrency,
   isValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
+  resolveWorkerConcurrency,
+} from "./adapters/preferences.js";
+export type {
+  ResolvedWorkerConcurrency,
+  WorkerConcurrencySource,
 } from "./adapters/preferences.js";
 export {
   canLaunchImplementationWorker,
