@@ -39,6 +39,11 @@ import {
 } from "./adapters/preferences.js";
 import { workerTranscriptPath } from "./adapters/transcripts.js";
 import { implementationWorktreePath } from "./adapters/workspace.js";
+import {
+  computeImplementationSlots,
+  countRunningImplementationWorkers,
+  implementationLaunchBlockReason,
+} from "./launch-rules.js";
 import type {
   RootScopedPorts,
   TrackerTicket,
@@ -384,8 +389,39 @@ export function createWorkflowCoordinator(
   }
 
   function hasRunningImplementationWorkers(): boolean {
+    return countRunningImplementationWorkers([
+      ...activeImplementationWorkers.values(),
+    ]) > 0;
+  }
+
+  function runningImplementationCount(): number {
+    return countRunningImplementationWorkers([
+      ...activeImplementationWorkers.values(),
+    ]);
+  }
+
+  /**
+   * Free Implementation slots: max(0, N - running).
+   * N is effective Worker concurrency (root → global → default 2).
+   */
+  async function freeImplementationSlots(
+    bound: RootScopedPorts,
+  ): Promise<{ n: number; running: number; slots: number }> {
+    const root = await bound.preferences.getRootWorkerConcurrency();
+    const global = await bound.preferences.getGlobalWorkerConcurrency();
+    const n = resolveEffectiveWorkerConcurrency(root, global);
+    const running = runningImplementationCount();
+    return { n, running, slots: computeImplementationSlots(n, running) };
+  }
+
+  /**
+   * True when any completed worker is waiting to become pendingDisposition
+   * (P1: process disposition before opening more implements).
+   */
+  function hasNeedsDispositionWaiting(): boolean {
+    if (pendingDisposition) return true;
     for (const worker of activeImplementationWorkers.values()) {
-      if (worker.status === "running") return true;
+      if (worker.status === "needs-disposition") return true;
     }
     return false;
   }
@@ -402,6 +438,66 @@ export function createWorkflowCoordinator(
       }
     }
     return undefined;
+  }
+
+  /**
+   * Shared P1 + slot gate for new Implementation launches (including Rework).
+   * Returns a failed StageResult when blocked; undefined when allowed.
+   */
+  async function blockNewImplementationLaunch(
+    bound: RootScopedPorts,
+    ticketNumber: number,
+    stage: "implement" | "rework" = "implement",
+  ): Promise<StageResult | undefined> {
+    const { n, running, slots } = await freeImplementationSlots(bound);
+    const reason = implementationLaunchBlockReason({
+      slots,
+      pendingDisposition: hasNeedsDispositionWaiting(),
+      pendingIntegration: pendingIntegration !== undefined,
+      activeConflictWorker: activeConflictWorker !== undefined,
+      // Specific ticket readiness is checked separately; treat as non-empty here.
+      readyCount: 1,
+    });
+    if (!reason) return undefined;
+
+    if (reason === "pending-disposition") {
+      const waiting =
+        pendingDisposition ??
+        [...activeImplementationWorkers.values()].find(
+          (w) => w.status === "needs-disposition",
+        );
+      return {
+        status: "failed",
+        stage,
+        reason: waiting
+          ? `An Implementation disposition is pending for #${waiting.ticketNumber}. Choose Close, Leave open, or Investigate before launching another worker.`
+          : "An Implementation disposition is pending. Resolve it before launching another worker.",
+        ticketNumber,
+      };
+    }
+    if (reason === "pending-integration") {
+      return {
+        status: "failed",
+        stage,
+        reason: `An Integration unit is pending for #${pendingIntegration!.ticketNumber}. Finish Integration before launching another Implementation worker.`,
+        ticketNumber,
+      };
+    }
+    if (reason === "conflict-worker") {
+      return {
+        status: "failed",
+        stage,
+        reason: `A Conflict resolution worker is active for #${activeConflictWorker!.ticketNumber}. Finish conflict resolution before launching another Implementation worker.`,
+        ticketNumber,
+      };
+    }
+    // no-slots (empty-frontier is handled by ready-ticket checks)
+    return {
+      status: "failed",
+      stage,
+      reason: `No free Implementation worker slots (running ${running} of effective concurrency ${n}). Wait for a worker to finish before launching another.`,
+      ticketNumber,
+    };
   }
 
   /**
@@ -1422,14 +1518,22 @@ export function createWorkflowCoordinator(
         ];
       }
 
-      // While Implementation workers run (and nothing needs disposition/integration),
-      // the passive panel owns progress.
-      if (hasRunningImplementationWorkers()) {
+      // Slot math: N effective concurrency; slots = max(0, N - running).
+      // While slots remain and P1 allows, offer ready-frontier implements so
+      // the run loop can fill without waiting for the first worker to finish.
+      // When slots are full, the passive panel owns progress (empty Next list).
+      const { slots } = await freeImplementationSlots(bound);
+      const runningWorkers = hasRunningImplementationWorkers();
+
+      if (slots === 0 && runningWorkers) {
+        // No free slots while workers run — wait surface, no overflow implements.
         return [];
       }
 
       const actions: NextAction[] = [];
-      if (pendingCiRecovery) {
+      // CI / PR / cleanup only when no Implementation workers are running so
+      // slot filling and wait semantics stay simple under concurrency.
+      if (!runningWorkers && pendingCiRecovery) {
         const n = pendingCiRecovery.ticketNumber;
         const detail =
           pendingCiRecovery.summary ??
@@ -1460,55 +1564,62 @@ export function createWorkflowCoordinator(
         return actions;
       }
 
-      for (const ticket of progress.awaitingCi) {
-        if (pendingCiRecovery?.ticketNumber === ticket.number) continue;
-        actions.push({
-          id: checkCiActionId(ticket.number),
-          label: `Check CI #${ticket.number}`,
-          description: `${ticket.title}. On-demand CI gate check — pending returns control immediately; green closes the ticket; red offers recovery.`,
-        });
-      }
-
-      const now = Date.now();
-      actions.push(
-        ...progress.ready
-          .filter((ticket) => {
-            const cooled = implementationRecoveryCooldown.get(ticket.number);
-            if (cooled === undefined) return true;
-            if (now - cooled >= IMPLEMENTATION_RECOVERY_COOLDOWN_MS) {
-              implementationRecoveryCooldown.delete(ticket.number);
-              return true;
-            }
-            return false;
-          })
-          .map(formatImplementAction),
-      );
-
-      // Pre-merge Rework for closed integrated tickets (fresh numbered attempt).
-      if (!active.workflowPr || active.stage === "pr-opened") {
-        const closedIntegrated = (active.integratedTickets ?? []).filter(
-          (t) =>
-            !progress.ready.some((r) => r.number === t.number) &&
-            !progress.awaitingCi.some((r) => r.number === t.number) &&
-            !progress.blocked.some((r) => r.number === t.number),
-        );
-        // Offer rework only for tickets that are closed on GitHub.
-        if (closedIntegrated.length > 0) {
-          const closedTickets = await bound.tracker.listTickets(
-            closedIntegrated.map((t) => t.number),
-          );
-          for (const ticket of closedTickets) {
-            if (ticket.state !== "CLOSED") continue;
-            actions.push({
-              id: reworkTicketActionId(ticket.number),
-              label: `Rework #${ticket.number}`,
-              description: `${ticket.title}. Pre-merge Rework attempt: reopen the ticket and create a fresh numbered Implementation workspace without reusing the completed one.`,
-            });
-          }
+      if (!runningWorkers) {
+        for (const ticket of progress.awaitingCi) {
+          if (pendingCiRecovery?.ticketNumber === ticket.number) continue;
+          actions.push({
+            id: checkCiActionId(ticket.number),
+            label: `Check CI #${ticket.number}`,
+            description: `${ticket.title}. On-demand CI gate check — pending returns control immediately; green closes the ticket; red offers recovery.`,
+          });
         }
       }
 
-      if (allTicketsComplete(progress)) {
+      // Offer Implement only while free slots remain (P1 already gated above).
+      if (slots > 0) {
+        const now = Date.now();
+        const launchable = progress.ready.filter((ticket) => {
+          if (findRunningWorkerForTicket(ticket.number)) return false;
+          const cooled = implementationRecoveryCooldown.get(ticket.number);
+          if (cooled === undefined) return true;
+          if (now - cooled >= IMPLEMENTATION_RECOVERY_COOLDOWN_MS) {
+            implementationRecoveryCooldown.delete(ticket.number);
+            return true;
+          }
+          return false;
+        });
+        // Stable ticket-number order is already how progress.ready is sorted.
+        actions.push(...launchable.map(formatImplementAction));
+
+        // Pre-merge Rework for closed integrated tickets (same slot rules).
+        if (!active.workflowPr || active.stage === "pr-opened") {
+          const closedIntegrated = (active.integratedTickets ?? []).filter(
+            (t) =>
+              !progress.ready.some((r) => r.number === t.number) &&
+              !progress.awaitingCi.some((r) => r.number === t.number) &&
+              !progress.blocked.some((r) => r.number === t.number),
+          );
+          if (closedIntegrated.length > 0) {
+            const closedTickets = await bound.tracker.listTickets(
+              closedIntegrated.map((t) => t.number),
+            );
+            for (const ticket of closedTickets) {
+              if (ticket.state !== "CLOSED") continue;
+              if (findRunningWorkerForTicket(ticket.number)) continue;
+              actions.push({
+                id: reworkTicketActionId(ticket.number),
+                label: `Rework #${ticket.number}`,
+                description: `${ticket.title}. Pre-merge Rework attempt: reopen the ticket and create a fresh numbered Implementation workspace without reusing the completed one.`,
+              });
+            }
+          }
+        }
+      } else if (runningWorkers) {
+        // No free slots and workers still running — wait (panel owns progress).
+        return [];
+      }
+
+      if (!runningWorkers && allTicketsComplete(progress)) {
         const integratedCount = active.integratedTickets?.length ?? 0;
         const allIntegrated =
           integratedCount >= progress.total &&
@@ -1532,7 +1643,14 @@ export function createWorkflowCoordinator(
         }
       }
 
-      actions.push(formatTicketProgressAction(progress));
+      // Ticket progress is informational; omit while workers run so the
+      // pipeline auto-picker stays on implement fills / wait.
+      if (!runningWorkers) {
+        actions.push(formatTicketProgressAction(progress));
+      } else if (actions.length === 0) {
+        // Running workers, free slots, but no launchable ready ticket left.
+        return [];
+      }
       return actions;
     }
 
@@ -2024,28 +2142,6 @@ export function createWorkflowCoordinator(
       };
     }
 
-    if (pendingDisposition) {
-      return {
-        status: "failed",
-        stage: "implement",
-        reason: `An Implementation disposition is pending for #${pendingDisposition.ticketNumber}. Choose Close, Leave open, or Investigate before launching another worker.`,
-        ticketNumber,
-      };
-    }
-
-    // Completed workers waiting for the single pendingDisposition slot also block
-    // new launches (P1: process disposition before opening more implements).
-    for (const waiting of activeImplementationWorkers.values()) {
-      if (waiting.status === "needs-disposition") {
-        return {
-          status: "failed",
-          stage: "implement",
-          reason: `An Implementation disposition is pending for #${waiting.ticketNumber}. Choose Close, Leave open, or Investigate before launching another worker.`,
-          ticketNumber,
-        };
-      }
-    }
-
     const alreadyRunning = findRunningWorkerForTicket(ticketNumber);
     if (alreadyRunning) {
       return {
@@ -2281,6 +2377,16 @@ export function createWorkflowCoordinator(
         attempt: plan.attempt,
       };
     }
+
+    // Slot math + P1 gate only when we are about to open a new worker process.
+    // Disposition recovery / retry-integration above do not consume a slot.
+    // Already-running workers are never aborted here (P1).
+    const launchBlock = await blockNewImplementationLaunch(
+      bound,
+      ticketNumber,
+      "implement",
+    );
+    if (launchBlock) return launchBlock;
 
     const prepared = await bound.skills.prepareImplement({
       ticketNumber,
@@ -4079,6 +4185,16 @@ export function createWorkflowCoordinator(
 
   async function startRework(ticketNumber: number): Promise<StageResult> {
     const bound = await requireScoped();
+
+    // Rework attempts use the same slot + P1 rules as Implement (check before
+    // reopening / mutating the manifest so a blocked launch is a no-op).
+    const launchBlock = await blockNewImplementationLaunch(
+      bound,
+      ticketNumber,
+      "rework",
+    );
+    if (launchBlock) return launchBlock;
+
     const active = await loadActiveWorkflow(bound);
     if (!active || !isTicketWorkStage(active.stage)) {
       return {

@@ -23,6 +23,13 @@ export {
   resolveEffectiveWorkerConcurrency,
 } from "./preferences.js";
 export {
+  canLaunchImplementationWorker,
+  computeImplementationSlots,
+  countRunningImplementationWorkers,
+  implementationLaunchBlockReason,
+} from "../launch-rules.js";
+export type { ImplementationLaunchBlockReason } from "../launch-rules.js";
+export {
   createSkillsPort,
   type CreateSpecHost,
   type SkillsHost,
