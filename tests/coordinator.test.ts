@@ -893,6 +893,8 @@ type PrefState = {
   globalWorkerProfile?: WorkerProfile;
   rootWorkerProfile?: WorkerProfile;
   snapshotWorkerProfile?: WorkerProfile;
+  globalWorkerConcurrency?: number;
+  rootWorkerConcurrency?: number;
   activeWorkflowIds?: Record<string, number>;
 };
 
@@ -914,6 +916,17 @@ function createPreferences(state: PrefState = {}): PreferencesPort {
     },
     clearRootWorkerProfile: async () => {
       delete store.rootWorkerProfile;
+    },
+    getGlobalWorkerConcurrency: async () => store.globalWorkerConcurrency,
+    getRootWorkerConcurrency: async () => store.rootWorkerConcurrency,
+    setGlobalWorkerConcurrency: async (concurrency) => {
+      store.globalWorkerConcurrency = concurrency;
+    },
+    setRootWorkerConcurrency: async (concurrency) => {
+      store.rootWorkerConcurrency = concurrency;
+    },
+    clearRootWorkerConcurrency: async () => {
+      delete store.rootWorkerConcurrency;
     },
     getActiveWorkflowId: async (targetBranch) =>
       store.activeWorkflowIds?.[targetBranch],
@@ -1449,6 +1462,148 @@ describe("Workflow coordinator Worker profile precedence", () => {
       source: "workflow-root",
     });
     expect(homeModel).toBe("still-workflow-home-model");
+  });
+});
+
+describe("Workflow coordinator Worker concurrency preferences", () => {
+  it("defaults effective concurrency to 2 when global and root are unset", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(2);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBeUndefined();
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("uses global concurrency when root is unset", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerConcurrency: 3 },
+        },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("prefers Workflow-root override over global concurrency", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerConcurrency: 3,
+            rootWorkerConcurrency: 5,
+          },
+        },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(5);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBe(5);
+  });
+
+  it("sets global concurrency through the coordinator seam", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await coordinator.setGlobalWorkerConcurrency(4);
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(4);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(4);
+  });
+
+  it("sets a Workflow-root override without changing the global concurrency", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerConcurrency: 3 },
+        },
+      }),
+    );
+
+    await coordinator.setRootWorkerConcurrency(6);
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(6);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+  });
+
+  it("clears the Workflow-root concurrency override so global becomes effective", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerConcurrency: 3,
+            rootWorkerConcurrency: 8,
+          },
+        },
+      }),
+    );
+
+    await coordinator.clearRootWorkerConcurrency();
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("rejects non-integer and sub-1 concurrency on set", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await expect(coordinator.setGlobalWorkerConcurrency(0)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setGlobalWorkerConcurrency(-1)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setGlobalWorkerConcurrency(1.5)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setRootWorkerConcurrency(0)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setRootWorkerConcurrency(2.2)).rejects.toThrow(
+      /positive integer/i,
+    );
+    // Valid values still succeed after rejections.
+    await coordinator.setGlobalWorkerConcurrency(1);
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(1);
+  });
+
+  it("writes concurrency only through PreferencesPort (no GitHub writes)", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {},
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.setGlobalWorkerConcurrency(3);
+    await coordinator.setRootWorkerConcurrency(4);
+    await coordinator.clearRootWorkerConcurrency();
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+
+    // Preferences are local-only; tracker mutation helpers must not be called.
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+    expect(tracker.state.closeIssueCalls).toEqual([]);
+    expect(tracker.state.addBlockedByCalls).toEqual([]);
+    expect(tracker.state.addSubIssueCalls).toEqual([]);
   });
 });
 
@@ -2496,8 +2651,30 @@ function ticketsPublishedFixture(
     transcripts?: ReturnType<typeof createTranscripts>;
     skills?: SkillsFixture;
     ci?: ReturnType<typeof createCi>;
+    /** Extra / override preferences for the default root. */
+    preferences?: PrefState;
+    /**
+     * When true, publish three independent ready tickets (43, 44, 46) plus
+     * blocked 45 — used for slot-fill / N=2 tests.
+     */
+    threeReadyTickets?: boolean;
   } = {},
 ) {
+  const ticketNumbers = options.threeReadyTickets
+    ? [43, 44, 45, 46]
+    : [43, 44, 45];
+  const tickets = options.threeReadyTickets
+    ? [
+        { number: 43, title: "Ship core path", blockedBy: [] },
+        { number: 44, title: "Ship parallel path", blockedBy: [] },
+        { number: 45, title: "Ship dependent path", blockedBy: [43] },
+        { number: 46, title: "Ship third ready path", blockedBy: [] },
+      ]
+    : [
+        { number: 43, title: "Ship core path", blockedBy: [] },
+        { number: 44, title: "Ship parallel path", blockedBy: [] },
+        { number: 45, title: "Ship dependent path", blockedBy: [43] },
+      ];
   const tracker = createTracker({
     active: {
       workflowId: 42,
@@ -2505,13 +2682,9 @@ function ticketsPublishedFixture(
       stage: "tickets-published",
       workerProfile: defaultWorkerProfile,
       title: "Existing spec",
-      tickets: [43, 44, 45],
+      tickets: ticketNumbers,
     },
-    tickets: [
-      { number: 43, title: "Ship core path", blockedBy: [] },
-      { number: 44, title: "Ship parallel path", blockedBy: [] },
-      { number: 45, title: "Ship dependent path", blockedBy: [43] },
-    ],
+    tickets,
   });
   const workspace = options.workspace ?? createWorkspace("/repo");
   const workers = options.workers ?? createWorkers();
@@ -2528,7 +2701,10 @@ function ticketsPublishedFixture(
   };
   const ports = createPorts({
     defaultRoot: {
-      preferences: { globalWorkerProfile: defaultWorkerProfile },
+      preferences: {
+        globalWorkerProfile: defaultWorkerProfile,
+        ...(options.preferences ?? {}),
+      },
       tracker,
       workspace,
       workers,
@@ -2680,8 +2856,12 @@ describe("Workflow coordinator single Implementation worker path", () => {
       message: "Running tests",
     });
 
-    // No Next actions while the worker runs — panel owns progress.
-    await expect(coordinator.nextActions()).resolves.toEqual([]);
+    // Free slots still surface remaining ready-frontier implements; the panel
+    // owns progress for the running worker (no ticket-progress row while busy).
+    const actionsWhileRunning = await coordinator.nextActions();
+    expect(actionsWhileRunning.map((a) => a.id)).toEqual([
+      implementTicketActionId(44),
+    ]);
   });
 
   it("receives Stage results over the Worker protocol and offers Implementation disposition", async () => {
@@ -3068,16 +3248,224 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(workers.state.launches).toHaveLength(0);
   });
 
-  it("rejects a second concurrent launch on the single-worker path", async () => {
+  it("rejects a second concurrent launch for the same ticket", async () => {
     const { coordinator } = ticketsPublishedFixture();
 
     await coordinator.runNextAction(implementTicketActionId(43));
-    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    const second = await coordinator.runNextAction(implementTicketActionId(43));
 
     expect(second.status).toBe("failed");
     if (second.status === "failed") {
       expect(second.reason).toMatch(/already running/i);
     }
+  });
+
+  it("runs two Implementation workers concurrently with isolated event routing", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    const first = await coordinator.runNextAction(implementTicketActionId(43));
+    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    expect(first).toMatchObject({
+      status: "running",
+      ticketNumber: 43,
+      workerId: "implement-42-43-r1",
+    });
+    expect(second).toMatchObject({
+      status: "running",
+      ticketNumber: 44,
+      workerId: "implement-42-44-r1",
+    });
+    expect(workers.state.launches).toHaveLength(2);
+    expect(workers.state.sinks.size).toBe(2);
+
+    await workers.emit("implement-42-43-r1", {
+      type: "progress",
+      workerId: "implement-42-43-r1",
+      message: "A tests",
+    });
+    await workers.emit("implement-42-44-r1", {
+      type: "progress",
+      workerId: "implement-42-44-r1",
+      message: "B tests",
+    });
+
+    const panelBothRunning = await coordinator.getPanelState();
+    expect(panelBothRunning?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "running",
+          progress: "A tests",
+          workerId: "implement-42-43-r1",
+          pid: 4242,
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "running",
+          progress: "B tests",
+          workerId: "implement-42-44-r1",
+          pid: 4242,
+        }),
+      ]),
+    );
+    expect(panelBothRunning?.workers).toHaveLength(2);
+    expect(
+      panelBothRunning?.lines.filter((l) => /Worker #/.test(l)),
+    ).toHaveLength(2);
+
+    // Worker A completes — B must remain running and untouched.
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "A done" },
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const panelAfterA = await coordinator.getPanelState();
+    expect(panelAfterA?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "needs-disposition",
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "running",
+          progress: "B tests",
+        }),
+      ]),
+    );
+    expect(panelAfterA?.workers).toHaveLength(2);
+
+    // Disposition for A is offered while B still runs (P1).
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(43),
+        label: "Disposition #43",
+        description: "A done",
+      },
+    ]);
+
+    // Progress / exit for B must not clear A's pending disposition.
+    await workers.emit("implement-42-44-r1", {
+      type: "progress",
+      workerId: "implement-42-44-r1",
+      message: "B still going",
+    });
+    const panelMidB = await coordinator.getPanelState();
+    expect(
+      panelMidB?.workers.find((w) => w.ticketNumber === 43)?.status,
+    ).toBe("needs-disposition");
+    expect(
+      panelMidB?.workers.find((w) => w.ticketNumber === 44),
+    ).toMatchObject({
+      status: "running",
+      progress: "B still going",
+    });
+  });
+
+  it("retains a second completed worker until the first disposition is resolved", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "First done" },
+    });
+    await workers.emit("implement-42-44-r1", {
+      type: "stage-result",
+      workerId: "implement-42-44-r1",
+      outcome: { status: "completed", summary: "Second done" },
+    });
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "needs-disposition",
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "needs-disposition",
+        }),
+      ]),
+    );
+    expect(panel?.workers).toHaveLength(2);
+
+    // Only one disposition is pending as a Next action.
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(43),
+        label: "Disposition #43",
+        description: "First done",
+      },
+    ]);
+
+    await coordinator.confirmDisposition("leave-open");
+
+    // Second Stage result is promoted — not dropped.
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(44),
+        label: "Disposition #44",
+        description: "Second done",
+      },
+    ]);
+    const panelAfter = await coordinator.getPanelState();
+    expect(panelAfter?.workers).toEqual([
+      expect.objectContaining({
+        ticketNumber: 44,
+        status: "needs-disposition",
+      }),
+    ]);
+  });
+
+  it("aborts every running Implementation worker on abortWorkers / pause", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    await coordinator.abortWorkers();
+
+    expect(workers.state.abortAllCount).toBe(1);
+    expect(workers.state.aborts).toEqual(
+      expect.arrayContaining([
+        "implement-42-43-r1",
+        "implement-42-44-r1",
+      ]),
+    );
+
+    const panelAfterAbort = await coordinator.getPanelState();
+    expect(
+      panelAfterAbort?.workers.every((w) => w.status !== "running") ?? true,
+    ).toBe(true);
+
+    // Fresh launches after cooldown clear via successful re-launch path.
+    const relaunchA = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    const relaunchB = await coordinator.runNextAction(
+      implementTicketActionId(44),
+    );
+    expect(relaunchA).toMatchObject({ status: "running", attempt: 2 });
+    expect(relaunchB).toMatchObject({ status: "running", attempt: 2 });
+
+    const pause = await coordinator.pausePipeline();
+    expect(pause.abortedWorkerCount).toBe(2);
+    expect(pause.pipelinePaused).toBe(true);
+    expect(workers.state.abortAllCount).toBe(2);
+    expect(
+      pause.affectedAttempts.map((a) => a.ticketNumber).sort((a, b) => a - b),
+    ).toEqual([43, 44]);
   });
 
   it("numbers rework attempts without reusing a completed workspace identity", async () => {
@@ -3099,6 +3487,273 @@ describe("Workflow coordinator single Implementation worker path", () => {
       worktreePath: "/matt-auto-workspaces/42/ticket-43/r2",
     });
     expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 2]);
+  });
+});
+
+describe("Workflow coordinator launch rules: slots, ready frontier, P1", () => {
+  it("with N=2 and 3 ready tickets, exactly 2 workers launch initially", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      // default effective concurrency is 2
+    });
+
+    const first = await coordinator.runNextAction(implementTicketActionId(43));
+    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    const third = await coordinator.runNextAction(implementTicketActionId(46));
+
+    expect(first).toMatchObject({ status: "running", ticketNumber: 43 });
+    expect(second).toMatchObject({ status: "running", ticketNumber: 44 });
+    expect(third.status).toBe("failed");
+    if (third.status === "failed") {
+      expect(third.reason).toMatch(/no free Implementation worker slots/i);
+      expect(third.reason).toMatch(/running 2 of effective concurrency 2/i);
+    }
+    expect(workers.state.launches).toHaveLength(2);
+
+    // nextActions does not offer overflow implements while slots are full.
+    await expect(coordinator.nextActions()).resolves.toEqual([]);
+  });
+
+  it("offers remaining ready implements while a free slot remains", async () => {
+    const { coordinator } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: { globalWorkerConcurrency: 2 },
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+
+    const actions = await coordinator.nextActions();
+    const ids = actions.map((a) => a.id);
+    expect(ids).toContain(implementTicketActionId(44));
+    expect(ids).toContain(implementTicketActionId(46));
+    expect(ids).not.toContain(implementTicketActionId(43)); // already running
+    expect(ids).not.toContain(TICKET_PROGRESS_ACTION.id);
+  });
+
+  it("third ticket launches only after a slot frees and P1 allows", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: { globalWorkerConcurrency: 2 },
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    // Worker A completes → needs-disposition. Slot free numerically, but P1 blocks.
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "A done" },
+    });
+
+    const blockedByP1 = await coordinator.runNextAction(
+      implementTicketActionId(46),
+    );
+    expect(blockedByP1.status).toBe("failed");
+    if (blockedByP1.status === "failed") {
+      expect(blockedByP1.reason).toMatch(/disposition is pending/i);
+    }
+    expect(workers.state.launches).toHaveLength(2);
+
+    // Resolve disposition without Integration (leave-open). B still running:
+    // slots = 2 - 1 = 1 → third may launch.
+    await coordinator.confirmDisposition("leave-open");
+
+    const third = await coordinator.runNextAction(implementTicketActionId(46));
+    expect(third).toMatchObject({
+      status: "running",
+      ticketNumber: 46,
+      workerId: "implement-42-46-r1",
+    });
+    expect(workers.state.launches).toHaveLength(3);
+
+    // B must still be running (P1 never aborts already-running workers).
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "running",
+        }),
+        expect.objectContaining({
+          ticketNumber: 46,
+          status: "running",
+        }),
+      ]),
+    );
+  });
+
+  it("pendingDisposition blocks new launches while other workers may still run", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: { globalWorkerConcurrency: 3 },
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "First done" },
+    });
+
+    // Free slot exists (N=3, running=1) but P1 blocks new implements.
+    const blocked = await coordinator.runNextAction(
+      implementTicketActionId(46),
+    );
+    expect(blocked.status).toBe("failed");
+    if (blocked.status === "failed") {
+      expect(blocked.reason).toMatch(/disposition is pending for #43/i);
+    }
+
+    // Only disposition is offered; worker B still listed as running.
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(43),
+        label: "Disposition #43",
+        description: "First done",
+      },
+    ]);
+    const panel = await coordinator.getPanelState();
+    expect(
+      panel?.workers.find((w) => w.ticketNumber === 44)?.status,
+    ).toBe("running");
+    expect(workers.state.launches).toHaveLength(2);
+  });
+
+  it("pending Integration blocks new implements even when slots remain", async () => {
+    const verification = createVerification({
+      result: {
+        ok: false,
+        reason: "broken",
+        commands: ["npm test"],
+      },
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: { globalWorkerConcurrency: 3 },
+      verification,
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "A done" },
+    });
+    await coordinator.confirmDisposition("close");
+
+    // Integration pending after failed Local verification.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+
+    const blocked = await coordinator.runNextAction(
+      implementTicketActionId(44),
+    );
+    expect(blocked.status).toBe("failed");
+    if (blocked.status === "failed") {
+      expect(blocked.reason).toMatch(/Integration unit is pending/i);
+    }
+    expect(workers.state.launches).toHaveLength(1);
+  });
+
+  it("active Conflict worker blocks new implements", async () => {
+    const workspace = createWorkspace("/repo", {
+      mergeResult: {
+        ok: false,
+        reason: "conflict",
+        message: "CONFLICT (content): merge conflict in src/app.ts",
+      },
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: { globalWorkerConcurrency: 3 },
+      workspace,
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "A done" },
+    });
+    await coordinator.confirmDisposition("close");
+
+    // Conflict worker is live under a pending Integration unit; nextActions empty.
+    await expect(coordinator.nextActions()).resolves.toEqual([]);
+    const blocked = await coordinator.runNextAction(
+      implementTicketActionId(44),
+    );
+    expect(blocked.status).toBe("failed");
+    if (blocked.status === "failed") {
+      // Conflict is nested under pendingIntegration — either reason is P1.
+      expect(blocked.reason).toMatch(
+        /Integration unit is pending|Conflict resolution worker is active/i,
+      );
+    }
+    expect(
+      workers.state.launches.some((l) => l.workerId.startsWith("conflict-")),
+    ).toBe(true);
+  });
+
+  it("respects root concurrency override for slot math", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture({
+      threeReadyTickets: true,
+      preferences: {
+        globalWorkerConcurrency: 5,
+        rootWorkerConcurrency: 1,
+      },
+    });
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(1);
+
+    const first = await coordinator.runNextAction(implementTicketActionId(43));
+    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    expect(first).toMatchObject({ status: "running" });
+    expect(second.status).toBe("failed");
+    if (second.status === "failed") {
+      expect(second.reason).toMatch(/running 1 of effective concurrency 1/i);
+    }
+    expect(workers.state.launches).toHaveLength(1);
+  });
+
+  it("rework attempts use the same slot rules", async () => {
+    const { coordinator, workers, tracker } = ticketsPublishedFixture({
+      preferences: { globalWorkerConcurrency: 1 },
+    });
+
+    // Integrate #43 so Rework is available later.
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "integrated later" },
+    });
+    await coordinator.confirmDisposition("close");
+
+    // Fill the only slot with #44 while #43 is integrated.
+    // First ensure integration completed for #43 (verification default ok).
+    // (confirmDisposition close already ran Integration unit successfully.)
+
+    // Mark #43 closed on tracker so rework is meaningful; fixture integration
+    // path closes after CI — force integrated + closed for this unit test.
+    const active = await coordinator.getActiveWorkflow();
+    expect(active?.integratedTickets?.some((t) => t.number === 43)).toBe(true);
+
+    // Close #43 on GitHub so rework action would reopen it.
+    await tracker.port.closeIssue(43);
+
+    await coordinator.runNextAction(implementTicketActionId(44));
+    expect(workers.state.launches).toHaveLength(2); // 43 then 44
+
+    const rework = await coordinator.runNextAction(reworkTicketActionId(43));
+    expect(rework.status).toBe("failed");
+    if (rework.status === "failed") {
+      expect(rework.reason).toMatch(/no free Implementation worker slots/i);
+    }
+    // Must not have reopened when slot-blocked (early gate before mutation).
+    expect(tracker.state.reopenIssueCalls).not.toContain(43);
   });
 });
 
@@ -4004,7 +4659,10 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 1, 1, 2]);
 
     // Workflow PR is not offered while rework is in flight / ticket open.
-    expect(await coordinator.nextActions()).toEqual([]);
+    // Free slots may still offer Rework for other closed integrated tickets.
+    const idsWhileRework = (await coordinator.nextActions()).map((a) => a.id);
+    expect(idsWhileRework).not.toContain(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(idsWhileRework).not.toContain(implementTicketActionId(43));
 
     await workers.emit("implement-42-43-r2", {
       type: "stage-result",
@@ -4379,16 +5037,15 @@ describe("Workflow coordinator Resume prefers latest unintegrated Implementation
     expect(actions.map((a) => a.id)).toEqual([dispositionActionId(43)]);
     expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
 
-    // Explicit implement seam also prefers disposition over rN+1.
+    // Explicit implement seam recovers disposition for this ticket rather than
+    // launching rN+1 (does not open a new worker process).
     const result = await coordinator.runNextAction(implementTicketActionId(43));
     expect(result).toMatchObject({
-      status: "failed",
+      status: "needs-disposition",
       stage: "implement",
       ticketNumber: 43,
+      attempt: 1,
     });
-    expect(String((result as { reason?: string }).reason ?? "")).toMatch(
-      /disposition/i,
-    );
 
     // No fresh workspace created beyond the original r1.
     expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1]);

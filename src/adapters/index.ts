@@ -16,7 +16,24 @@ export {
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
 } from "./planning-draft.js";
-export { createPreferencesPort } from "./preferences.js";
+export {
+  assertValidWorkerConcurrency,
+  createPreferencesPort,
+  isValidWorkerConcurrency,
+  resolveEffectiveWorkerConcurrency,
+  resolveWorkerConcurrency,
+} from "./preferences.js";
+export type {
+  ResolvedWorkerConcurrency,
+  WorkerConcurrencySource,
+} from "./preferences.js";
+export {
+  canLaunchImplementationWorker,
+  computeImplementationSlots,
+  countRunningImplementationWorkers,
+  implementationLaunchBlockReason,
+} from "../launch-rules.js";
+export type { ImplementationLaunchBlockReason } from "../launch-rules.js";
 export {
   createSkillsPort,
   type CreateSpecHost,

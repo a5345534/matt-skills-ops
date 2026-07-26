@@ -1,15 +1,76 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DEFAULT_WORKER_CONCURRENCY } from "../constants.js";
 import type { PreferencesPort } from "../ports.js";
 import type { WorkerProfile } from "../types.js";
 
 type PreferencesFile = {
   targetBranch?: string;
   workerProfile?: WorkerProfile;
+  /** Optional positive integer Worker concurrency for this prefs layer. */
+  workerConcurrency?: number;
   /** Target branch → Active Workflow ID (rebuildable local cache). */
   activeWorkflowIds?: Record<string, number>;
 };
+
+/** True when value is a positive integer (>= 1). */
+export function isValidWorkerConcurrency(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
+
+/**
+ * Reject non-integers and values < 1 for Worker concurrency writes.
+ */
+export function assertValidWorkerConcurrency(
+  value: unknown,
+): asserts value is number {
+  if (!isValidWorkerConcurrency(value)) {
+    throw new Error("Worker concurrency must be a positive integer (>= 1).");
+  }
+}
+
+/** Where an effective Worker concurrency value was resolved from. */
+export type WorkerConcurrencySource =
+  | "workflow-root"
+  | "global"
+  | "default";
+
+/** Effective Worker concurrency with the layer that supplied it. */
+export type ResolvedWorkerConcurrency = {
+  concurrency: number;
+  source: WorkerConcurrencySource;
+};
+
+/**
+ * Resolve effective Worker concurrency with source: root → global → default 2.
+ * Callers pass only validated or sanitized layer values.
+ */
+export function resolveWorkerConcurrency(
+  root: number | undefined,
+  global: number | undefined,
+  defaultValue: number = DEFAULT_WORKER_CONCURRENCY,
+): ResolvedWorkerConcurrency {
+  if (isValidWorkerConcurrency(root)) {
+    return { concurrency: root, source: "workflow-root" };
+  }
+  if (isValidWorkerConcurrency(global)) {
+    return { concurrency: global, source: "global" };
+  }
+  return { concurrency: defaultValue, source: "default" };
+}
+
+/**
+ * Resolve effective Worker concurrency: root → global → default 2.
+ * Callers pass only validated or sanitized layer values.
+ */
+export function resolveEffectiveWorkerConcurrency(
+  root: number | undefined,
+  global: number | undefined,
+  defaultValue: number = DEFAULT_WORKER_CONCURRENCY,
+): number {
+  return resolveWorkerConcurrency(root, global, defaultValue).concurrency;
+}
 
 async function readPreferencesFile(
   filePath: string,
@@ -139,6 +200,47 @@ export function createPreferencesPort(workflowRoot: string): PreferencesPort {
         return;
       }
       const { workerProfile: _removed, ...rest } = existing;
+      await writePreferencesFile(rootPrefsPath, rest);
+    },
+
+    async getGlobalWorkerConcurrency() {
+      const global = await readPreferencesFile(globalPrefsPath);
+      return isValidWorkerConcurrency(global?.workerConcurrency)
+        ? global.workerConcurrency
+        : undefined;
+    },
+
+    async getRootWorkerConcurrency() {
+      const root = await readPreferencesFile(rootPrefsPath);
+      return isValidWorkerConcurrency(root?.workerConcurrency)
+        ? root.workerConcurrency
+        : undefined;
+    },
+
+    async setGlobalWorkerConcurrency(concurrency: number) {
+      assertValidWorkerConcurrency(concurrency);
+      const existing = (await readPreferencesFile(globalPrefsPath)) ?? {};
+      await writePreferencesFile(globalPrefsPath, {
+        ...existing,
+        workerConcurrency: concurrency,
+      });
+    },
+
+    async setRootWorkerConcurrency(concurrency: number) {
+      assertValidWorkerConcurrency(concurrency);
+      const existing = (await readPreferencesFile(rootPrefsPath)) ?? {};
+      await writePreferencesFile(rootPrefsPath, {
+        ...existing,
+        workerConcurrency: concurrency,
+      });
+    },
+
+    async clearRootWorkerConcurrency() {
+      const existing = await readPreferencesFile(rootPrefsPath);
+      if (!existing || existing.workerConcurrency === undefined) {
+        return;
+      }
+      const { workerConcurrency: _removed, ...rest } = existing;
       await writePreferencesFile(rootPrefsPath, rest);
     },
 

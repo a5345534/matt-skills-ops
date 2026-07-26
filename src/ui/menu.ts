@@ -1,5 +1,10 @@
 import type { MattAutoLogger } from "../adapters/logger.js";
 import {
+  isValidWorkerConcurrency,
+  resolveWorkerConcurrency,
+  type WorkerConcurrencySource,
+} from "../adapters/preferences.js";
+import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
   CLEANUP_WORKFLOW_ACTION,
@@ -13,6 +18,7 @@ import {
   REWORK_TICKET_ACTION_PREFIX,
   START_FOLLOW_UP_ACTION,
   TICKET_PROGRESS_ACTION,
+  WORKER_CONCURRENCY_WARNING_THRESHOLD,
 } from "../constants.js";
 
 let menuLogger: MattAutoLogger | undefined;
@@ -265,6 +271,27 @@ function runningWorkers(panel: WorkflowPanelState | undefined) {
   return panel?.workers.filter((w) => w.status === "running") ?? [];
 }
 
+/**
+ * Work that the run loop must drive next (P1), even while other Implementation
+ * workers are still running. Wait settles early so disposition / Integration
+ * retry auto-advance can run without aborting parallel workers.
+ */
+function hasP1RunLoopWork(panel: WorkflowPanelState | undefined): boolean {
+  if (!panel) return false;
+  if (panel.workers.some((w) => w.status === "needs-disposition")) return true;
+  if (panel.integration?.status === "pending-retry") return true;
+  return false;
+}
+
+/** True when the pipeline should keep waiting (live workers / conflict / pause). */
+function hasLivePipelineWork(panel: WorkflowPanelState | undefined): boolean {
+  if (!panel) return false;
+  if (panel.pipelinePaused || panel.runTerminated) return true;
+  if (panel.workers.some((w) => w.status === "running")) return true;
+  if (panel.integration?.status === "conflict-resolution") return true;
+  return false;
+}
+
 function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
   return (
     panel?.workers.map((w) => ({
@@ -487,9 +514,14 @@ async function presentRunBriefControlMenu(
  * from `getPanelState()`. The only controls are Pause / Resume / Terminate —
  * each requires explicit confirmation before coordinator APIs run.
  *
- * Settles when no workers are `running` and the pipeline is not paused
- * (including needs-disposition) so Auto-Close can proceed. Terminate exits
- * the wait with `{ status: "terminated" }` so the pipeline can stop cleanly.
+ * Settles when:
+ * - no workers are `running` and the pipeline is not paused, or
+ * - P1 run-loop work appears (needs-disposition / Integration pending-retry)
+ *   even while other Implementation workers still run, so Auto-Close and
+ *   serial Integration can proceed without aborting parallel workers.
+ *
+ * Terminate exits the wait with `{ status: "terminated" }` so the pipeline
+ * can stop cleanly.
  */
 export async function waitForPipelineWorkers(
   coordinator: Pick<WorkflowCoordinator, "getPanelState"> | RunBriefCoordinator,
@@ -506,11 +538,13 @@ export async function waitForPipelineWorkers(
   const initialPanel = await coordinator.getPanelState({ mode: "full" });
   const initialRunning = runningWorkers(initialPanel);
   const initialPaused = initialPanel?.pipelinePaused === true;
+  const initialP1 = hasP1RunLoopWork(initialPanel);
 
-  // Already settled (e.g. needs-disposition only) and not paused — do not block.
-  if (initialRunning.length === 0 && !initialPaused) {
+  // Already settled (no live runners, or P1 work ready) and not paused — do not block.
+  if ((initialRunning.length === 0 || initialP1) && !initialPaused) {
     log("info", "pipeline:workers-settled", {
       immediate: true,
+      p1: initialP1,
       panelWorkers: panelWorkerSnapshot(initialPanel),
     });
     if (initialPanel) {
@@ -601,6 +635,19 @@ export async function waitForPipelineWorkers(
           continue;
         }
         continue;
+      }
+
+      // P1: disposition / Integration retry must run even while other workers continue.
+      if (hasP1RunLoopWork(panel)) {
+        notifyRunBrief(ui, panel);
+        log("info", "pipeline:workers-settled", {
+          ticks: i + 1,
+          reason: "p1-run-loop-work",
+          runningCount: running.length,
+          panelWorkers: panelWorkerSnapshot(panel),
+          integration: panel.integration,
+        });
+        return { status: "settled" };
       }
 
       if (running.length === 0) {
@@ -738,9 +785,11 @@ const PREFLIGHT_HEADER = "--- Workflow preflight ---";
 const NEXT_ACTIONS_HEADER = "--- Next actions ---";
 const ROOT_HEADER = "--- Workflow root ---";
 const WORKER_HEADER = "--- Worker profile ---";
+const WORKER_CONCURRENCY_HEADER = "--- Worker concurrency ---";
 const REFRESH_ITEM = "Refresh preflight";
 const SWITCH_ROOT_ITEM = "Switch Workflow root…";
 const CONFIGURE_WORKER_ITEM = "Configure Worker profile…";
+const CONFIGURE_WORKER_CONCURRENCY_ITEM = "Configure Worker concurrency…";
 const RUN_PIPELINE_ITEM =
   "▶ Run post-grill pipeline (to-spec → tickets → implement…)";
 const NONE_AVAILABLE = "(none available)";
@@ -748,7 +797,16 @@ const NONE_AVAILABLE = "(none available)";
 const SET_GLOBAL_WORKER = "Set global default Worker profile";
 const SET_ROOT_WORKER = "Set Workflow-root override";
 const CLEAR_ROOT_WORKER = "Clear Workflow-root override";
+const SET_GLOBAL_WORKER_CONCURRENCY =
+  "Set global default Worker concurrency";
+const SET_ROOT_WORKER_CONCURRENCY =
+  "Set Workflow-root Worker concurrency override";
+const CLEAR_ROOT_WORKER_CONCURRENCY =
+  "Clear Workflow-root Worker concurrency override";
 const BACK_ITEM = "← Back";
+
+const CONFIRM_CONCURRENCY_WARNING_ITEM = "Confirm Worker concurrency";
+const DECLINE_CONCURRENCY_WARNING_ITEM = "Cancel";
 
 const PUBLISH_ITEM = "Publish";
 const REVISE_ITEM = "Revise";
@@ -835,6 +893,65 @@ function formatResolvedProfileLine(
   return `Effective: ${formatProfileShort(resolved.profile)} [${resolved.source}]`;
 }
 
+/** Compact main-menu line for effective Worker concurrency + source. */
+export function formatResolvedWorkerConcurrencyLine(
+  concurrency: number,
+  source: WorkerConcurrencySource,
+): string {
+  return `Effective Worker concurrency: ${concurrency} [${source}]`;
+}
+
+/** True when saving this Worker concurrency requires a Concurrency warning. */
+export function needsConcurrencyWarning(
+  concurrency: number,
+  threshold: number = WORKER_CONCURRENCY_WARNING_THRESHOLD,
+): boolean {
+  return concurrency > threshold;
+}
+
+/** Concurrency warning body shown before saving N above the threshold. */
+export function concurrencyWarningMessage(
+  concurrency: number,
+  threshold: number = WORKER_CONCURRENCY_WARNING_THRESHOLD,
+): string {
+  return [
+    `Concurrency warning: Worker concurrency ${concurrency} exceeds the warning threshold of ${threshold}.`,
+    "There is no Matt Auto hard upper limit. Confirming stores this value; run-time slot filling will not re-prompt.",
+    "Decline leaves preferences unchanged.",
+  ].join("\n");
+}
+
+/**
+ * Parse free-text Worker concurrency input.
+ * Accepts positive integers only (optional surrounding whitespace).
+ */
+export function parseWorkerConcurrencyInput(
+  raw: string,
+): { ok: true; value: number } | { ok: false; reason: string } {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return {
+      ok: false,
+      reason: "Worker concurrency must be a positive integer (>= 1).",
+    };
+  }
+  // Reject scientific notation / floats / trailing junk; require pure digits.
+  if (!/^\d+$/.test(trimmed)) {
+    return {
+      ok: false,
+      reason: `Invalid Worker concurrency "${trimmed}". Enter a positive integer (>= 1).`,
+    };
+  }
+  const value = Number(trimmed);
+  if (!isValidWorkerConcurrency(value)) {
+    return {
+      ok: false,
+      reason: "Worker concurrency must be a positive integer (>= 1).",
+    };
+  }
+  return { ok: true, value };
+}
+
 /** Compact single-line summary of the current Workflow root. */
 export function formatCurrentRootLine(root: WorkflowRoot): string {
   return `Current: ${root.path} (${root.kind}, ${formatRootStatus(root)})`;
@@ -874,6 +991,12 @@ export function formatPanelLines(panel: WorkflowPanelState): string[] {
   return formatCompactWorkflowPanelLines(panel);
 }
 
+/** Optional effective Worker concurrency for the main menu summary. */
+export type MainMenuWorkerConcurrency = {
+  concurrency: number;
+  source: WorkerConcurrencySource;
+};
+
 /** Build bare `/matt-auto` menu lines from coordinator state. */
 export function buildMainMenuItems(
   preflight: PreflightResult,
@@ -882,6 +1005,7 @@ export function buildMainMenuItems(
   rootCount: number,
   ticketProgress?: TicketProgressSummary,
   panel?: WorkflowPanelState,
+  workerConcurrency?: MainMenuWorkerConcurrency,
 ): string[] {
   const nextLines =
     nextActions.length > 0
@@ -893,9 +1017,19 @@ export function buildMainMenuItems(
     formatCurrentRootLine(currentRoot),
     WORKER_HEADER,
     formatResolvedProfileLine(preflight.workerProfile),
-    PREFLIGHT_HEADER,
-    ...preflight.checks.map(formatCheckLine),
   ];
+
+  if (workerConcurrency) {
+    items.push(
+      WORKER_CONCURRENCY_HEADER,
+      formatResolvedWorkerConcurrencyLine(
+        workerConcurrency.concurrency,
+        workerConcurrency.source,
+      ),
+    );
+  }
+
+  items.push(PREFLIGHT_HEADER, ...preflight.checks.map(formatCheckLine));
 
   if (preflight.ok && nextActions.length > 0) {
     items.push(RUN_PIPELINE_ITEM);
@@ -914,6 +1048,7 @@ export function buildMainMenuItems(
     ...nextLines,
     "---",
     CONFIGURE_WORKER_ITEM,
+    CONFIGURE_WORKER_CONCURRENCY_ITEM,
     REFRESH_ITEM,
   );
 
@@ -939,6 +1074,14 @@ export async function presentMainMenu(
     const nextActions = await coordinator.nextActions();
     const ticketProgress = await coordinator.getTicketProgress();
     const panel = await coordinator.getPanelState();
+    const [globalConcurrency, rootConcurrency] = await Promise.all([
+      coordinator.getGlobalWorkerConcurrency(),
+      coordinator.getRootWorkerConcurrency(),
+    ]);
+    const resolvedConcurrency = resolveWorkerConcurrency(
+      rootConcurrency,
+      globalConcurrency,
+    );
     // Secondary always-on Workflow panel from the same DTO (no-op without TUI widgets).
     publishWorkflowPanel(ui, panel);
     const panelLines = panel ? formatPanelLines(panel) : [];
@@ -949,6 +1092,7 @@ export async function presentMainMenu(
       roots.length,
       ticketProgress,
       panel,
+      resolvedConcurrency,
     );
     const selected = await ui.select("Matt Auto", items);
 
@@ -980,6 +1124,11 @@ export async function presentMainMenu(
       continue;
     }
 
+    if (selected === CONFIGURE_WORKER_CONCURRENCY_ITEM) {
+      await presentWorkerConcurrencyMenu(coordinator, ui);
+      continue;
+    }
+
     if (selected === RUN_PIPELINE_ITEM) {
       await runPostGrillPipeline(coordinator, ui);
       continue;
@@ -987,6 +1136,11 @@ export async function presentMainMenu(
 
     if (selected.startsWith("Current:")) {
       await notifyCurrentRoot(currentRoot, ui);
+      continue;
+    }
+
+    if (selected.startsWith("Effective Worker concurrency:")) {
+      await notifyWorkerConcurrency(coordinator, ui);
       continue;
     }
 
@@ -1126,14 +1280,18 @@ export async function runPostGrillPipeline(
     });
     if (nextActions.length === 0) {
       const panel = await coordinator.getPanelState();
-      if (
-        panel &&
-        (panel.workers.length > 0 || panel.pipelinePaused || panel.runTerminated)
-      ) {
+      // Slots full (or no ready launch) while workers / conflict / pause live → wait.
+      // waitForPipelineWorkers settles early on P1 (needs-disposition / pending-retry)
+      // so disposition auto-advance runs while other Implementation workers continue.
+      if (hasLivePipelineWork(panel)) {
         log("info", "pipeline:wait-workers", {
-          workers: panel.workers.map((w) => w.ticketNumber),
-          pipelinePaused: panel.pipelinePaused,
-          runTerminated: panel.runTerminated,
+          workers: panel?.workers.map((w) => ({
+            ticketNumber: w.ticketNumber,
+            status: w.status,
+          })),
+          pipelinePaused: panel?.pipelinePaused,
+          runTerminated: panel?.runTerminated,
+          integration: panel?.integration,
         });
         const waitResult = await waitForPipelineWorkers(coordinator, ui);
         if (waitResult.status === "terminated") {
@@ -1251,8 +1409,10 @@ export async function runPostGrillPipeline(
       return;
     }
 
-    // Implement returns "running" while the worker is live — wait here instead
-    // of falling through to an empty nextActions and exiting to the main menu.
+    // Implement returns "running" while the worker is live. Do NOT wait yet —
+    // continue the loop so remaining free Implementation slots can be filled
+    // from the ready frontier (up to N). Wait only when nextActions is empty
+    // while workers still run (slots full / frontier empty / P1 blocked).
     if (result.status === "running") {
       const panel = await coordinator.getPanelState();
       const ticketNumber =
@@ -1270,17 +1430,9 @@ export async function runPostGrillPipeline(
         worktreePath: worker?.worktreePath,
         transcriptPath: worker?.transcriptPath,
         branchName: worker?.branchName,
+        runningCount: runningWorkers(panel).length,
       });
-      const waitResult = await waitForPipelineWorkers(coordinator, ui);
-      if (waitResult.status === "terminated") {
-        log("info", "pipeline:stop", {
-          reason: "run-terminated",
-          step,
-          mode: waitResult.result.mode,
-          ticketNumber,
-        });
-        return;
-      }
+      continue;
     }
   }
 
@@ -1811,6 +1963,162 @@ export async function presentRootSwitcher(
 }
 
 /**
+ * Worker concurrency configuration menus (global + Workflow-root).
+ * Writes only Matt Auto preferences. Concurrency warning fires on save when N > 4;
+ * run-time slot filling never re-prompts.
+ */
+export async function presentWorkerConcurrencyMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  for (;;) {
+    const [global, root] = await Promise.all([
+      coordinator.getGlobalWorkerConcurrency(),
+      coordinator.getRootWorkerConcurrency(),
+    ]);
+    const effective = resolveWorkerConcurrency(root, global);
+
+    const options = [
+      formatResolvedWorkerConcurrencyLine(
+        effective.concurrency,
+        effective.source,
+      ),
+      `Global default: ${global !== undefined ? String(global) : "(not set)"}`,
+      `Workflow-root override: ${root !== undefined ? String(root) : "(not set)"}`,
+      SET_GLOBAL_WORKER_CONCURRENCY,
+      SET_ROOT_WORKER_CONCURRENCY,
+    ];
+    if (root !== undefined) {
+      options.push(CLEAR_ROOT_WORKER_CONCURRENCY);
+    }
+    options.push(BACK_ITEM);
+
+    const selected = await ui.select("Worker concurrency", options);
+    if (selected === undefined || selected === BACK_ITEM) return;
+
+    if (selected.startsWith("Effective Worker concurrency:")) {
+      await notifyWorkerConcurrency(coordinator, ui);
+      continue;
+    }
+    if (selected.startsWith("Global default:")) {
+      ui.notify(
+        global !== undefined
+          ? `Global default Worker concurrency: ${global}`
+          : "No global default Worker concurrency is set (effective falls back to default 2).",
+        "info",
+      );
+      continue;
+    }
+    if (selected.startsWith("Workflow-root override:")) {
+      ui.notify(
+        root !== undefined
+          ? `Workflow-root Worker concurrency override: ${root}`
+          : "No Workflow-root Worker concurrency override is set.",
+        "info",
+      );
+      continue;
+    }
+
+    if (selected === SET_GLOBAL_WORKER_CONCURRENCY) {
+      const value = await promptWorkerConcurrency(ui, "global default");
+      if (value === undefined) continue;
+      try {
+        await coordinator.setGlobalWorkerConcurrency(value);
+        ui.notify(
+          `Global default Worker concurrency set to ${value}.`,
+          "info",
+        );
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+      }
+      continue;
+    }
+
+    if (selected === SET_ROOT_WORKER_CONCURRENCY) {
+      const value = await promptWorkerConcurrency(
+        ui,
+        "Workflow-root override",
+      );
+      if (value === undefined) continue;
+      try {
+        await coordinator.setRootWorkerConcurrency(value);
+        ui.notify(
+          `Workflow-root Worker concurrency override set to ${value}.`,
+          "info",
+        );
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+      }
+      continue;
+    }
+
+    if (selected === CLEAR_ROOT_WORKER_CONCURRENCY) {
+      await coordinator.clearRootWorkerConcurrency();
+      ui.notify(
+        "Cleared Workflow-root Worker concurrency override. Effective Worker concurrency falls back to the global default (or default 2).",
+        "info",
+      );
+    }
+  }
+}
+
+/**
+ * Prompt for Worker concurrency as a positive integer.
+ * Invalid input notifies and returns undefined (no write).
+ * Values above the Concurrency warning threshold require one confirmation.
+ */
+export async function promptWorkerConcurrency(
+  ui: MattAutoUi,
+  layerLabel: string,
+): Promise<number | undefined> {
+  if (!ui.input) {
+    ui.notify(
+      "Worker concurrency configuration needs an input UI to enter a positive integer.",
+      "warning",
+    );
+    return undefined;
+  }
+
+  const raw = await ui.input(
+    `Worker concurrency (${layerLabel}) — positive integer ≥ 1`,
+    String(WORKER_CONCURRENCY_WARNING_THRESHOLD),
+  );
+  if (raw === undefined) return undefined;
+
+  const parsed = parseWorkerConcurrencyInput(raw);
+  if (!parsed.ok) {
+    ui.notify(parsed.reason, "error");
+    return undefined;
+  }
+
+  if (needsConcurrencyWarning(parsed.value)) {
+    const confirmed = await confirmConcurrencyWarning(ui, parsed.value);
+    if (!confirmed) {
+      ui.notify(
+        "Concurrency warning declined — Worker concurrency preferences unchanged.",
+        "info",
+      );
+      return undefined;
+    }
+  }
+
+  return parsed.value;
+}
+
+/** One confirmation for saving Worker concurrency above the warning threshold. */
+export async function confirmConcurrencyWarning(
+  ui: MattAutoUi,
+  concurrency: number,
+): Promise<boolean> {
+  ui.notify(concurrencyWarningMessage(concurrency), "warning");
+  const selected = await ui.select("Concurrency warning", [
+    CONFIRM_CONCURRENCY_WARNING_ITEM,
+    DECLINE_CONCURRENCY_WARNING_ITEM,
+  ]);
+  return selected === CONFIRM_CONCURRENCY_WARNING_ITEM;
+}
+
+/**
  * Worker profile configuration menus.
  * Writes only Matt Auto preferences — never the Workflow home model.
  */
@@ -2164,6 +2472,24 @@ async function notifyWorkerProfile(
     "Configuring Worker profile does not change the Workflow home model.",
   ];
   ui.notify(lines.join("\n"), effective ? "info" : "warning");
+}
+
+async function notifyWorkerConcurrency(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  const [global, root] = await Promise.all([
+    coordinator.getGlobalWorkerConcurrency(),
+    coordinator.getRootWorkerConcurrency(),
+  ]);
+  const effective = resolveWorkerConcurrency(root, global);
+  const lines = [
+    `Effective Worker concurrency: ${effective.concurrency} [${effective.source}]`,
+    `Global default: ${global !== undefined ? String(global) : "(not set)"}`,
+    `Workflow-root override: ${root !== undefined ? String(root) : "(not set)"}`,
+    `Concurrency warning threshold: ${WORKER_CONCURRENCY_WARNING_THRESHOLD} (confirm when saving above this; no re-prompt during /matt-auto run).`,
+  ];
+  ui.notify(lines.join("\n"), "info");
 }
 
 function summarizePreflightFailures(preflight: PreflightResult): string {

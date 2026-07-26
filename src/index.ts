@@ -9,6 +9,7 @@ export {
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_TARGET_BRANCH,
+  DEFAULT_WORKER_CONCURRENCY,
   DISPOSITION_ACTION_PREFIX,
   dispositionActionId,
   IMPLEMENTATION_DISPOSITION_OPTIONS,
@@ -36,9 +37,27 @@ export {
   TICKET_ISSUE_LABEL,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
+  WORKER_CONCURRENCY_WARNING_THRESHOLD,
   WORKFLOW_MANIFEST_MARKER,
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
+export {
+  assertValidWorkerConcurrency,
+  isValidWorkerConcurrency,
+  resolveEffectiveWorkerConcurrency,
+  resolveWorkerConcurrency,
+} from "./adapters/preferences.js";
+export type {
+  ResolvedWorkerConcurrency,
+  WorkerConcurrencySource,
+} from "./adapters/preferences.js";
+export {
+  canLaunchImplementationWorker,
+  computeImplementationSlots,
+  countRunningImplementationWorkers,
+  implementationLaunchBlockReason,
+} from "./launch-rules.js";
+export type { ImplementationLaunchBlockReason } from "./launch-rules.js";
 export type {
   CiCheckResult,
   CiPort,

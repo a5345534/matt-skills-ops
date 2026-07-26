@@ -424,6 +424,9 @@ export type TrackerPort = {
  *
  * Worker profile layers are stored separately; the Workflow coordinator
  * resolves precedence (snapshot → root → global).
+ *
+ * Worker concurrency layers are stored separately; the Workflow coordinator
+ * resolves precedence (root → global → default 2). Local prefs only — never GitHub.
  */
 export type PreferencesPort = {
   /**
@@ -446,6 +449,28 @@ export type PreferencesPort = {
   setRootWorkerProfile(profile: WorkerProfile): Promise<void>;
   /** Clear the Workflow-root Worker profile override. */
   clearRootWorkerProfile(): Promise<void>;
+  /**
+   * Global default Worker concurrency, if set.
+   * Positive integer only; invalid stored values are treated as unset.
+   */
+  getGlobalWorkerConcurrency(): Promise<number | undefined>;
+  /**
+   * Workflow-root Worker concurrency override, if set.
+   * Positive integer only; invalid stored values are treated as unset.
+   */
+  getRootWorkerConcurrency(): Promise<number | undefined>;
+  /**
+   * Persist the global default Worker concurrency.
+   * Rejects non-integers and values < 1.
+   */
+  setGlobalWorkerConcurrency(concurrency: number): Promise<void>;
+  /**
+   * Persist the Workflow-root Worker concurrency override.
+   * Rejects non-integers and values < 1.
+   */
+  setRootWorkerConcurrency(concurrency: number): Promise<void>;
+  /** Clear the Workflow-root Worker concurrency override. */
+  clearRootWorkerConcurrency(): Promise<void>;
   /**
    * Rebuildable local pointer to the Active workflow id for a Target branch.
    * GitHub remains authoritative; this avoids scanning every open issue on each menu open.
