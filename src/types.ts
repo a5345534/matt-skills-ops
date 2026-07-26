@@ -221,6 +221,8 @@ export type ImplementationAttemptRef = {
 /** Compact passive Workflow panel snapshot while background work is running. */
 export type WorkflowPanelState = {
   workflowId: number;
+  /** Spec issue title when known (Active workflow recovery). */
+  title?: string;
   /** Compact passive lines for a Pi TUI widget (not an interactive dashboard). */
   lines: readonly string[];
   workers: readonly {

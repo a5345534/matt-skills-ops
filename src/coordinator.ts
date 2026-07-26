@@ -4433,6 +4433,9 @@ export function createWorkflowCoordinator(
       workers,
       pipelinePaused,
     };
+    if (active.title?.trim()) {
+      state.title = active.title.trim();
+    }
     if (runTerminated) {
       state.runTerminated = true;
     }
