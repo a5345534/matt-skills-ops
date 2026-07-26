@@ -495,6 +495,12 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         : true;
     if (!confirm) {
       ctx.ui.notify("Pause cancelled.", "info");
+      try {
+        const { unlink } = await import("node:fs/promises");
+        await unlink(runControlFilePath(ctx.cwd));
+      } catch {
+        // ignore
+      }
       return;
     }
     const result = await coordinator.pausePipeline();
