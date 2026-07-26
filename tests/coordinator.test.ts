@@ -2207,6 +2207,27 @@ describe("Workflow coordinator Create-tickets Planning stage", () => {
         },
       ],
       awaitingCi: [],
+      items: [
+        {
+          number: 43,
+          title: "Ship core path",
+          state: "OPEN",
+          status: "ready",
+        },
+        {
+          number: 44,
+          title: "Ship parallel path",
+          state: "OPEN",
+          status: "ready",
+        },
+        {
+          number: 45,
+          title: "Ship dependent path",
+          state: "OPEN",
+          status: "blocked",
+          openBlockers: [43],
+        },
+      ],
     });
 
     await expect(coordinator.getTicketProgress()).resolves.toEqual(

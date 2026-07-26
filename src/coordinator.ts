@@ -774,7 +774,9 @@ export function createWorkflowCoordinator(
     const ready: ReadyTicket[] = [];
     const blocked: TicketProgressSummary["blocked"][number][] = [];
     const awaitingCi: ReadyTicket[] = [];
+    const items: TicketProgressSummary["items"][number][] = [];
 
+    const sortedAll = [...tickets].sort((a, b) => a.number - b.number);
     const sortedOpen = [...open].sort((a, b) => a.number - b.number);
 
     for (const ticket of sortedOpen) {
@@ -799,6 +801,47 @@ export function createWorkflowCoordinator(
       }
     }
 
+    for (const ticket of sortedAll) {
+      if (ticket.state === "CLOSED") {
+        items.push({
+          number: ticket.number,
+          title: ticket.title,
+          state: "CLOSED",
+          status: "closed",
+        });
+        continue;
+      }
+      if (integratedNumbers.has(ticket.number)) {
+        items.push({
+          number: ticket.number,
+          title: ticket.title,
+          state: "OPEN",
+          status: "awaiting-ci",
+        });
+        continue;
+      }
+      const openBlockers = ticket.blockedBy
+        .filter((b) => b.state === "OPEN")
+        .map((b) => b.number)
+        .sort((a, b) => a - b);
+      if (openBlockers.length === 0) {
+        items.push({
+          number: ticket.number,
+          title: ticket.title,
+          state: "OPEN",
+          status: "ready",
+        });
+      } else {
+        items.push({
+          number: ticket.number,
+          title: ticket.title,
+          state: "OPEN",
+          status: "blocked",
+          openBlockers,
+        });
+      }
+    }
+
     return {
       workflowId,
       total: tickets.length,
@@ -807,6 +850,7 @@ export function createWorkflowCoordinator(
       ready,
       blocked,
       awaitingCi,
+      items,
     };
   }
 
@@ -887,6 +931,7 @@ export function createWorkflowCoordinator(
         ready: [],
         blocked: [],
         awaitingCi: [],
+        items: [],
       };
     }
     const tickets = await bound.tracker.listTickets(numbers);

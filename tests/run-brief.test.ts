@@ -76,6 +76,33 @@ describe("buildRunBriefViewModel", () => {
         ready: [{ number: 45, title: "Ready ticket" }],
         blocked: [{ number: 46, title: "Blocked", openBlockers: [45] }],
         awaitingCi: [{ number: 41, title: "Awaiting" }],
+        items: [
+          {
+            number: 40,
+            title: "Closed ticket",
+            state: "CLOSED",
+            status: "closed",
+          },
+          {
+            number: 41,
+            title: "Awaiting",
+            state: "OPEN",
+            status: "awaiting-ci",
+          },
+          {
+            number: 45,
+            title: "Ready ticket",
+            state: "OPEN",
+            status: "ready",
+          },
+          {
+            number: 46,
+            title: "Blocked",
+            state: "OPEN",
+            status: "blocked",
+            openBlockers: [45],
+          },
+        ],
       },
       lastStopReason: "pipeline-pause",
     });
@@ -117,10 +144,12 @@ describe("buildRunBriefViewModel", () => {
       "  url: https://example.test/pr/99",
     ]);
     expect(byId.tickets?.lines).toEqual([
-      "Tickets: 1 ready / 3 open / 1 closed (total 4)",
-      "Ready: #45 Ready ticket",
-      "Blocked: #46 (by #45)",
-      "Awaiting CI: #41",
+      "Summary: 1 ready / 3 open / 1 closed (total 4)",
+      "Issues:",
+      "  #40 [closed] Closed ticket",
+      "  #41 [ci:awaiting-check r1] Awaiting",
+      "  #45 [ready] Ready ticket",
+      "  #46 [blocked (by #45)] Blocked",
     ]);
     expect(byId.stop?.lines).toEqual(["Last stop: pipeline pause"]);
 
@@ -311,6 +340,7 @@ describe("predictRunTerminationMode", () => {
             ready: [],
             blocked: [],
             awaitingCi: [],
+            items: [],
           },
         }),
       ),
@@ -327,6 +357,14 @@ describe("predictRunTerminationMode", () => {
             ready: [],
             blocked: [],
             awaitingCi: [{ number: 1, title: "Integrated" }],
+            items: [
+              {
+                number: 1,
+                title: "Integrated",
+                state: "OPEN",
+                status: "awaiting-ci",
+              },
+            ],
           },
         }),
       ),

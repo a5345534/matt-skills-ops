@@ -89,6 +89,47 @@ export function buildCompactWorkflowPanel(
     );
   }
 
+  // Compact issue list: every ticket + status (same DTO as full brief).
+  if (panel.ticketProgress) {
+    const progress = panel.ticketProgress;
+    const items =
+      progress.items && progress.items.length > 0
+        ? progress.items
+        : [
+            ...progress.ready.map((t) => ({
+              number: t.number,
+              title: t.title,
+              status: "ready" as const,
+            })),
+            ...progress.blocked.map((t) => ({
+              number: t.number,
+              title: t.title,
+              status: "blocked" as const,
+            })),
+            ...progress.awaitingCi.map((t) => ({
+              number: t.number,
+              title: t.title,
+              status: "awaiting-ci" as const,
+            })),
+          ].sort((a, b) => a.number - b.number);
+    if (items.length > 0) {
+      lines.push(
+        `Tickets ${progress.ready.length}r/${progress.open}o/${progress.closed}c`,
+      );
+      for (const item of items) {
+        const worker = panel.workers.find(
+          (w) => w.ticketNumber === item.number,
+        );
+        const label = worker ? worker.status : item.status;
+        const title =
+          item.title.length > 40
+            ? `${item.title.slice(0, 37)}…`
+            : item.title;
+        lines.push(`  #${item.number} [${label}] ${title}`);
+      }
+    }
+  }
+
   const statusLine = buildStatusLine(panel, pipelineStatus, context);
   const visible =
     panel.workers.length > 0 ||
@@ -96,7 +137,8 @@ export function buildCompactWorkflowPanel(
     Boolean(panel.runTerminated) ||
     Boolean(panel.integration) ||
     Boolean(panel.ci && panel.ci.length > 0) ||
-    Boolean(panel.workflowPr);
+    Boolean(panel.workflowPr) ||
+    Boolean(panel.ticketProgress && panel.ticketProgress.total > 0);
 
   return { lines, statusLine, visible };
 }

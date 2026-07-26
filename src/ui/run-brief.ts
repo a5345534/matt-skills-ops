@@ -78,7 +78,7 @@ export function buildRunBriefViewModel(
   const workflowPr = workflowPrSection(panel.workflowPr);
   if (workflowPr) sections.push(workflowPr);
 
-  const tickets = ticketsSection(panel.ticketProgress);
+  const tickets = ticketsSection(panel);
   if (tickets) sections.push(tickets);
 
   const stop = stopSection(panel);
@@ -302,38 +302,119 @@ function workflowPrSection(
   };
 }
 
+/**
+ * List every workflow issue with status. Live workers / integration / CI
+ * overlays refine tracker status when present.
+ */
 function ticketsSection(
-  progress: WorkflowPanelState["ticketProgress"],
+  panel: WorkflowPanelState,
 ): RunBriefSection | undefined {
+  const progress = panel.ticketProgress;
   if (!progress) return undefined;
+
   const lines = [
-    `Tickets: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed (total ${progress.total})`,
+    `Summary: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed (total ${progress.total})`,
   ];
-  if (progress.ready.length > 0) {
-    lines.push(
-      `Ready: ${progress.ready.map((t) => `#${t.number} ${t.title}`).join("; ")}`,
-    );
+
+  const items =
+    progress.items && progress.items.length > 0
+      ? progress.items
+      : synthesizeItemsFromBuckets(progress);
+
+  if (items.length === 0) {
+    return { id: "tickets", title: "Tickets", lines };
   }
-  if (progress.blocked.length > 0) {
-    lines.push(
-      `Blocked: ${progress.blocked
-        .map(
-          (t) =>
-            `#${t.number} (by ${t.openBlockers.map((n) => `#${n}`).join(", ")})`,
-        )
-        .join("; ")}`,
-    );
+
+  lines.push("Issues:");
+  for (const item of items) {
+    lines.push(formatTicketListLine(item, panel));
   }
-  if (progress.awaitingCi.length > 0) {
-    lines.push(
-      `Awaiting CI: ${progress.awaitingCi.map((t) => `#${t.number}`).join(", ")}`,
-    );
-  }
+
   return {
     id: "tickets",
     title: "Tickets",
     lines,
   };
+}
+
+function synthesizeItemsFromBuckets(
+  progress: NonNullable<WorkflowPanelState["ticketProgress"]>,
+): NonNullable<WorkflowPanelState["ticketProgress"]>["items"][number][] {
+  // Backward-compatible fallback when older fixtures omit `items`.
+  const items: NonNullable<
+    WorkflowPanelState["ticketProgress"]
+  >["items"][number][] = [];
+  for (const t of progress.ready) {
+    items.push({
+      number: t.number,
+      title: t.title,
+      state: "OPEN",
+      status: "ready",
+    });
+  }
+  for (const t of progress.blocked) {
+    items.push({
+      number: t.number,
+      title: t.title,
+      state: "OPEN",
+      status: "blocked",
+      openBlockers: t.openBlockers,
+    });
+  }
+  for (const t of progress.awaitingCi) {
+    items.push({
+      number: t.number,
+      title: t.title,
+      state: "OPEN",
+      status: "awaiting-ci",
+    });
+  }
+  return items.sort((a, b) => a.number - b.number);
+}
+
+function formatTicketListLine(
+  item: NonNullable<
+    WorkflowPanelState["ticketProgress"]
+  >["items"][number],
+  panel: WorkflowPanelState,
+): string {
+  const worker = panel.workers.find((w) => w.ticketNumber === item.number);
+  const integration =
+    panel.integration?.ticketNumber === item.number
+      ? panel.integration
+      : undefined;
+  const ci = panel.ci?.find((c) => c.ticketNumber === item.number);
+
+  let statusLabel: string = item.status;
+  let extra = "";
+
+  // Closed GitHub issues stay "closed" even if stale CI rows remain on panel.
+  if (item.status === "closed" || item.state === "CLOSED") {
+    statusLabel = "closed";
+  } else if (worker) {
+    statusLabel = worker.status;
+    extra = ` r${worker.attempt}`;
+    if (worker.progress) {
+      extra += ` — ${worker.progress}`;
+    }
+  } else if (integration) {
+    statusLabel = `integration:${integration.status}`;
+    extra = ` r${integration.attempt}`;
+    if (integration.reason) {
+      extra += ` — ${integration.reason}`;
+    }
+  } else if (ci) {
+    statusLabel = `ci:${ci.status}`;
+    extra = ` r${ci.attempt}`;
+    if (ci.summary) {
+      extra += ` — ${ci.summary}`;
+    }
+  } else if (item.status === "blocked" && item.openBlockers?.length) {
+    extra = ` (by ${item.openBlockers.map((n) => `#${n}`).join(", ")})`;
+  }
+
+  const title = item.title.trim() || "(no title)";
+  return `  #${item.number} [${statusLabel}${extra}] ${title}`;
 }
 
 function stopSection(

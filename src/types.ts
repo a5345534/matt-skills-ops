@@ -188,6 +188,21 @@ export type ReadyTicket = {
  * Ticket progress and ready frontier computed from GitHub issue state.
  * Used by Next actions and the Workflow panel after Create-tickets publish.
  */
+/** One workflow ticket row for operator lists (run brief / progress). */
+export type TicketProgressItem = {
+  number: number;
+  title: string;
+  /** GitHub issue open/closed. */
+  state: "OPEN" | "CLOSED";
+  /**
+   * Workflow-facing status from tracker + integration bookkeeping.
+   * Live worker/CI overlays may refine this on the run brief.
+   */
+  status: "closed" | "awaiting-ci" | "ready" | "blocked";
+  /** Present when status is blocked. */
+  openBlockers?: readonly number[];
+};
+
 export type TicketProgressSummary = {
   workflowId: number;
   total: number;
@@ -206,6 +221,11 @@ export type TicketProgressSummary = {
   }[];
   /** Open integrated tickets awaiting the on-demand CI gate. */
   awaitingCi: readonly ReadyTicket[];
+  /**
+   * Every workflow ticket (open + closed), sorted by number, for list UIs.
+   * Prefer this over reconstructing status from ready/blocked/awaitingCi alone.
+   */
+  items: readonly TicketProgressItem[];
 };
 
 /** Identity of one Implementation worker attempt (branch + worktree + transcript). */
