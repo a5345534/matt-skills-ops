@@ -120,7 +120,7 @@ When tickets are published and the ready frontier is non-empty, Next actions inc
 
 1. Matt Auto creates an **Implementation workspace** outside the Workflow root (sibling `matt-auto-workspaces/…` worktree) on branch `matt-auto/<Workflow ID>/ticket-<n>/r<attempt>`.
 2. A **session-owned Implementation worker** runs `/implement` via the Matt skills adapter in that workspace (Worker profile model + thinking level).
-3. Progress streams over the **Worker protocol** (Pi JSON event stream → Stage results). The passive **Workflow panel** shows running status; it is not an interactive dashboard.
+3. Progress streams over the **Worker protocol** (Pi JSON event stream → Stage results). The passive **Workflow panel** shows condensed running status from the same panel DTO as the full-screen run brief (workflow id, pause state, worker ticket/status/alive, optional progress). When the Pi TUI exposes `setWidget`/`setStatus`, that summary is also published as a secondary always-on surface; without those APIs the publish is a no-op and the full-screen brief remains primary. The Workflow panel is not an interactive dashboard.
 4. A local **Worker transcript** is retained under `.pi/matt-auto/transcripts/` for the attempt.
 5. On success, **Implementation disposition** offers Close / Leave open / Investigate.
 6. **Close** starts a serialized **Integration unit** (does **not** close the GitHub ticket yet).

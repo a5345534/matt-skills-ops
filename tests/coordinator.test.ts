@@ -204,6 +204,14 @@ type WorkspaceState = {
     branchName: string;
     worktreePath: string;
   }>;
+  ensures: Array<{
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    baseRef: string;
+    branchName: string;
+    worktreePath: string;
+  }>;
   integrationEnsures: Array<{
     workflowId: number;
     baseRef: string;
@@ -217,6 +225,8 @@ type WorkspaceState = {
   attempts: Map<string, number>;
   cleanupCalls: number[];
   listBranchesCalls: number[];
+  removeLocalBranchesCalls: string[][];
+  removedBranches: Set<string>;
   failCreate?: boolean;
   failEnsureIntegration?: boolean;
   mergeResult?:
@@ -235,11 +245,14 @@ function createWorkspace(
 ): { port: WorkspacePort; state: WorkspaceState } {
   const state: WorkspaceState = {
     creates: [],
+    ensures: [],
     integrationEnsures: [],
     merges: [],
     attempts: initial.attempts ?? new Map(),
     cleanupCalls: [],
     listBranchesCalls: [],
+    removeLocalBranchesCalls: [],
+    removedBranches: new Set(),
     ...(initial.failCreate !== undefined
       ? { failCreate: initial.failCreate }
       : {}),
@@ -281,7 +294,51 @@ function createWorkspace(
         `${input.workflowId}:${input.ticketNumber}`,
         input.attempt,
       );
+      state.removedBranches.delete(branchName);
       return { branchName, worktreePath };
+    },
+    ensureImplementationWorkspace: async (input) => {
+      const branchName = implementationBranchName(
+        input.workflowId,
+        input.ticketNumber,
+        input.attempt,
+      );
+      const worktreePath = path.join(
+        path.dirname(workflowRoot),
+        "matt-auto-workspaces",
+        String(input.workflowId),
+        `ticket-${input.ticketNumber}`,
+        `r${input.attempt}`,
+      );
+      state.ensures.push({
+        ...input,
+        branchName,
+        worktreePath,
+      });
+      // Reuse existing attempt workspace when not discarded; otherwise create.
+      if (!state.removedBranches.has(branchName)) {
+        const existing = state.creates.find(
+          (c) =>
+            c.workflowId === input.workflowId &&
+            c.ticketNumber === input.ticketNumber &&
+            c.attempt === input.attempt,
+        );
+        if (existing) {
+          state.attempts.set(
+            `${input.workflowId}:${input.ticketNumber}`,
+            Math.max(
+              state.attempts.get(`${input.workflowId}:${input.ticketNumber}`) ??
+                0,
+              input.attempt,
+            ),
+          );
+          return {
+            branchName: existing.branchName,
+            worktreePath: existing.worktreePath,
+          };
+        }
+      }
+      return port.createImplementationWorkspace(input);
     },
     ensureIntegrationWorkspace: async (input) => {
       if (state.failEnsureIntegration) {
@@ -300,6 +357,7 @@ function createWorkspace(
         branchName,
         worktreePath,
       });
+      state.removedBranches.delete(branchName);
       return { branchName, worktreePath };
     },
     mergeIntoIntegration: async (input) => {
@@ -315,23 +373,67 @@ function createWorkspace(
     listWorkflowBranches: async (workflowId) => {
       state.listBranchesCalls.push(workflowId);
       const branches = new Set<string>();
-      branches.add(integrationBranchName(workflowId));
+      const integration = integrationBranchName(workflowId);
+      if (!state.removedBranches.has(integration)) {
+        // Only list Integration branch once it has been ensured or still present.
+        if (
+          state.integrationEnsures.some((e) => e.workflowId === workflowId) ||
+          state.creates.some((c) => c.workflowId === workflowId)
+        ) {
+          branches.add(integration);
+        }
+      }
       for (const create of state.creates) {
-        if (create.workflowId === workflowId) {
+        if (
+          create.workflowId === workflowId &&
+          !state.removedBranches.has(create.branchName)
+        ) {
           branches.add(create.branchName);
         }
       }
       return [...branches].sort();
     },
+    removeLocalBranches: async (branchNames) => {
+      state.removeLocalBranchesCalls.push([...branchNames]);
+      const removedLocalBranches: string[] = [];
+      const removedWorktrees: string[] = [];
+      for (const branch of branchNames) {
+        state.removedBranches.add(branch);
+        removedLocalBranches.push(branch);
+        removedWorktrees.push(
+          `/matt-auto-workspaces/${branch.replace(/\//g, "-")}`,
+        );
+        // Reset latestAttempt counters for discarded ticket attempts.
+        const match = /^matt-auto\/(\d+)\/ticket-(\d+)\/r(\d+)$/.exec(branch);
+        if (match) {
+          const workflowId = Number(match[1]);
+          const ticketNumber = Number(match[2]);
+          const attempt = Number(match[3]);
+          const key = `${workflowId}:${ticketNumber}`;
+          const current = state.attempts.get(key) ?? 0;
+          if (attempt >= current) {
+            // Recompute max remaining attempt for this ticket.
+            let max = 0;
+            for (const create of state.creates) {
+              if (
+                create.workflowId === workflowId &&
+                create.ticketNumber === ticketNumber &&
+                !state.removedBranches.has(create.branchName)
+              ) {
+                max = Math.max(max, create.attempt);
+              }
+            }
+            if (max > 0) state.attempts.set(key, max);
+            else state.attempts.delete(key);
+          }
+        }
+      }
+      return { removedLocalBranches, removedWorktrees };
+    },
     cleanupWorkflowWorkspaces: async (workflowId) => {
       state.cleanupCalls.push(workflowId);
       const branches = await port.listWorkflowBranches(workflowId);
-      return {
-        removedWorktrees: branches.map(
-          (b) => `/matt-auto-workspaces/${workflowId}/${b.replace(/\//g, "-")}`,
-        ),
-        removedLocalBranches: branches,
-      };
+      return port.removeLocalBranches(branches);
     },
     hasCommitsAhead: async () => ({ ahead: false, count: 0 }),
   };
@@ -3915,5 +4017,456 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(ids).toContain(reworkTicketActionId(43));
     expect(ids).not.toContain(START_FOLLOW_UP_ACTION.id);
     expect(ids).not.toContain(CLEANUP_WORKFLOW_ACTION.id);
+  });
+});
+
+describe("Workflow coordinator Pipeline pause and Run termination", () => {
+  it("Pause aborts session-owned workers, sets pipelinePaused, and leaves GitHub untouched", async () => {
+    const { coordinator, workers, tracker, transcripts, remoteGit } =
+      ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const issueStatesBefore = tracker.state.issues.map((i) => ({
+      number: i.number,
+      state: i.state,
+    }));
+
+    const paused = await coordinator.pausePipeline();
+    expect(paused).toEqual({
+      abortedWorkerCount: 1,
+      affectedAttempts: [
+        {
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          kind: "implementation",
+        },
+      ],
+      pipelinePaused: true,
+    });
+    expect(workers.state.abortAllCount).toBe(1);
+    expect(workers.state.aborts).toContain("implement-42-43-r1");
+    expect(coordinator.isPipelinePaused()).toBe(true);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+    expect(coordinator.isRunTerminated()).toBe(false);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.pipelinePaused).toBe(true);
+    expect(panel?.lastStopReason).toBe("pipeline-pause");
+    expect(panel?.workers ?? []).toEqual([]);
+
+    // No GitHub mutations on Pause.
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(
+      tracker.state.issues.map((i) => ({ number: i.number, state: i.state })),
+    ).toEqual(issueStatesBefore);
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(remoteGit.state.deleted).toEqual([]);
+
+    const events = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(
+      events.some((e) => (e as { type?: string }).type === "pipeline:pause"),
+    ).toBe(true);
+  });
+
+  it("Resume clears Pipeline pause so auto-advance can select Next again", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.pausePipeline();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    const resumed = await coordinator.resumePipeline();
+    expect(resumed).toEqual({ pipelinePaused: false });
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.pipelinePaused).toBe(false);
+    expect(panel?.lastStopReason).toBeUndefined();
+
+    // Orchestration-only: does not relaunch the aborted worker dialogue.
+    expect(workers.state.launches).toHaveLength(1);
+
+    // Without recovery cooldown, Next can offer the ticket again after Pause.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toContain(implementTicketActionId(43));
+  });
+
+  it("Terminate before integrate uses T2 discard-unintegrated and removes attempt artifacts only", async () => {
+    const { coordinator, workers, workspace, tracker, transcripts, remoteGit } =
+      ticketsPublishedFixture();
+
+    // Create two unintegrated attempt workspaces (single-worker path: pause between).
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.pausePipeline();
+    await coordinator.resumePipeline();
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const issuesBefore = structuredClone(tracker.state.issues);
+    const manifestBefore = structuredClone(tracker.state.manifests.get(42));
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("discard-unintegrated");
+    expect(terminated.runTerminated).toBe(true);
+    expect(terminated.abortedWorkerCount).toBe(1);
+    expect(terminated.affectedAttempts).toEqual([
+      {
+        workflowId: 42,
+        ticketNumber: 44,
+        attempt: 1,
+        kind: "implementation",
+      },
+    ]);
+    expect(terminated.discardedBranches).toEqual(
+      expect.arrayContaining([
+        "matt-auto/42/ticket-43/r1",
+        "matt-auto/42/ticket-44/r1",
+        "matt-auto/42/integration",
+      ]),
+    );
+    expect(workspace.state.removeLocalBranchesCalls.length).toBeGreaterThan(0);
+    expect(workers.state.aborts).toContain("implement-42-44-r1");
+
+    expect(coordinator.isRunTerminated()).toBe(true);
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.runTerminated).toBe(true);
+    expect(panel?.lastStopReason).toBe("run-termination");
+    expect(panel?.terminationMode).toBe("discard-unintegrated");
+
+    // GitHub history untouched (no integrate/PR rewrite, no ticket reopen).
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(tracker.state.manifests.get(42)).toEqual(manifestBefore);
+    expect(tracker.state.issues).toEqual(issuesBefore);
+    expect(remoteGit.state.deleted).toEqual([]);
+
+    const events44 = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 44,
+      attempt: 1,
+    });
+    expect(
+      events44.some(
+        (e) => (e as { type?: string }).type === "pipeline:terminate",
+      ),
+    ).toBe(true);
+
+    // Discarded attempts no longer count toward latestAttempt.
+    expect(await workspace.port.latestAttempt(42, 43)).toBe(0);
+    expect(await workspace.port.latestAttempt(42, 44)).toBe(0);
+  });
+
+  it("Terminate after successful Integration unit uses T1 stop-only and never discards integrated artifacts", async () => {
+    const { coordinator, workers, workspace, tracker, remoteGit } =
+      ticketsPublishedFixture();
+
+    // Integrate #43 successfully (pending CI).
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "Done #43" },
+    });
+    await coordinator.confirmDisposition("close");
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
+      {
+        number: 43,
+        attempt: 1,
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+
+    // Start another unintegrated worker, then terminate.
+    await coordinator.runNextAction(implementTicketActionId(44));
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const integratedBefore = structuredClone(
+      tracker.state.manifests.get(42)?.integratedTickets,
+    );
+    const pushesBefore = [...remoteGit.state.pushes];
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("stop-only");
+    expect(terminated.discardedBranches).toEqual([]);
+    expect(terminated.discardedWorktrees).toEqual([]);
+    expect(terminated.abortedWorkerCount).toBe(1);
+    expect(workspace.state.removeLocalBranchesCalls).toEqual([]);
+
+    // Integrated history preserved; no remote deletes; no manifest rewrite.
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual(
+      integratedBefore,
+    );
+    expect(remoteGit.state.pushes).toEqual(pushesBefore);
+    expect(remoteGit.state.deleted).toEqual([]);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.terminationMode).toBe("stop-only");
+    expect(panel?.lastStopReason).toBe("run-termination");
+    expect(coordinator.isRunTerminated()).toBe(true);
+  });
+
+  it("Terminate with a Workflow PR present is T1 stop-only even without integratedTickets length edge cases", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "pr-opened",
+        workerProfile: defaultWorkerProfile,
+        title: "Existing spec",
+        tickets: [43],
+        integrationBranch: "matt-auto/42/integration",
+        integratedTickets: [
+          {
+            number: 43,
+            attempt: 1,
+            branchName: "matt-auto/42/ticket-43/r1",
+          },
+        ],
+        workflowPr: {
+          number: 99,
+          url: "https://example.test/pr/99",
+          baseBranch: DEFAULT_TARGET_BRANCH,
+          headBranch: "matt-auto/42/integration",
+        },
+      },
+      tickets: [{ number: 43, title: "Ship core path", state: "CLOSED", blockedBy: [] }],
+    });
+    const workspace = createWorkspace("/repo");
+    const ports = createPorts({
+      defaultRoot: {
+        preferences: { globalWorkerProfile: defaultWorkerProfile },
+        tracker,
+        workspace,
+      },
+    });
+    const coordinator = createWorkflowCoordinator(ports);
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("stop-only");
+    expect(terminated.discardedBranches).toEqual([]);
+    expect(workspace.state.removeLocalBranchesCalls).toEqual([]);
+    expect(coordinator.isRunTerminated()).toBe(true);
+  });
+
+  it("beginPipelineRun clears pause and termination so a new run can auto-advance", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+    await coordinator.pausePipeline();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    coordinator.beginPipelineRun();
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isRunTerminated()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+
+    await coordinator.terminateRun();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+    coordinator.beginPipelineRun();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+  });
+
+  it("exposes pipelinePaused on panel even when no workers are running", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+    const before = await coordinator.getPanelState();
+    expect(before?.pipelinePaused).toBe(false);
+
+    await coordinator.pausePipeline();
+    const after = await coordinator.getPanelState();
+    expect(after?.pipelinePaused).toBe(true);
+    expect(after?.lastStopReason).toBe("pipeline-pause");
+    expect(after?.workers).toEqual([]);
+  });
+});
+
+describe("Workflow coordinator Resume prefers latest unintegrated Implementation attempt", () => {
+  it("surfaces disposition for a completed attempt after abort/resume instead of re-implementing", async () => {
+    const { coordinator, workers, workspace } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: {
+        status: "completed",
+        summary: "landed before pause",
+        localCommitSha: "abc12345",
+      },
+    });
+
+    // Pause after completion is a no-op for workers, but Resume must still not
+    // open r2 when the completed attempt is unrecovered only via implement.
+    await coordinator.pausePipeline();
+    await coordinator.resumePipeline();
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([dispositionActionId(43)]);
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+
+    // Explicit implement seam also prefers disposition over rN+1.
+    const result = await coordinator.runNextAction(implementTicketActionId(43));
+    expect(result).toMatchObject({
+      status: "failed",
+      stage: "implement",
+      ticketNumber: 43,
+    });
+    expect(String((result as { reason?: string }).reason ?? "")).toMatch(
+      /disposition/i,
+    );
+
+    // No fresh workspace created beyond the original r1.
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1]);
+    expect(workers.state.launches).toHaveLength(1);
+  });
+
+  it("relaunches on the same attempt branch when incomplete work has commits ahead", async () => {
+    const workspace = createWorkspace("/repo");
+    workspace.port.hasCommitsAhead = async () => ({
+      ahead: true,
+      headSha: "partial01",
+      count: 2,
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({ workspace });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    expect(workers.state.launches).toHaveLength(1);
+    expect(workers.state.launches[0]?.attempt).toBe(1);
+
+    await coordinator.pausePipeline();
+    await coordinator.resumePipeline();
+
+    const relaunch = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    expect(relaunch).toMatchObject({
+      status: "running",
+      stage: "implement",
+      ticketNumber: 43,
+      attempt: 1,
+      branchName: "matt-auto/42/ticket-43/r1",
+      workerId: "implement-42-43-r1",
+    });
+
+    // Same attempt workspace ensured; no silent orphan r2 create.
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1]);
+    expect(
+      workspace.state.ensures.some(
+        (e) => e.ticketNumber === 43 && e.attempt === 1,
+      ),
+    ).toBe(true);
+    expect(workers.state.launches).toHaveLength(2);
+    expect(workers.state.launches[1]?.attempt).toBe(1);
+    expect(workers.state.launches[1]?.branchName).toBe(
+      "matt-auto/42/ticket-43/r1",
+    );
+    expect(workers.state.launches[1]?.prompt).toMatch(/Resume note/);
+    expect(workers.state.launches[1]?.prompt).toMatch(/r1/);
+    expect(workers.state.launches[1]?.prompt).toMatch(/not available|dialogue/i);
+  });
+
+  it("opens a fresh attempt when the latest attempt is empty/failed", async () => {
+    const workspace = createWorkspace("/repo");
+    // Default hasCommitsAhead is empty (ahead: false).
+    const { coordinator, workers } = ticketsPublishedFixture({ workspace });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.pausePipeline();
+    await coordinator.resumePipeline();
+
+    const relaunch = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    expect(relaunch).toMatchObject({
+      status: "running",
+      attempt: 2,
+      branchName: "matt-auto/42/ticket-43/r2",
+      workerId: "implement-42-43-r2",
+    });
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 2]);
+    expect(workers.state.launches).toHaveLength(2);
+    expect(workers.state.launches[1]?.attempt).toBe(2);
+    // Fresh attempt does not claim resume-of-dialogue semantics.
+    expect(workers.state.launches[1]?.prompt).not.toMatch(/Resume note/);
+  });
+
+  it("after leave-open disposition opens a fresh attempt rather than reusing completed workspace", async () => {
+    const workspace = createWorkspace("/repo");
+    workspace.port.hasCommitsAhead = async () => ({
+      ahead: true,
+      headSha: "done0001",
+      count: 3,
+    });
+    const { coordinator, workers } = ticketsPublishedFixture({ workspace });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "first pass" },
+    });
+    await coordinator.confirmDisposition("leave-open");
+
+    const relaunch = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    expect(relaunch).toMatchObject({
+      status: "running",
+      attempt: 2,
+      branchName: "matt-auto/42/ticket-43/r2",
+    });
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([1, 2]);
+    expect(workers.state.launches[1]?.prompt).not.toMatch(/Resume note/);
+  });
+
+  it("recovers disposition from transcript for completed attempt without launching rN+1", async () => {
+    const attempts = new Map<string, number>([["42:43", 3]]);
+    const workspace = createWorkspace("/repo", { attempts });
+    // Seed a prior create so ensure/reuse paths have a workspace row if hit.
+    workspace.state.creates.push({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 3,
+      baseRef: "main",
+      branchName: "matt-auto/42/ticket-43/r3",
+      worktreePath: "/matt-auto-workspaces/42/ticket-43/r3",
+    });
+    const transcripts = createTranscripts();
+    await transcripts.port.append(
+      { workflowId: 42, ticketNumber: 43, attempt: 3 },
+      {
+        type: "stage-result",
+        workerId: "implement-42-43-r3",
+        outcome: {
+          status: "completed",
+          summary: "finished offline",
+          localCommitSha: "cafebabe",
+        },
+      },
+    );
+
+    const { coordinator, workers } = ticketsPublishedFixture({
+      workspace,
+      transcripts,
+    });
+
+    // Direct implement (skipping nextActions recovery first) still prefers disposition.
+    const result = await coordinator.runNextAction(implementTicketActionId(43));
+    expect(result).toMatchObject({
+      status: "needs-disposition",
+      stage: "implement",
+      ticketNumber: 43,
+      attempt: 3,
+      branchName: "matt-auto/42/ticket-43/r3",
+    });
+    expect(workers.state.launches).toHaveLength(0);
+    expect(workspace.state.creates.map((c) => c.attempt)).toEqual([3]);
   });
 });

@@ -49,10 +49,15 @@ import type {
   ImplementationWorkerStatus,
   IntegratedTicketRef,
   NextAction,
+  PipelineAffectedAttempt,
+  PipelinePauseResult,
+  PipelineResumeResult,
   PreflightCheck,
   PreflightResult,
   ReadyTicket,
   ResolvedWorkerProfile,
+  RunTerminationMode,
+  RunTerminationResult,
   SpecDraft,
   StageConfirmationDecision,
   StageResult,
@@ -82,6 +87,146 @@ type PendingCreateTickets = {
 };
 
 type PendingStage = PendingCreateSpec | PendingCreateTickets;
+
+/**
+ * Settled facts for one Implementation attempt transcript.
+ * Used by disposition recovery and by startImplementation attempt selection
+ * (reuse latest unintegrated attempt vs blind rN+1).
+ */
+type ImplementationAttemptHistory = {
+  implementCompleted: boolean;
+  disposition?: ImplementationDispositionDecision;
+  integrationFailedReason?: string;
+  integrationComplete: boolean;
+  summary?: string;
+  headSha?: string;
+};
+
+/**
+ * Reduce retained Worker transcript events for one attempt into completion /
+ * disposition / integration facts. Pause/terminate markers do not clear a
+ * completed Stage result; worker-aborted and compatibility-recovery do.
+ */
+function analyzeImplementationAttemptEvents(
+  events: readonly unknown[],
+): ImplementationAttemptHistory {
+  let implementCompleted = false;
+  let disposition: ImplementationDispositionDecision | undefined;
+  let integrationFailedReason: string | undefined;
+  let integrationComplete = false;
+  let summary: string | undefined;
+  let headSha: string | undefined;
+
+  for (const raw of events) {
+    if (!raw || typeof raw !== "object") continue;
+    const e = raw as Record<string, unknown>;
+    const type = e.type;
+
+    if (type === "compatibility-recovery" || type === "worker-aborted") {
+      implementCompleted = false;
+      disposition = undefined;
+      integrationFailedReason = undefined;
+      summary = undefined;
+      headSha = undefined;
+      continue;
+    }
+
+    // pipeline:pause / pipeline:terminate are stop markers only — they must not
+    // erase a completed Stage result already on the attempt.
+
+    if (type === "stage-result") {
+      const outcome = e.outcome as Record<string, unknown> | undefined;
+      if (outcome?.status === "completed") {
+        implementCompleted = true;
+        disposition = undefined;
+        integrationFailedReason = undefined;
+        integrationComplete = false;
+        if (typeof outcome.summary === "string") summary = outcome.summary;
+        if (typeof outcome.localCommitSha === "string") {
+          headSha = outcome.localCommitSha;
+        }
+      } else {
+        implementCompleted = false;
+        disposition = undefined;
+        integrationFailedReason = undefined;
+        summary = undefined;
+        headSha = undefined;
+      }
+      continue;
+    }
+
+    if (type === "stage-result-inferred") {
+      implementCompleted = true;
+      disposition = undefined;
+      integrationFailedReason = undefined;
+      integrationComplete = false;
+      if (typeof e.headSha === "string") headSha = e.headSha;
+      summary =
+        typeof e.reason === "string"
+          ? e.reason
+          : "Inferred completion from local commits";
+      continue;
+    }
+
+    if (type === "disposition") {
+      const decision = e.decision;
+      if (
+        decision === "close" ||
+        decision === "leave-open" ||
+        decision === "investigate"
+      ) {
+        disposition = decision;
+      }
+      if (decision === "close" && implementCompleted) {
+        integrationFailedReason = undefined;
+      } else if (decision === "leave-open" || decision === "investigate") {
+        // Settled without integrate; a later implement opens a fresh attempt.
+      } else {
+        implementCompleted = false;
+        disposition = undefined;
+        integrationFailedReason = undefined;
+        summary = undefined;
+        headSha = undefined;
+      }
+      continue;
+    }
+
+    if (type === "integration-unit-failed") {
+      if (disposition === "close" || implementCompleted) {
+        disposition = "close";
+        integrationFailedReason =
+          typeof e.reason === "string"
+            ? e.reason
+            : "Integration unit failed";
+      }
+      continue;
+    }
+
+    if (
+      type === "integration-unit-completed" ||
+      type === "integration-unit-complete" ||
+      type === "integration-unit-skipped"
+    ) {
+      implementCompleted = false;
+      disposition = undefined;
+      integrationFailedReason = undefined;
+      integrationComplete = true;
+      summary = undefined;
+      headSha = undefined;
+    }
+  }
+
+  return {
+    implementCompleted,
+    integrationComplete,
+    ...(disposition !== undefined ? { disposition } : {}),
+    ...(integrationFailedReason !== undefined
+      ? { integrationFailedReason }
+      : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    ...(headSha !== undefined ? { headSha } : {}),
+  };
+}
 
 type ActiveImplementationWorker = {
   workerId: string;
@@ -195,6 +340,17 @@ export function createWorkflowCoordinator(
   /** Ticket numbers that recently hit implementation recovery — skip auto re-launch. */
   const implementationRecoveryCooldown = new Map<number, number>();
   const IMPLEMENTATION_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+  /**
+   * Session-owned Pipeline pause flag. When true, auto-advance / preferred Next
+   * must not continue the run loop. Cleared only by Resume or beginPipelineRun.
+   */
+  let pipelinePaused = false;
+  /** Session-owned Run termination flag until the next explicit pipeline run. */
+  let runTerminated = false;
+  /** Last operator stop that affected the run loop (panel / brief surface). */
+  let lastStopReason: "pipeline-pause" | "run-termination" | undefined;
+  /** T1/T2 mode recorded when lastStopReason is run-termination. */
+  let lastTerminationMode: RunTerminationMode | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -329,96 +485,7 @@ export function createWorkflowCoordinator(
         ticketNumber,
         attempt,
       });
-
-      let completed = false;
-      let closedForIntegrate = false;
-      let integrationFailedReason: string | undefined;
-      let summary: string | undefined;
-      let headSha: string | undefined;
-
-      for (const raw of events) {
-        if (!raw || typeof raw !== "object") continue;
-        const e = raw as Record<string, unknown>;
-        const type = e.type;
-
-        if (type === "compatibility-recovery" || type === "worker-aborted") {
-          completed = false;
-          closedForIntegrate = false;
-          integrationFailedReason = undefined;
-          summary = undefined;
-          headSha = undefined;
-          continue;
-        }
-
-        if (type === "stage-result") {
-          const outcome = e.outcome as Record<string, unknown> | undefined;
-          if (outcome?.status === "completed") {
-            completed = true;
-            closedForIntegrate = false;
-            integrationFailedReason = undefined;
-            if (typeof outcome.summary === "string") summary = outcome.summary;
-            if (typeof outcome.localCommitSha === "string") {
-              headSha = outcome.localCommitSha;
-            }
-          } else {
-            completed = false;
-            closedForIntegrate = false;
-            integrationFailedReason = undefined;
-            summary = undefined;
-            headSha = undefined;
-          }
-          continue;
-        }
-
-        if (type === "stage-result-inferred") {
-          completed = true;
-          closedForIntegrate = false;
-          integrationFailedReason = undefined;
-          if (typeof e.headSha === "string") headSha = e.headSha;
-          summary =
-            typeof e.reason === "string"
-              ? e.reason
-              : "Inferred completion from local commits";
-          continue;
-        }
-
-        if (type === "disposition") {
-          const decision = e.decision;
-          if (decision === "close" && completed) {
-            // Close was chosen — Integration may still be pending/failed.
-            closedForIntegrate = true;
-            integrationFailedReason = undefined;
-          } else {
-            // leave-open / investigate: not waiting on Integration.
-            completed = false;
-            closedForIntegrate = false;
-            integrationFailedReason = undefined;
-            summary = undefined;
-            headSha = undefined;
-          }
-          continue;
-        }
-
-        if (type === "integration-unit-failed") {
-          if (closedForIntegrate || completed) {
-            closedForIntegrate = true;
-            integrationFailedReason =
-              typeof e.reason === "string"
-                ? e.reason
-                : "Integration unit failed";
-          }
-          continue;
-        }
-
-        if (
-          type === "integration-unit-complete" ||
-          type === "integration-unit-skipped"
-        ) {
-          completed = false;
-          closedForIntegrate = false;
-          integrationFailedReason = undefined;
-        }
-      }
+      const history = analyzeImplementationAttemptEvents(events);
 
       const branchName = implementationBranchName(
         active.workflowId,
@@ -433,21 +500,25 @@ export function createWorkflowCoordinator(
       );
 
       // Prefer retrying a failed Integration over re-Implementing.
-      if (closedForIntegrate && integrationFailedReason) {
+      if (
+        history.disposition === "close" &&
+        history.implementCompleted &&
+        history.integrationFailedReason
+      ) {
         pendingIntegration = {
           workflowId: active.workflowId,
           ticketNumber,
           attempt,
           branchName,
           worktreePath,
-          lastFailure: integrationFailedReason,
+          lastFailure: history.integrationFailedReason,
         };
         implementationRecoveryCooldown.delete(ticketNumber);
         return;
       }
 
       // Completed implement, never Closed (or Close not recorded).
-      if (completed && !closedForIntegrate) {
+      if (history.implementCompleted && history.disposition === undefined) {
         pendingDisposition = {
           workerId: `recovered-${active.workflowId}-${ticketNumber}-r${attempt}`,
           workflowId: active.workflowId,
@@ -458,9 +529,9 @@ export function createWorkflowCoordinator(
           status: "needs-disposition",
           receivedStageResult: true,
           summary:
-            summary ??
-            (headSha
-              ? `Recovered completed attempt r${attempt} @ ${headSha.slice(0, 8)}`
+            history.summary ??
+            (history.headSha
+              ? `Recovered completed attempt r${attempt} @ ${history.headSha.slice(0, 8)}`
               : `Recovered completed attempt r${attempt}`),
         };
         implementationRecoveryCooldown.delete(ticketNumber);
@@ -1869,6 +1940,198 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const latest = await bound.workspace.latestAttempt(
+      active.workflowId,
+      ticketNumber,
+    );
+    const targetBranch = await resolveTargetBranch(bound.preferences);
+    // Dependents branch from the Integration branch after successful units.
+    const baseRef = active.integrationBranch ?? targetBranch;
+    const rootPath = selectedPath ?? ports.startPath;
+
+    // Prefer the latest unintegrated Implementation attempt over blind rN+1:
+    // completed → disposition; incomplete with commits → same branch relaunch;
+    // empty/failed → fresh attempt. Never claims worker-dialogue continuation.
+    type AttemptPlan =
+      | {
+          kind: "disposition";
+          attempt: number;
+          summary?: string;
+          headSha?: string;
+        }
+      | {
+          kind: "retry-integration";
+          attempt: number;
+          reason: string;
+        }
+      | {
+          kind: "reuse";
+          attempt: number;
+          commitCount: number;
+          headSha?: string;
+        }
+      | { kind: "fresh"; attempt: number };
+
+    let plan: AttemptPlan = { kind: "fresh", attempt: latest + 1 };
+    const integratedAttempt = (active.integratedTickets ?? []).find(
+      (t) => t.number === ticketNumber,
+    )?.attempt;
+
+    // Integrated attempts are history — Rework and later implements always open
+    // a fresh numbered attempt rather than reusing the integrated workspace.
+    if (
+      integratedAttempt !== undefined &&
+      latest > 0 &&
+      latest <= integratedAttempt
+    ) {
+      plan = { kind: "fresh", attempt: integratedAttempt + 1 };
+    } else if (latest >= 1) {
+      const events = await bound.transcripts.read({
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt: latest,
+      });
+      const history = analyzeImplementationAttemptEvents(events);
+
+      if (history.integrationComplete) {
+        plan = { kind: "fresh", attempt: latest + 1 };
+      } else if (
+        history.implementCompleted &&
+        history.disposition === "close"
+      ) {
+        plan = {
+          kind: "retry-integration",
+          attempt: latest,
+          reason:
+            history.integrationFailedReason ??
+            "Close disposition is pending Integration for this attempt.",
+        };
+      } else if (
+        history.implementCompleted &&
+        history.disposition === undefined
+      ) {
+        plan = {
+          kind: "disposition",
+          attempt: latest,
+          ...(history.summary !== undefined
+            ? { summary: history.summary }
+            : {}),
+          ...(history.headSha !== undefined
+            ? { headSha: history.headSha }
+            : {}),
+        };
+      } else if (
+        history.implementCompleted &&
+        (history.disposition === "leave-open" ||
+          history.disposition === "investigate")
+      ) {
+        plan = { kind: "fresh", attempt: latest + 1 };
+      } else if (!history.implementCompleted) {
+        // Incomplete / aborted: reuse when the attempt branch has useful commits.
+        try {
+          const ensured = await bound.workspace.ensureImplementationWorkspace({
+            workflowId: active.workflowId,
+            ticketNumber,
+            attempt: latest,
+            baseRef,
+          });
+          const ahead = await bound.workspace.hasCommitsAhead({
+            worktreePath: ensured.worktreePath,
+            baseRef,
+          });
+          if (ahead.ahead) {
+            plan = {
+              kind: "reuse",
+              attempt: latest,
+              commitCount: ahead.count,
+              ...(ahead.headSha !== undefined
+                ? { headSha: ahead.headSha }
+                : {}),
+            };
+          } else {
+            plan = { kind: "fresh", attempt: latest + 1 };
+          }
+        } catch {
+          plan = { kind: "fresh", attempt: latest + 1 };
+        }
+      }
+    }
+
+    if (plan.kind === "disposition") {
+      const branchName = implementationBranchName(
+        active.workflowId,
+        ticketNumber,
+        plan.attempt,
+      );
+      const worktreePath = implementationWorktreePath(
+        rootPath,
+        active.workflowId,
+        ticketNumber,
+        plan.attempt,
+      );
+      const workerId = `recovered-${active.workflowId}-${ticketNumber}-r${plan.attempt}`;
+      pendingDisposition = {
+        workerId,
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt: plan.attempt,
+        branchName,
+        worktreePath,
+        status: "needs-disposition",
+        receivedStageResult: true,
+        summary:
+          plan.summary ??
+          (plan.headSha
+            ? `Recovered completed attempt r${plan.attempt} @ ${plan.headSha.slice(0, 8)}`
+            : `Recovered completed attempt r${plan.attempt}`),
+      };
+      implementationRecoveryCooldown.delete(ticketNumber);
+      return {
+        status: "needs-disposition",
+        stage: "implement",
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt: plan.attempt,
+        branchName,
+        worktreePath,
+        workerId,
+        ...(pendingDisposition.summary !== undefined
+          ? { summary: pendingDisposition.summary }
+          : {}),
+        dispositionOptions: [...IMPLEMENTATION_DISPOSITION_OPTIONS],
+      };
+    }
+
+    if (plan.kind === "retry-integration") {
+      const branchName = implementationBranchName(
+        active.workflowId,
+        ticketNumber,
+        plan.attempt,
+      );
+      const worktreePath = implementationWorktreePath(
+        rootPath,
+        active.workflowId,
+        ticketNumber,
+        plan.attempt,
+      );
+      pendingIntegration = {
+        workflowId: active.workflowId,
+        ticketNumber,
+        attempt: plan.attempt,
+        branchName,
+        worktreePath,
+        lastFailure: plan.reason,
+      };
+      implementationRecoveryCooldown.delete(ticketNumber);
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: `Ticket #${ticketNumber} already has a completed Implementation attempt (r${plan.attempt}) awaiting Integration. Use Retry Integration instead of re-implementing.`,
+        ticketNumber,
+        attempt: plan.attempt,
+      };
+    }
+
     const prepared = await bound.skills.prepareImplement({
       ticketNumber,
       title: ready.title,
@@ -1882,29 +2145,31 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const latest = await bound.workspace.latestAttempt(
-      active.workflowId,
-      ticketNumber,
-    );
-    const attempt = latest + 1;
-    const targetBranch = await resolveTargetBranch(bound.preferences);
-    // Dependents branch from the Integration branch after successful units.
-    const baseRef = active.integrationBranch ?? targetBranch;
-
+    const attempt = plan.attempt;
+    const reusingAttempt = plan.kind === "reuse";
     let workspace: { branchName: string; worktreePath: string };
     try {
-      workspace = await bound.workspace.createImplementationWorkspace({
-        workflowId: active.workflowId,
-        ticketNumber,
-        attempt,
-        baseRef,
-      });
+      workspace = reusingAttempt
+        ? await bound.workspace.ensureImplementationWorkspace({
+            workflowId: active.workflowId,
+            ticketNumber,
+            attempt,
+            baseRef,
+          })
+        : await bound.workspace.createImplementationWorkspace({
+            workflowId: active.workflowId,
+            ticketNumber,
+            attempt,
+            baseRef,
+          });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
         status: "failed",
         stage: "implement",
-        reason: `Failed to create Implementation workspace: ${message}`,
+        reason: reusingAttempt
+          ? `Failed to ensure Implementation workspace for reuse: ${message}`
+          : `Failed to create Implementation workspace: ${message}`,
         ticketNumber,
         attempt,
       };
@@ -1942,6 +2207,23 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const workerPrompt = reusingAttempt
+      ? [
+          "## Resume note (orchestration-only)",
+          `Relaunching a new worker on existing Implementation attempt r${attempt}.`,
+          `Branch/worktree already has local commits` +
+            (plan.kind === "reuse" && plan.commitCount > 0
+              ? ` (${plan.commitCount} commit(s) ahead of ${baseRef}` +
+                (plan.headSha ? ` @ ${plan.headSha.slice(0, 8)}` : "") +
+                ")"
+              : "") +
+            " — continue from the workspace state, not from any prior worker dialogue.",
+          "Session-owned workers use --no-session; token-level continuation is not available.",
+          "",
+          prepared.prompt,
+        ].join("\n")
+      : prepared.prompt;
+
     const workerId = `implement-${active.workflowId}-${ticketNumber}-r${attempt}`;
     const worker: ActiveImplementationWorker = {
       workerId,
@@ -1967,6 +2249,7 @@ export function createWorkflowCoordinator(
       branchName: workspace.branchName,
       worktreePath: workspace.worktreePath,
       skillCommand: prepared.skillCommand,
+      ...(reusingAttempt ? { reusedAttempt: true } : {}),
     });
 
     const sink: WorkerEventSink = {
@@ -1984,7 +2267,7 @@ export function createWorkflowCoordinator(
           branchName: workspace.branchName,
           workerProfile: workerProfile.profile,
           ticketTitle: ready.title,
-          prompt: prepared.prompt,
+          prompt: workerPrompt,
           skillCommand: prepared.skillCommand,
         },
         sink,
@@ -3691,10 +3974,37 @@ export function createWorkflowCoordinator(
     return startImplementation(ticketNumber);
   }
 
-  async function abortWorkers(): Promise<void> {
+  /**
+   * Abort session-owned Implementation + Conflict resolution workers.
+   * @param setCooldown - when true (session teardown), block auto re-launch briefly.
+   * @param transcriptEvent - structured event appended to each affected attempt.
+   */
+  async function abortSessionWorkers(options: {
+    setCooldown: boolean;
+    transcriptEvent: Record<string, unknown>;
+    preservePendingIntegrationMessage?: string;
+  }): Promise<PipelineAffectedAttempt[]> {
     const bound = scoped ?? (await requireScoped());
     const worker = activeWorker;
     const conflictWorker = activeConflictWorker;
+    const affected: PipelineAffectedAttempt[] = [];
+
+    if (worker) {
+      affected.push({
+        workflowId: worker.workflowId,
+        ticketNumber: worker.ticketNumber,
+        attempt: worker.attempt,
+        kind: "implementation",
+      });
+    }
+    if (conflictWorker) {
+      affected.push({
+        workflowId: conflictWorker.workflowId,
+        ticketNumber: conflictWorker.ticketNumber,
+        attempt: conflictWorker.attempt,
+        kind: "conflict-resolution",
+      });
+    }
 
     try {
       await bound.workers.abortAll();
@@ -3704,15 +4014,17 @@ export function createWorkflowCoordinator(
 
     if (worker) {
       worker.status = "aborted";
-      // Prevent the pipeline from immediately re-selecting the same ticket.
-      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      if (options.setCooldown) {
+        // Prevent the pipeline from immediately re-selecting the same ticket.
+        implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      }
       await bound.transcripts.append(
         {
           workflowId: worker.workflowId,
           ticketNumber: worker.ticketNumber,
           attempt: worker.attempt,
         },
-        { type: "worker-aborted" },
+        options.transcriptEvent,
       );
     }
 
@@ -3724,19 +4036,242 @@ export function createWorkflowCoordinator(
           ticketNumber: conflictWorker.ticketNumber,
           attempt: conflictWorker.attempt,
         },
-        { type: "conflict-resolution-aborted" },
+        options.transcriptEvent,
       );
       if (
         pendingIntegration &&
         pendingIntegration.ticketNumber === conflictWorker.ticketNumber
       ) {
         pendingIntegration.lastFailure =
+          options.preservePendingIntegrationMessage ??
           "Conflict resolution worker aborted with Workflow home. In-progress merge is preserved for retry.";
       }
     }
 
     activeWorker = undefined;
     activeConflictWorker = undefined;
+    return affected;
+  }
+
+  async function abortWorkers(): Promise<void> {
+    await abortSessionWorkers({
+      setCooldown: true,
+      transcriptEvent: { type: "worker-aborted" },
+    });
+  }
+
+  function isPipelinePaused(): boolean {
+    return pipelinePaused;
+  }
+
+  function isRunTerminated(): boolean {
+    return runTerminated;
+  }
+
+  function isAutoAdvanceBlocked(): boolean {
+    return pipelinePaused || runTerminated;
+  }
+
+  function beginPipelineRun(): void {
+    pipelinePaused = false;
+    runTerminated = false;
+    lastStopReason = undefined;
+    lastTerminationMode = undefined;
+  }
+
+  async function pausePipeline(): Promise<PipelinePauseResult> {
+    const affectedAttempts = await abortSessionWorkers({
+      setCooldown: false,
+      transcriptEvent: {
+        type: "pipeline:pause",
+        reason: "pipeline-pause",
+      },
+      preservePendingIntegrationMessage:
+        "Conflict resolution worker aborted by Pipeline pause. In-progress merge is preserved for retry.",
+    });
+
+    pipelinePaused = true;
+    runTerminated = false;
+    lastStopReason = "pipeline-pause";
+    lastTerminationMode = undefined;
+
+    return {
+      abortedWorkerCount: affectedAttempts.length,
+      affectedAttempts,
+      pipelinePaused: true,
+    };
+  }
+
+  async function resumePipeline(): Promise<PipelineResumeResult> {
+    pipelinePaused = false;
+    if (lastStopReason === "pipeline-pause") {
+      lastStopReason = undefined;
+    }
+    // Resume never clears Run termination — that ends the run deliberately.
+    return { pipelinePaused: false };
+  }
+
+  function resolveTerminationMode(
+    active: ActiveWorkflow | undefined,
+  ): RunTerminationMode {
+    const hasIntegrated =
+      (active?.integratedTickets?.length ?? 0) > 0 || Boolean(active?.workflowPr);
+    return hasIntegrated ? "stop-only" : "discard-unintegrated";
+  }
+
+  /**
+   * Collect local unintegrated attempt / integration branches for T2 discard.
+   * Never includes branches recorded on integratedTickets.
+   */
+  async function collectUnintegratedBranches(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<string[]> {
+    const integratedBranches = new Set(
+      (active.integratedTickets ?? []).map((t) => t.branchName),
+    );
+    const listed = await bound.workspace.listWorkflowBranches(active.workflowId);
+    const candidates = new Set<string>();
+
+    for (const branch of listed) {
+      if (integratedBranches.has(branch)) continue;
+      // T2 has no successful integrate / PR — discard attempt + integration branches.
+      candidates.add(branch);
+    }
+
+    // Session-known attempt branches (in case list is incomplete in tests / recovery).
+    const sessionBranches = [
+      activeWorker?.branchName,
+      pendingDisposition?.branchName,
+      pendingIntegration?.branchName,
+      pendingIntegration?.conflict?.integrationBranch,
+      activeConflictWorker?.integrationBranch,
+    ].filter((b): b is string => Boolean(b));
+    for (const branch of sessionBranches) {
+      if (!integratedBranches.has(branch)) {
+        candidates.add(branch);
+      }
+    }
+
+    return [...candidates].sort();
+  }
+
+  async function terminateRun(): Promise<RunTerminationResult> {
+    const bound = scoped ?? (await requireScoped());
+    const active = await loadActiveWorkflow(bound);
+    const mode = resolveTerminationMode(active);
+
+    const affectedAttempts = await abortSessionWorkers({
+      setCooldown: false,
+      transcriptEvent: {
+        type: "pipeline:terminate",
+        reason: "run-termination",
+        mode,
+      },
+      preservePendingIntegrationMessage:
+        mode === "stop-only"
+          ? "Conflict resolution worker aborted by Run termination (stop-only). In-progress merge is preserved."
+          : "Conflict resolution worker aborted by Run termination; unintegrated artifacts may be discarded.",
+    });
+
+    // Also log terminate against pending disposition / integration attempts that
+    // had no live worker (so attempt history still records the stop).
+    const loggedKeys = new Set(
+      affectedAttempts.map(
+        (a) => `${a.workflowId}:${a.ticketNumber}:${a.attempt}`,
+      ),
+    );
+    const extraAttempts: Array<{
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+    }> = [];
+    if (pendingDisposition) {
+      extraAttempts.push({
+        workflowId: pendingDisposition.workflowId,
+        ticketNumber: pendingDisposition.ticketNumber,
+        attempt: pendingDisposition.attempt,
+      });
+    }
+    if (pendingIntegration) {
+      extraAttempts.push({
+        workflowId: pendingIntegration.workflowId,
+        ticketNumber: pendingIntegration.ticketNumber,
+        attempt: pendingIntegration.attempt,
+      });
+    }
+    for (const key of extraAttempts) {
+      const id = `${key.workflowId}:${key.ticketNumber}:${key.attempt}`;
+      if (loggedKeys.has(id)) continue;
+      loggedKeys.add(id);
+      await bound.transcripts.append(key, {
+        type: "pipeline:terminate",
+        reason: "run-termination",
+        mode,
+      });
+    }
+
+    let discardedBranches: readonly string[] = [];
+    let discardedWorktrees: readonly string[] = [];
+
+    if (mode === "discard-unintegrated" && active) {
+      const toRemove = await collectUnintegratedBranches(bound, active);
+      if (toRemove.length > 0) {
+        // Record terminate on discarded attempts even when no live worker remained.
+        for (const branch of toRemove) {
+          const match =
+            /^matt-auto\/(\d+)\/ticket-(\d+)\/r(\d+)$/.exec(branch);
+          if (!match) continue;
+          const key = {
+            workflowId: Number(match[1]),
+            ticketNumber: Number(match[2]),
+            attempt: Number(match[3]),
+          };
+          const id = `${key.workflowId}:${key.ticketNumber}:${key.attempt}`;
+          if (loggedKeys.has(id)) continue;
+          loggedKeys.add(id);
+          await bound.transcripts.append(key, {
+            type: "pipeline:terminate",
+            reason: "run-termination",
+            mode,
+            discarded: true,
+          });
+        }
+        try {
+          const removed = await bound.workspace.removeLocalBranches(toRemove);
+          discardedBranches = removed.removedLocalBranches;
+          discardedWorktrees = removed.removedWorktrees;
+        } catch {
+          // Best-effort local discard; run still ends.
+          discardedBranches = [];
+          discardedWorktrees = [];
+        }
+      }
+      // Session-local unfinished work is discarded with T2 artifacts.
+      pendingDisposition = undefined;
+      pendingIntegration = undefined;
+      pendingCiRecovery = undefined;
+      integrationInProgress = false;
+    } else {
+      // T1 stop-only: clear live run pointers but never rewrite integrated history.
+      // Keep pendingIntegration conflict state recoverable for a later retry.
+      pendingDisposition = undefined;
+      pendingCiRecovery = undefined;
+    }
+
+    pipelinePaused = false;
+    runTerminated = true;
+    lastStopReason = "run-termination";
+    lastTerminationMode = mode;
+
+    return {
+      mode,
+      abortedWorkerCount: affectedAttempts.length,
+      affectedAttempts,
+      discardedBranches,
+      discardedWorktrees,
+      runTerminated: true,
+    };
   }
 
   /**
@@ -3896,7 +4431,20 @@ export function createWorkflowCoordinator(
       workflowId: active.workflowId,
       lines,
       workers,
+      pipelinePaused,
     };
+    if (active.title?.trim()) {
+      state.title = active.title.trim();
+    }
+    if (runTerminated) {
+      state.runTerminated = true;
+    }
+    if (lastStopReason) {
+      state.lastStopReason = lastStopReason;
+    }
+    if (lastTerminationMode) {
+      state.terminationMode = lastTerminationMode;
+    }
     if (progress) {
       state.ticketProgress = progress;
     }
@@ -4085,6 +4633,13 @@ export function createWorkflowCoordinator(
     getPanelState,
     confirmDisposition,
     abortWorkers,
+    pausePipeline,
+    resumePipeline,
+    terminateRun,
+    isPipelinePaused,
+    isRunTerminated,
+    beginPipelineRun,
+    isAutoAdvanceBlocked,
     getWorkerTranscript,
   };
 }

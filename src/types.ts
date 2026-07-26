@@ -218,10 +218,20 @@ export type ImplementationAttemptRef = {
   workerId: string;
 };
 
-/** Compact passive Workflow panel snapshot while background work is running. */
+/**
+ * Compact passive Workflow panel snapshot while background work is running.
+ * Structured fields are the single source of truth for both the full-screen run
+ * brief and the secondary compact Workflow panel (same DTO; no panel-only GitHub reads).
+ */
 export type WorkflowPanelState = {
   workflowId: number;
-  /** Compact passive lines for a Pi TUI widget (not an interactive dashboard). */
+  /** Spec issue title when known (Active workflow recovery). */
+  title?: string;
+  /**
+   * Coordinator-built compact lines (legacy/summary).
+   * UI surfaces prefer `buildCompactWorkflowPanel` / `buildRunBriefViewModel` from
+   * the structured fields so panel and brief stay on one derivation path.
+   */
   lines: readonly string[];
   workers: readonly {
     ticketNumber: number;
@@ -265,6 +275,47 @@ export type WorkflowPanelState = {
     baseBranch: string;
     headBranch: string;
   };
+  /** True when Pipeline pause is active for this coordinator session. */
+  pipelinePaused: boolean;
+  /** True after Run termination until a new pipeline run begins. */
+  runTerminated?: boolean;
+  /** Last operator stop control that affected the run loop. */
+  lastStopReason?: "pipeline-pause" | "run-termination";
+  /** T1 stop-only vs T2 discard-unintegrated, when last stop was Run termination. */
+  terminationMode?: RunTerminationMode;
+};
+
+/** Run termination mode: T1 stop-only vs T2 discard unintegrated attempts. */
+export type RunTerminationMode = "stop-only" | "discard-unintegrated";
+
+/** One session-owned worker attempt affected by Pause / Terminate. */
+export type PipelineAffectedAttempt = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  kind: "implementation" | "conflict-resolution";
+};
+
+/** Outcome of Pipeline pause (abort workers + stop auto-advance). */
+export type PipelinePauseResult = {
+  abortedWorkerCount: number;
+  affectedAttempts: readonly PipelineAffectedAttempt[];
+  pipelinePaused: true;
+};
+
+/** Outcome of resuming after Pipeline pause. */
+export type PipelineResumeResult = {
+  pipelinePaused: false;
+};
+
+/** Outcome of Run termination (T1 stop-only or T2 discard-unintegrated). */
+export type RunTerminationResult = {
+  mode: RunTerminationMode;
+  abortedWorkerCount: number;
+  affectedAttempts: readonly PipelineAffectedAttempt[];
+  discardedBranches: readonly string[];
+  discardedWorktrees: readonly string[];
+  runTerminated: true;
 };
 
 /**
@@ -647,6 +698,39 @@ export type WorkflowCoordinator = {
    * Leaves GitHub state recoverable (tickets remain open / ready).
    */
   abortWorkers(): Promise<void>;
+  /**
+   * Pipeline pause: abort session-owned workers and stop auto-advance.
+   * Leaves GitHub issues, labels, manifests, and integrated history untouched.
+   * Confirmation is owned by the UI; this method performs the operation.
+   */
+  pausePipeline(): Promise<PipelinePauseResult>;
+  /**
+   * Clear Pipeline pause so orchestration can select Next actions again.
+   * Does not resume aborted worker dialogue — orchestration-only.
+   */
+  resumePipeline(): Promise<PipelineResumeResult>;
+  /**
+   * Run termination: end the run and abort session-owned workers.
+   * T2 (no successful integrate and no Workflow PR): may discard unintegrated
+   * attempt workspaces/branches only. T1 (integratedTickets or workflowPr):
+   * stop-only — never rewrites integrated history or reopens closed tickets.
+   * Confirmation is owned by the UI; this method performs the operation.
+   */
+  terminateRun(): Promise<RunTerminationResult>;
+  /** True when Pipeline pause is active (auto-advance must not continue). */
+  isPipelinePaused(): boolean;
+  /** True after Run termination until {@link beginPipelineRun}. */
+  isRunTerminated(): boolean;
+  /**
+   * Clear Pipeline pause / Run termination so a new auto-advance run can start.
+   * Called at the start of `/matt-auto run` (or equivalent).
+   */
+  beginPipelineRun(): void;
+  /**
+   * True when auto-advance / preferred Next must not continue the run loop
+   * (Pipeline pause or Run termination).
+   */
+  isAutoAdvanceBlocked(): boolean;
   /**
    * Retained Worker transcript events for one attempt (local, uncommitted).
    */

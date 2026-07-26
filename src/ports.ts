@@ -127,6 +127,18 @@ export type WorkspacePort = {
     baseRef: string;
   }): Promise<{ branchName: string; worktreePath: string }>;
   /**
+   * Ensure an Implementation workspace exists for an existing (or recoverable) attempt.
+   * Reattaches a worktree when the attempt branch already exists; creates branch+worktree
+   * from baseRef only when neither is present. Used when Resume / re-implement reuses the
+   * latest unintegrated attempt instead of opening blind rN+1.
+   */
+  ensureImplementationWorkspace(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    baseRef: string;
+  }): Promise<{ branchName: string; worktreePath: string }>;
+  /**
    * Highest existing attempt number for a ticket under this Workflow ID, or 0 if none.
    */
   latestAttempt(workflowId: number, ticketNumber: number): Promise<number>;
@@ -160,6 +172,14 @@ export type WorkspacePort = {
    * for a Workflow ID. Does not touch remotes or GitHub history.
    */
   cleanupWorkflowWorkspaces(workflowId: number): Promise<{
+    removedWorktrees: readonly string[];
+    removedLocalBranches: readonly string[];
+  }>;
+  /**
+   * Remove specific local worktrees and branches (Run termination T2).
+   * Does not touch remotes, GitHub history, or branches not listed.
+   */
+  removeLocalBranches(branchNames: readonly string[]): Promise<{
     removedWorktrees: readonly string[];
     removedLocalBranches: readonly string[];
   }>;

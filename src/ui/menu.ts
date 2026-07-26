@@ -36,6 +36,8 @@ import type {
   PreflightCheck,
   PreflightResult,
   ResolvedWorkerProfile,
+  RunTerminationMode,
+  RunTerminationResult,
   SpecDraft,
   StageConfirmationDecision,
   StageResult,
@@ -47,6 +49,15 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+import {
+  buildRunBriefViewModel,
+  predictRunTerminationMode,
+} from "./run-brief.js";
+import {
+  buildCompactWorkflowPanel,
+  formatCompactWorkflowPanelLines,
+  publishWorkflowPanel,
+} from "./workflow-panel.js";
 
 /**
  * Choose the next pipeline action without asking the user when rules allow.
@@ -101,70 +112,508 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Wait while session-owned workers run. During that window nextActions is empty
- * on purpose; exiting the pipeline would dump the user back to the main menu.
- */
-async function waitForPipelineWorkers(
-  coordinator: WorkflowCoordinator,
+/** Options for the pipeline worker wait / run-brief refresh loop. */
+export type WaitForPipelineWorkersOptions = {
+  /** Poll interval between panel refreshes. Defaults to 2000ms. */
+  pollIntervalMs?: number;
+  /** Max poll iterations. Defaults to 1800 (~1 hour at 2s). */
+  maxTicks?: number;
+  /** Injectable sleep (tests). Defaults to real wall-clock sleep. */
+  sleep?: (ms: number) => Promise<void>;
+};
+
+/** How the run-brief wait loop ended. */
+export type WaitForPipelineWorkersResult =
+  | { status: "settled" }
+  | { status: "terminated"; result: RunTerminationResult }
+  | { status: "timeout" };
+
+/** Coordinator surface required by the run-brief wait / control loop. */
+export type RunBriefCoordinator = Pick<
+  WorkflowCoordinator,
+  | "getPanelState"
+  | "pausePipeline"
+  | "resumePipeline"
+  | "terminateRun"
+  | "isPipelinePaused"
+  | "isRunTerminated"
+>;
+
+// --- Run brief controls (Pause / Resume / Terminate) ---
+// Only controls on the full-screen brief; each requires explicit confirmation.
+
+const CONTINUE_WAITING_ITEM = "Continue waiting";
+const PAUSE_PIPELINE_ITEM = "Pause pipeline…";
+const RESUME_PIPELINE_ITEM = "Resume pipeline…";
+const TERMINATE_RUN_ITEM = "Terminate run…";
+const CONFIRM_PAUSE_ITEM = "Confirm Pause";
+const CONFIRM_RESUME_ITEM = "Confirm Resume";
+const CONFIRM_TERMINATE_ITEM = "Confirm Terminate";
+const DECLINE_CONFIRM_ITEM = "Cancel";
+
+/** Pause confirmation body (GitHub untouched; workers abort). */
+export function pauseConfirmMessage(workflowId: number): string {
+  return [
+    `Confirm Pause for Workflow #${workflowId}?`,
+    "• Abort all session-owned Implementation and Conflict resolution workers now",
+    "• Stop auto-advance for this Matt Auto run",
+    "• GitHub issues, labels, manifests, and integrated history stay untouched",
+  ].join("\n");
+}
+
+/** Resume confirmation body (orchestration-only; not worker dialogue). */
+export function resumeConfirmMessage(workflowId: number): string {
+  return [
+    `Confirm Resume for Workflow #${workflowId}?`,
+    "• Clear Pipeline pause and continue orchestration in this Workflow home",
+    "• Prefers the latest unintegrated Implementation attempt (branch/worktree/commits)",
+    "• Does not resume the aborted worker conversation",
+  ].join("\n");
+}
+
+/** Terminate confirmation body — copy differs for T1 stop-only vs T2 discard. */
+export function terminateConfirmMessage(
+  workflowId: number,
+  mode: RunTerminationMode,
+): string {
+  if (mode === "stop-only") {
+    return [
+      `Confirm Terminate for Workflow #${workflowId}? (stop-only)`,
+      "• End this Matt Auto run and abort session-owned workers",
+      "• Integrated tickets, closed history, and remote Integration state are preserved",
+      "• Unintegrated work is left as-is (not discarded)",
+      "• Does not rewrite integrated history or reopen closed tickets",
+    ].join("\n");
+  }
+  return [
+    `Confirm Terminate for Workflow #${workflowId}?`,
+    "• End this Matt Auto run and abort session-owned workers",
+    "• May discard unintegrated attempt workspaces/branches (rollback unfinished work only)",
+    "• No successful Integration unit yet — nothing integrated is rewritten",
+  ].join("\n");
+}
+
+/** Confirm Pause; decline returns false with no coordinator mutation. */
+export async function confirmPauseControl(
   ui: MattAutoUi,
-): Promise<void> {
+  workflowId: number,
+): Promise<boolean> {
+  ui.notify(pauseConfirmMessage(workflowId), "warning");
+  const selected = await ui.select("Confirm Pause", [
+    CONFIRM_PAUSE_ITEM,
+    DECLINE_CONFIRM_ITEM,
+  ]);
+  return selected === CONFIRM_PAUSE_ITEM;
+}
+
+/** Confirm Resume; decline returns false with no coordinator mutation. */
+export async function confirmResumeControl(
+  ui: MattAutoUi,
+  workflowId: number,
+): Promise<boolean> {
+  ui.notify(resumeConfirmMessage(workflowId), "info");
+  const selected = await ui.select("Confirm Resume", [
+    CONFIRM_RESUME_ITEM,
+    DECLINE_CONFIRM_ITEM,
+  ]);
+  return selected === CONFIRM_RESUME_ITEM;
+}
+
+/** Confirm Terminate; decline returns false with no coordinator mutation. */
+export async function confirmTerminateControl(
+  ui: MattAutoUi,
+  workflowId: number,
+  mode: RunTerminationMode,
+): Promise<boolean> {
+  ui.notify(terminateConfirmMessage(workflowId, mode), "warning");
+  const selected = await ui.select("Confirm Terminate", [
+    CONFIRM_TERMINATE_ITEM,
+    DECLINE_CONFIRM_ITEM,
+  ]);
+  return selected === CONFIRM_TERMINATE_ITEM;
+}
+
+function runningWorkers(panel: WorkflowPanelState | undefined) {
+  return panel?.workers.filter((w) => w.status === "running") ?? [];
+}
+
+function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
+  return (
+    panel?.workers.map((w) => ({
+      ticketNumber: w.ticketNumber,
+      attempt: w.attempt,
+      status: w.status,
+      workerId: w.workerId,
+      pid: w.pid,
+      processAlive: w.processAlive,
+      worktreePath: w.worktreePath,
+      transcriptPath: w.transcriptPath,
+      branchName: w.branchName,
+      progress: w.progress,
+    })) ?? []
+  );
+}
+
+function hasControlApis(
+  coordinator: Pick<WorkflowCoordinator, "getPanelState">,
+): coordinator is RunBriefCoordinator {
+  const c = coordinator as Partial<RunBriefCoordinator>;
+  return (
+    typeof c.pausePipeline === "function" &&
+    typeof c.resumePipeline === "function" &&
+    typeof c.terminateRun === "function"
+  );
+}
+
+/**
+ * Present the multi-section run brief as the primary wait-surface content.
+ * Uses multi-line notify (MVP primitive); content density matches the brief.
+ * Also refreshes the secondary compact Workflow panel from the same DTO when
+ * the TUI exposes setWidget/setStatus (graceful no-op otherwise).
+ */
+function notifyRunBrief(
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+  type: "info" | "warning" | "error" = "info",
+): ReturnType<typeof buildRunBriefViewModel> {
+  const brief = buildRunBriefViewModel(panel);
+  ui.notify(brief.lines.join("\n"), type);
+  // Secondary always-on Workflow panel — same panel state as the brief.
+  publishWorkflowPanel(ui, panel);
+  return brief;
+}
+
+async function applyConfirmedPause(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): Promise<boolean> {
+  const workflowId = panel.workflowId;
+  const confirmed = await confirmPauseControl(ui, workflowId);
+  log("info", "run-brief:operator-pause-decision", {
+    workflowId,
+    decision: confirmed ? "confirm" : "decline",
+  });
+  if (!confirmed) {
+    ui.notify("Pause cancelled — pipeline and workers unchanged.", "info");
+    return false;
+  }
+  const result = await coordinator.pausePipeline();
+  log("info", "run-brief:operator-pause", {
+    workflowId,
+    abortedWorkerCount: result.abortedWorkerCount,
+    affectedAttempts: result.affectedAttempts,
+  });
   ui.notify(
-    "Pipeline waiting for Implementation / Conflict workers to finish…",
+    [
+      `Pipeline paused for Workflow #${workflowId}.`,
+      `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
+      "GitHub workflow state is unchanged. Choose Resume or Terminate.",
+    ].join("\n"),
+    "warning",
+  );
+  return true;
+}
+
+async function applyConfirmedResume(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): Promise<boolean> {
+  const workflowId = panel.workflowId;
+  const confirmed = await confirmResumeControl(ui, workflowId);
+  log("info", "run-brief:operator-resume-decision", {
+    workflowId,
+    decision: confirmed ? "confirm" : "decline",
+  });
+  if (!confirmed) {
+    ui.notify("Resume cancelled — pipeline remains paused.", "info");
+    return false;
+  }
+  await coordinator.resumePipeline();
+  log("info", "run-brief:operator-resume", { workflowId });
+  ui.notify(
+    `Pipeline resumed for Workflow #${workflowId}. Continuing orchestration (attempt reuse preferred).`,
     "info",
   );
-  for (let i = 0; i < 1800; i += 1) {
-    // 1800 * 2s ≈ 1 hour max wait
-    await sleep(2000);
+  return true;
+}
+
+async function applyConfirmedTerminate(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): Promise<RunTerminationResult | undefined> {
+  const workflowId = panel.workflowId;
+  const mode = predictRunTerminationMode(panel);
+  const confirmed = await confirmTerminateControl(ui, workflowId, mode);
+  log("info", "run-brief:operator-terminate-decision", {
+    workflowId,
+    predictedMode: mode,
+    decision: confirmed ? "confirm" : "decline",
+  });
+  if (!confirmed) {
+    ui.notify("Terminate cancelled — pipeline and workers unchanged.", "info");
+    return undefined;
+  }
+  const result = await coordinator.terminateRun();
+  log("info", "run-brief:operator-terminate", {
+    workflowId,
+    mode: result.mode,
+    abortedWorkerCount: result.abortedWorkerCount,
+    affectedAttempts: result.affectedAttempts,
+    discardedBranches: result.discardedBranches,
+    discardedWorktrees: result.discardedWorktrees,
+  });
+  return result;
+}
+
+function formatTerminateNotify(result: RunTerminationResult): string {
+  const attempts =
+    result.affectedAttempts.length === 0
+      ? "none"
+      : result.affectedAttempts
+          .map(
+            (a) =>
+              `#${a.ticketNumber} r${a.attempt} (${a.kind}) [wf #${a.workflowId}]`,
+          )
+          .join("; ");
+  if (result.mode === "stop-only") {
+    return [
+      "Run terminated (stop-only).",
+      `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
+      `Affected attempts: ${attempts}.`,
+      "Integrated history, closed tickets, and remote Integration state preserved.",
+    ].join("\n");
+  }
+  const discarded =
+    result.discardedBranches.length === 0
+      ? "(none)"
+      : result.discardedBranches.join(", ");
+  return [
+    "Run terminated.",
+    `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
+    `Affected attempts: ${attempts}.`,
+    `Discarded unintegrated branches: ${discarded}.`,
+  ].join("\n");
+}
+
+/**
+ * Operator controls on the full-screen run brief.
+ * Resume only when paused; Pause when running; Terminate while waiting or paused.
+ * Every control requires confirmation before coordinator mutation.
+ */
+async function presentRunBriefControlMenu(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): Promise<
+  | { action: "continue" }
+  | { action: "paused" }
+  | { action: "resumed" }
+  | { action: "terminated"; result: RunTerminationResult }
+  | { action: "unchanged" }
+> {
+  const paused = panel.pipelinePaused === true;
+  const options = paused
+    ? [RESUME_PIPELINE_ITEM, TERMINATE_RUN_ITEM]
+    : [CONTINUE_WAITING_ITEM, PAUSE_PIPELINE_ITEM, TERMINATE_RUN_ITEM];
+
+  const selected = await ui.select(
+    paused
+      ? `Run brief controls (Workflow #${panel.workflowId} · paused)`
+      : `Run brief controls (Workflow #${panel.workflowId})`,
+    options,
+  );
+
+  if (selected === undefined || selected === CONTINUE_WAITING_ITEM) {
+    return { action: "continue" };
+  }
+
+  if (selected === PAUSE_PIPELINE_ITEM) {
+    const applied = await applyConfirmedPause(coordinator, ui, panel);
+    return applied ? { action: "paused" } : { action: "unchanged" };
+  }
+
+  if (selected === RESUME_PIPELINE_ITEM) {
+    const applied = await applyConfirmedResume(coordinator, ui, panel);
+    return applied ? { action: "resumed" } : { action: "unchanged" };
+  }
+
+  if (selected === TERMINATE_RUN_ITEM) {
+    const result = await applyConfirmedTerminate(coordinator, ui, panel);
+    if (result) return { action: "terminated", result };
+    return { action: "unchanged" };
+  }
+
+  return { action: "continue" };
+}
+
+/**
+ * Wait while session-owned workers run, or while Pipeline pause is active.
+ * During that window nextActions is empty on purpose; exiting the pipeline
+ * would dump the user back to the main menu.
+ *
+ * Primary operator surface is the full multi-section run brief (U2), refreshed
+ * from `getPanelState()`. The only controls are Pause / Resume / Terminate —
+ * each requires explicit confirmation before coordinator APIs run.
+ *
+ * Settles when no workers are `running` and the pipeline is not paused
+ * (including needs-disposition) so Auto-Close can proceed. Terminate exits
+ * the wait with `{ status: "terminated" }` so the pipeline can stop cleanly.
+ */
+export async function waitForPipelineWorkers(
+  coordinator: Pick<WorkflowCoordinator, "getPanelState"> | RunBriefCoordinator,
+  ui: MattAutoUi,
+  options: WaitForPipelineWorkersOptions = {},
+): Promise<WaitForPipelineWorkersResult> {
+  const pollIntervalMs = options.pollIntervalMs ?? 2000;
+  const maxTicks = options.maxTicks ?? 1800;
+  const sleepFn = options.sleep ?? sleep;
+  const controls = hasControlApis(coordinator) ? coordinator : undefined;
+
+  const initialPanel = await coordinator.getPanelState();
+  const initialRunning = runningWorkers(initialPanel);
+  const initialPaused = initialPanel?.pipelinePaused === true;
+
+  // Already settled (e.g. needs-disposition only) and not paused — do not block.
+  if (initialRunning.length === 0 && !initialPaused) {
+    log("info", "pipeline:workers-settled", {
+      immediate: true,
+      panelWorkers: panelWorkerSnapshot(initialPanel),
+    });
+    if (initialPanel) {
+      notifyRunBrief(ui, initialPanel);
+    }
+    return { status: "settled" };
+  }
+
+  if (initialPanel) {
+    const initialBrief = notifyRunBrief(ui, initialPanel);
+    log("info", "pipeline:wait-workers", {
+      runningCount: initialRunning.length,
+      pipelinePaused: initialPaused,
+      panelWorkers: panelWorkerSnapshot(initialPanel),
+      briefSections: initialBrief.sections.map((s) => s.id),
+    });
+  }
+
+  for (let i = 0; i < maxTicks; i += 1) {
     const panel = await coordinator.getPanelState();
+    if (!panel) {
+      log("info", "pipeline:workers-settled", {
+        ticks: i + 1,
+        reason: "no-panel",
+      });
+      return { status: "settled" };
+    }
+
+    if (panel.runTerminated || controls?.isRunTerminated?.()) {
+      notifyRunBrief(ui, panel, "warning");
+      log("info", "pipeline:wait-terminated-observed", {
+        ticks: i + 1,
+        workflowId: panel.workflowId,
+      });
+      // Termination already applied (e.g. prior control); surface a synthetic result.
+      return {
+        status: "terminated",
+        result: {
+          mode: panel.terminationMode ?? "stop-only",
+          abortedWorkerCount: 0,
+          affectedAttempts: [],
+          discardedBranches: [],
+          discardedWorktrees: [],
+          runTerminated: true,
+        },
+      };
+    }
+
+    const paused =
+      panel.pipelinePaused === true ||
+      (controls?.isPipelinePaused?.() ?? false);
+    const running = runningWorkers(panel);
+
+    // Paused mode: keep the brief visible until Resume or Terminate.
+    if (paused) {
+      notifyRunBrief(ui, panel, "warning");
+      if (!controls) {
+        // Without control APIs we cannot leave paused mode here.
+        log("warn", "pipeline:paused-without-controls", {
+          workflowId: panel.workflowId,
+        });
+        return { status: "settled" };
+      }
+      const control = await presentRunBriefControlMenu(controls, ui, panel);
+      if (control.action === "terminated") {
+        const latest = (await coordinator.getPanelState()) ?? panel;
+        notifyRunBrief(ui, latest, "warning");
+        ui.notify(formatTerminateNotify(control.result), "warning");
+        return { status: "terminated", result: control.result };
+      }
+      if (control.action === "resumed") {
+        // Fall through: next loop iteration continues wait/auto-advance.
+        continue;
+      }
+      // Decline / unchanged — re-show paused brief.
+      continue;
+    }
+
     // Panel may list pendingDisposition as a "worker" with status
     // needs-disposition — that is NOT still running. Only wait on live runs.
-    const running =
-      panel?.workers.filter((w) => w.status === "running") ?? [];
     if (running.length === 0) {
-      // If disposition is pending, settle immediately so Auto-Close can run.
-      // If panel is empty, also settle — caller will re-read nextActions
-      // (may hit cooldown after abort/recovery instead of re-Implement thrash).
+      notifyRunBrief(ui, panel);
       log("info", "pipeline:workers-settled", {
-        panelWorkers: panel?.workers.map((w) => ({
-          ticketNumber: w.ticketNumber,
-          attempt: w.attempt,
-          status: w.status,
-          workerId: w.workerId,
-          pid: w.pid,
-          processAlive: w.processAlive,
-          worktreePath: w.worktreePath,
-          transcriptPath: w.transcriptPath,
-          branchName: w.branchName,
-        })),
+        ticks: i + 1,
+        panelWorkers: panelWorkerSnapshot(panel),
       });
-      return;
+      return { status: "settled" };
     }
-    if (i > 0 && i % 15 === 0) {
-      ui.notify(
-        `Still waiting on ${running.length} running worker(s)… (${formatPanelLines(panel!).join(" | ")})`,
-        "info",
-      );
-      log("debug", "pipeline:wait-workers-tick", {
-        running: running.map((w) => ({
-          ticketNumber: w.ticketNumber,
-          attempt: w.attempt,
-          workerId: w.workerId,
-          pid: w.pid,
-          processAlive: w.processAlive,
-          worktreePath: w.worktreePath,
-          transcriptPath: w.transcriptPath,
-          branchName: w.branchName,
-          progress: w.progress,
-        })),
-      });
+
+    // Refresh the full brief so process-gone / progress stay visible.
+    const brief = notifyRunBrief(ui, panel);
+    log("debug", "pipeline:wait-workers-tick", {
+      tick: i + 1,
+      runningCount: running.length,
+      running: running.map((w) => ({
+        ticketNumber: w.ticketNumber,
+        attempt: w.attempt,
+        workerId: w.workerId,
+        pid: w.pid,
+        processAlive: w.processAlive,
+        worktreePath: w.worktreePath,
+        transcriptPath: w.transcriptPath,
+        branchName: w.branchName,
+        progress: w.progress,
+      })),
+      briefSections: brief.sections.map((s) => s.id),
+      briefLines: brief.lines,
+    });
+
+    // Offer Pause / Terminate (and Continue waiting) while workers run.
+    if (controls) {
+      const control = await presentRunBriefControlMenu(controls, ui, panel);
+      if (control.action === "terminated") {
+        const latest = (await coordinator.getPanelState()) ?? panel;
+        notifyRunBrief(ui, latest, "warning");
+        ui.notify(formatTerminateNotify(control.result), "warning");
+        return { status: "terminated", result: control.result };
+      }
+      if (control.action === "paused") {
+        // Stay in the wait loop; next iteration shows paused mode controls.
+        continue;
+      }
+      // continue / unchanged → poll again after interval
     }
+
+    await sleepFn(pollIntervalMs);
   }
+
   ui.notify(
     "Timed out waiting for workers. Re-run /matt-auto run to continue.",
     "warning",
   );
   log("warn", "pipeline:wait-workers-timeout");
+  return { status: "timeout" };
 }
 
 /** Minimal UI surface needed by Matt Auto menus. */
@@ -184,6 +633,20 @@ export type MattAutoUi = {
    */
   editor?(title: string, prefill?: string): Promise<string | undefined>;
   notify(message: string, type?: "info" | "warning" | "error"): void;
+  /**
+   * Optional Pi TUI widget surface for the secondary compact Workflow panel.
+   * When omitted, panel publish is a graceful no-op (full-screen brief remains primary).
+   */
+  setWidget?(
+    key: string,
+    content: string[] | undefined,
+    options?: { placement?: "aboveEditor" | "belowEditor" },
+  ): void;
+  /**
+   * Optional Pi TUI footer status for the compact Workflow panel one-liner.
+   * When omitted, status publish is a graceful no-op.
+   */
+  setStatus?(key: string, text: string | undefined): void;
 };
 
 const PREFLIGHT_HEADER = "--- Workflow preflight ---";
@@ -318,9 +781,12 @@ export function formatTicketProgressLines(
   ];
 }
 
-/** Compact passive Workflow panel lines (not an interactive dashboard). */
+/**
+ * Compact passive Workflow panel lines (not an interactive dashboard).
+ * Derived from the same panel DTO as the full-screen run brief — not a second channel.
+ */
 export function formatPanelLines(panel: WorkflowPanelState): string[] {
-  return [...panel.lines];
+  return formatCompactWorkflowPanelLines(panel);
 }
 
 /** Build bare `/matt-auto` menu lines from coordinator state. */
@@ -350,7 +816,7 @@ export function buildMainMenuItems(
     items.push(RUN_PIPELINE_ITEM);
   }
 
-  if (panel && panel.workers.length > 0) {
+  if (panel && buildCompactWorkflowPanel(panel).visible) {
     items.push(PANEL_HEADER, ...formatPanelLines(panel));
   }
 
@@ -388,6 +854,9 @@ export async function presentMainMenu(
     const nextActions = await coordinator.nextActions();
     const ticketProgress = await coordinator.getTicketProgress();
     const panel = await coordinator.getPanelState();
+    // Secondary always-on Workflow panel from the same DTO (no-op without TUI widgets).
+    publishWorkflowPanel(ui, panel);
+    const panelLines = panel ? formatPanelLines(panel) : [];
     const items = buildMainMenuItems(
       preflight,
       nextActions,
@@ -405,12 +874,11 @@ export async function presentMainMenu(
       selected.startsWith("Tickets:") ||
       selected.startsWith("Ready frontier:") ||
       selected.startsWith("Blocked:") ||
-      selected.startsWith("Workflow #") ||
-      selected.startsWith("Worker #")
+      (panel && panelLines.includes(selected))
     ) {
-      // Passive panel / progress rows — show detail, no actions.
-      if (panel && (selected.startsWith("Workflow #") || selected.startsWith("Worker #"))) {
-        ui.notify(formatPanelLines(panel).join("\n"), "info");
+      // Passive Workflow panel / progress rows — show detail, no actions.
+      if (panel && panelLines.includes(selected)) {
+        ui.notify(panelLines.join("\n"), "info");
       } else if (ticketProgress) {
         ui.notify(formatTicketProgressLines(ticketProgress).join("\n"), "info");
       }
@@ -510,13 +978,18 @@ export async function handleNextAction(
  * Auto-publishes planning drafts and auto-closes implementation dispositions.
  * Only pauses when multiple non-planning Next actions need a human choice
  * (e.g. several implement tickets) or when workers are still running.
+ *
+ * Operator Pause / Resume / Terminate are owned by the full-screen run brief
+ * wait surface (with confirmation). Terminate exits this loop cleanly.
  */
 export async function runPostGrillPipeline(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
 ): Promise<void> {
+  // Clear prior pause / termination so this run can auto-advance.
+  coordinator.beginPipelineRun();
   ui.notify(
-    "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement… Stage confirmation is auto-Publish; disposition is auto-Close.",
+    "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement… Stage confirmation is auto-Publish; disposition is auto-Close. Run brief controls: Pause / Resume / Terminate (each requires confirm).",
     "info",
   );
   log("info", "pipeline:start", {
@@ -524,6 +997,26 @@ export async function runPostGrillPipeline(
   });
 
   for (let step = 0; step < 50; step += 1) {
+    if (coordinator.isRunTerminated()) {
+      ui.notify("Run terminated — pipeline stopped.", "warning");
+      log("info", "pipeline:stop", { reason: "run-terminated", step });
+      return;
+    }
+
+    // Pipeline pause keeps the brief visible until Resume or Terminate.
+    if (coordinator.isPipelinePaused()) {
+      const waitResult = await waitForPipelineWorkers(coordinator, ui);
+      if (waitResult.status === "terminated") {
+        log("info", "pipeline:stop", {
+          reason: "run-terminated",
+          step,
+          mode: waitResult.result.mode,
+        });
+        return;
+      }
+      continue;
+    }
+
     const stepStarted = Date.now();
     const preflight = await coordinator.preflight();
     log("debug", "pipeline:preflight", {
@@ -548,11 +1041,24 @@ export async function runPostGrillPipeline(
     });
     if (nextActions.length === 0) {
       const panel = await coordinator.getPanelState();
-      if (panel && panel.workers.length > 0) {
+      if (
+        panel &&
+        (panel.workers.length > 0 || panel.pipelinePaused || panel.runTerminated)
+      ) {
         log("info", "pipeline:wait-workers", {
           workers: panel.workers.map((w) => w.ticketNumber),
+          pipelinePaused: panel.pipelinePaused,
+          runTerminated: panel.runTerminated,
         });
-        await waitForPipelineWorkers(coordinator, ui);
+        const waitResult = await waitForPipelineWorkers(coordinator, ui);
+        if (waitResult.status === "terminated") {
+          log("info", "pipeline:stop", {
+            reason: "run-terminated",
+            step,
+            mode: waitResult.result.mode,
+          });
+          return;
+        }
         continue;
       }
       ui.notify(
@@ -561,6 +1067,25 @@ export async function runPostGrillPipeline(
       );
       log("info", "pipeline:stop", { reason: "idle", step });
       return;
+    }
+
+    // Do not auto-advance while Pipeline pause / Run termination blocks the run.
+    if (coordinator.isAutoAdvanceBlocked()) {
+      if (coordinator.isRunTerminated()) {
+        ui.notify("Run terminated — pipeline stopped.", "warning");
+        log("info", "pipeline:stop", { reason: "run-terminated", step });
+        return;
+      }
+      const waitResult = await waitForPipelineWorkers(coordinator, ui);
+      if (waitResult.status === "terminated") {
+        log("info", "pipeline:stop", {
+          reason: "run-terminated",
+          step,
+          mode: waitResult.result.mode,
+        });
+        return;
+      }
+      continue;
     }
 
     const preferred = selectPipelineAction(nextActions);
@@ -661,7 +1186,16 @@ export async function runPostGrillPipeline(
         transcriptPath: worker?.transcriptPath,
         branchName: worker?.branchName,
       });
-      await waitForPipelineWorkers(coordinator, ui);
+      const waitResult = await waitForPipelineWorkers(coordinator, ui);
+      if (waitResult.status === "terminated") {
+        log("info", "pipeline:stop", {
+          reason: "run-terminated",
+          step,
+          mode: waitResult.result.mode,
+          ticketNumber,
+        });
+        return;
+      }
     }
   }
 
