@@ -48,6 +48,11 @@ import type {
   WorkflowRoot,
 } from "../types.js";
 import { buildRunBriefViewModel } from "./run-brief.js";
+import {
+  buildCompactWorkflowPanel,
+  formatCompactWorkflowPanelLines,
+  publishWorkflowPanel,
+} from "./workflow-panel.js";
 
 /**
  * Choose the next pipeline action without asking the user when rules allow.
@@ -136,6 +141,8 @@ function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
 /**
  * Present the multi-section run brief as the primary wait-surface content.
  * Uses multi-line notify (MVP primitive); content density matches the brief.
+ * Also refreshes the secondary compact Workflow panel from the same DTO when
+ * the TUI exposes setWidget/setStatus (graceful no-op otherwise).
  */
 function notifyRunBrief(
   ui: MattAutoUi,
@@ -144,6 +151,8 @@ function notifyRunBrief(
 ): ReturnType<typeof buildRunBriefViewModel> {
   const brief = buildRunBriefViewModel(panel);
   ui.notify(brief.lines.join("\n"), type);
+  // Secondary always-on Workflow panel — same panel state as the brief.
+  publishWorkflowPanel(ui, panel);
   return brief;
 }
 
@@ -249,6 +258,20 @@ export type MattAutoUi = {
    */
   editor?(title: string, prefill?: string): Promise<string | undefined>;
   notify(message: string, type?: "info" | "warning" | "error"): void;
+  /**
+   * Optional Pi TUI widget surface for the secondary compact Workflow panel.
+   * When omitted, panel publish is a graceful no-op (full-screen brief remains primary).
+   */
+  setWidget?(
+    key: string,
+    content: string[] | undefined,
+    options?: { placement?: "aboveEditor" | "belowEditor" },
+  ): void;
+  /**
+   * Optional Pi TUI footer status for the compact Workflow panel one-liner.
+   * When omitted, status publish is a graceful no-op.
+   */
+  setStatus?(key: string, text: string | undefined): void;
 };
 
 const PREFLIGHT_HEADER = "--- Workflow preflight ---";
@@ -383,9 +406,12 @@ export function formatTicketProgressLines(
   ];
 }
 
-/** Compact passive Workflow panel lines (not an interactive dashboard). */
+/**
+ * Compact passive Workflow panel lines (not an interactive dashboard).
+ * Derived from the same panel DTO as the full-screen run brief — not a second channel.
+ */
 export function formatPanelLines(panel: WorkflowPanelState): string[] {
-  return [...panel.lines];
+  return formatCompactWorkflowPanelLines(panel);
 }
 
 /** Build bare `/matt-auto` menu lines from coordinator state. */
@@ -415,7 +441,7 @@ export function buildMainMenuItems(
     items.push(RUN_PIPELINE_ITEM);
   }
 
-  if (panel && panel.workers.length > 0) {
+  if (panel && buildCompactWorkflowPanel(panel).visible) {
     items.push(PANEL_HEADER, ...formatPanelLines(panel));
   }
 
@@ -453,6 +479,9 @@ export async function presentMainMenu(
     const nextActions = await coordinator.nextActions();
     const ticketProgress = await coordinator.getTicketProgress();
     const panel = await coordinator.getPanelState();
+    // Secondary always-on Workflow panel from the same DTO (no-op without TUI widgets).
+    publishWorkflowPanel(ui, panel);
+    const panelLines = panel ? formatPanelLines(panel) : [];
     const items = buildMainMenuItems(
       preflight,
       nextActions,
@@ -470,12 +499,11 @@ export async function presentMainMenu(
       selected.startsWith("Tickets:") ||
       selected.startsWith("Ready frontier:") ||
       selected.startsWith("Blocked:") ||
-      selected.startsWith("Workflow #") ||
-      selected.startsWith("Worker #")
+      (panel && panelLines.includes(selected))
     ) {
-      // Passive panel / progress rows — show detail, no actions.
-      if (panel && (selected.startsWith("Workflow #") || selected.startsWith("Worker #"))) {
-        ui.notify(formatPanelLines(panel).join("\n"), "info");
+      // Passive Workflow panel / progress rows — show detail, no actions.
+      if (panel && panelLines.includes(selected)) {
+        ui.notify(panelLines.join("\n"), "info");
       } else if (ticketProgress) {
         ui.notify(formatTicketProgressLines(ticketProgress).join("\n"), "info");
       }
