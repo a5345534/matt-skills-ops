@@ -893,6 +893,8 @@ type PrefState = {
   globalWorkerProfile?: WorkerProfile;
   rootWorkerProfile?: WorkerProfile;
   snapshotWorkerProfile?: WorkerProfile;
+  globalWorkerConcurrency?: number;
+  rootWorkerConcurrency?: number;
   activeWorkflowIds?: Record<string, number>;
 };
 
@@ -914,6 +916,17 @@ function createPreferences(state: PrefState = {}): PreferencesPort {
     },
     clearRootWorkerProfile: async () => {
       delete store.rootWorkerProfile;
+    },
+    getGlobalWorkerConcurrency: async () => store.globalWorkerConcurrency,
+    getRootWorkerConcurrency: async () => store.rootWorkerConcurrency,
+    setGlobalWorkerConcurrency: async (concurrency) => {
+      store.globalWorkerConcurrency = concurrency;
+    },
+    setRootWorkerConcurrency: async (concurrency) => {
+      store.rootWorkerConcurrency = concurrency;
+    },
+    clearRootWorkerConcurrency: async () => {
+      delete store.rootWorkerConcurrency;
     },
     getActiveWorkflowId: async (targetBranch) =>
       store.activeWorkflowIds?.[targetBranch],
@@ -1449,6 +1462,148 @@ describe("Workflow coordinator Worker profile precedence", () => {
       source: "workflow-root",
     });
     expect(homeModel).toBe("still-workflow-home-model");
+  });
+});
+
+describe("Workflow coordinator Worker concurrency preferences", () => {
+  it("defaults effective concurrency to 2 when global and root are unset", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(2);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBeUndefined();
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("uses global concurrency when root is unset", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerConcurrency: 3 },
+        },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("prefers Workflow-root override over global concurrency", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerConcurrency: 3,
+            rootWorkerConcurrency: 5,
+          },
+        },
+      }),
+    );
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(5);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBe(5);
+  });
+
+  it("sets global concurrency through the coordinator seam", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await coordinator.setGlobalWorkerConcurrency(4);
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(4);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(4);
+  });
+
+  it("sets a Workflow-root override without changing the global concurrency", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerConcurrency: 3 },
+        },
+      }),
+    );
+
+    await coordinator.setRootWorkerConcurrency(6);
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(6);
+    await expect(coordinator.getGlobalWorkerConcurrency()).resolves.toBe(3);
+  });
+
+  it("clears the Workflow-root concurrency override so global becomes effective", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerConcurrency: 3,
+            rootWorkerConcurrency: 8,
+          },
+        },
+      }),
+    );
+
+    await coordinator.clearRootWorkerConcurrency();
+
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+    await expect(coordinator.getRootWorkerConcurrency()).resolves.toBeUndefined();
+  });
+
+  it("rejects non-integer and sub-1 concurrency on set", async () => {
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: { preferences: {} },
+      }),
+    );
+
+    await expect(coordinator.setGlobalWorkerConcurrency(0)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setGlobalWorkerConcurrency(-1)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setGlobalWorkerConcurrency(1.5)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setRootWorkerConcurrency(0)).rejects.toThrow(
+      /positive integer/i,
+    );
+    await expect(coordinator.setRootWorkerConcurrency(2.2)).rejects.toThrow(
+      /positive integer/i,
+    );
+    // Valid values still succeed after rejections.
+    await coordinator.setGlobalWorkerConcurrency(1);
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(1);
+  });
+
+  it("writes concurrency only through PreferencesPort (no GitHub writes)", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {},
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.setGlobalWorkerConcurrency(3);
+    await coordinator.setRootWorkerConcurrency(4);
+    await coordinator.clearRootWorkerConcurrency();
+    await expect(coordinator.getEffectiveWorkerConcurrency()).resolves.toBe(3);
+
+    // Preferences are local-only; tracker mutation helpers must not be called.
+    expect(tracker.state.createIssueCalls).toBe(0);
+    expect(tracker.state.writeManifestCalls).toBe(0);
+    expect(tracker.state.closeIssueCalls).toEqual([]);
+    expect(tracker.state.addBlockedByCalls).toEqual([]);
+    expect(tracker.state.addSubIssueCalls).toEqual([]);
   });
 });
 

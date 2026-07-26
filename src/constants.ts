@@ -2,6 +2,19 @@
 export const DEFAULT_TARGET_BRANCH = "main";
 
 /**
+ * Default Worker concurrency when neither global nor Workflow-root override is set.
+ * Domain: Worker concurrency defaults to two with no Matt Auto hard upper limit.
+ */
+export const DEFAULT_WORKER_CONCURRENCY = 2;
+
+/**
+ * Concurrency warning threshold for the configure UI.
+ * Setting N above this shows a one-time confirmation; run-time filling does not re-prompt.
+ * Fixed for this slice (initially four).
+ */
+export const WORKER_CONCURRENCY_WARNING_THRESHOLD = 4;
+
+/**
  * Matt skills required for Matt Auto V1.
  * Discovered at runtime; never bundled or pinned.
  */

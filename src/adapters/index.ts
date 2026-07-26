@@ -16,7 +16,12 @@ export {
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
 } from "./planning-draft.js";
-export { createPreferencesPort } from "./preferences.js";
+export {
+  assertValidWorkerConcurrency,
+  createPreferencesPort,
+  isValidWorkerConcurrency,
+  resolveEffectiveWorkerConcurrency,
+} from "./preferences.js";
 export {
   createSkillsPort,
   type CreateSpecHost,
