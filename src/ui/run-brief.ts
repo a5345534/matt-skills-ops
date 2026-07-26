@@ -517,8 +517,8 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
     id: "controls",
     title: "Controls",
     lines: [
-      "Use the select menu below: Keep waiting / Pause / Terminate",
-      "(Shortcuts optional; shell: echo terminate-now > .pi/matt-auto/run-control)",
+      "Live: ↑↓ / Enter on Pause or Terminate (brief keeps refreshing)",
+      "Shell fallback: echo terminate-now > .pi/matt-auto/run-control",
     ],
   };
 }

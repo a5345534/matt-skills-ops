@@ -202,8 +202,8 @@ describe("buildRunBriefViewModel", () => {
       "#43 r1: needs-disposition",
       "  branch: matt-auto/42/ticket-43/r1",
     ]);
-    expect(brief.sections.find((s) => s.id === "controls")?.lines.join("\n")).toContain(
-      "select menu",
+    expect(brief.sections.find((s) => s.id === "controls")?.lines.join("\n")).toMatch(
+      /Live:|select menu|Pause/,
     );
     // Missing optional sections are absent, not empty placeholders that throw.
     expect(ids).not.toContain("integration");

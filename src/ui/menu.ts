@@ -7,6 +7,10 @@ import {
   type WorkerConcurrencySource,
 } from "../adapters/preferences.js";
 import {
+  canPresentLiveWaitControls,
+  presentLiveWaitControls,
+} from "./live-run-brief-controls.js";
+import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
   CLEANUP_WORKFLOW_ACTION,
@@ -688,13 +692,20 @@ export async function waitForPipelineWorkers(
 
   if (!initialPaused) {
     const controlPath = runControlFilePath(process.cwd());
-    if (offerRunningControls) {
+    if (canPresentLiveWaitControls(ui)) {
+      ui.notify(
+        [
+          "Live wait: brief refreshes while Pause / Terminate stay selectable (↑↓ Enter).",
+          `Shell fallback: echo terminate-now > ${controlPath}`,
+        ].join("\n"),
+        "info",
+      );
+    } else if (offerRunningControls) {
       ui.notify(
         [
           "Waiting for workers — use the control menu (select an option):",
           "  • Keep waiting (refresh brief)",
           "  • Pause pipeline…  /  Terminate run…  (each asks for confirm)",
-          "Optional shortcuts: Ctrl+Shift+X terminate · Ctrl+Shift+Z pause",
           `Shell fallback: echo terminate-now > ${controlPath}`,
         ].join("\n"),
         "info",
@@ -702,8 +713,7 @@ export async function waitForPipelineWorkers(
     } else {
       ui.notify(
         [
-          "Auto-waiting (no control menu) — use shortcuts or the control file.",
-          "Ctrl+Shift+X terminate · Ctrl+Shift+Z pause",
+          "Auto-waiting (no control menu) — use the run-control file.",
           `Shell: echo terminate-now > ${controlPath}`,
         ].join("\n"),
         "info",
@@ -800,6 +810,26 @@ export async function waitForPipelineWorkers(
             return { status: "terminated", result };
           }
         }
+        if (canPresentLiveWaitControls(ui)) {
+          const live = await presentLiveWaitControls(ui, controls, panel, {
+            pollIntervalMs,
+          });
+          if (live.action === "resume") {
+            await applyConfirmedResume(controls, ui, panel);
+            continue;
+          }
+          if (live.action === "terminate") {
+            const result = await applyConfirmedTerminate(controls, ui, panel);
+            if (result) {
+              const latest =
+                (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+              notifyRunBrief(ui, latest, "warning");
+              ui.notify(formatTerminateNotify(result), "warning");
+              return { status: "terminated", result };
+            }
+          }
+          continue;
+        }
         const control = await presentRunBriefControlMenu(controls, ui, panel);
         if (control.action === "terminated") {
           const latest =
@@ -880,8 +910,8 @@ export async function waitForPipelineWorkers(
       }
       log("debug", "pipeline:wait-workers-tick", tickPayload);
 
-      // Primary: select menu (Keep waiting / Pause / Terminate).
-      // Secondary: shortcuts + run-control file (consumed first if already queued).
+      // Primary: live custom surface (brief refresh + options simultaneously).
+      // Fallback: blocking select menu. Shortcuts / run-control file still work.
       if (controls) {
         const queued =
           consumePendingWaitControl() ??
@@ -904,7 +934,31 @@ export async function waitForPipelineWorkers(
           if (control.action === "paused") {
             continue;
           }
-          // menu decline / pause cancel / continue → keep waiting
+        } else if (canPresentLiveWaitControls(ui)) {
+          const live = await presentLiveWaitControls(ui, controls, panel, {
+            pollIntervalMs,
+          });
+          if (live.action === "settled") {
+            // Panel may have P1 work or workers finished — re-check outer loop.
+            continue;
+          }
+          if (live.action === "pause") {
+            const applied = await applyConfirmedPause(controls, ui, panel);
+            if (applied) continue;
+          } else if (live.action === "resume") {
+            const applied = await applyConfirmedResume(controls, ui, panel);
+            if (applied) continue;
+          } else if (live.action === "terminate") {
+            const result = await applyConfirmedTerminate(controls, ui, panel);
+            if (result) {
+              const latest =
+                (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+              notifyRunBrief(ui, latest, "warning");
+              ui.notify(formatTerminateNotify(result), "warning");
+              return { status: "terminated", result };
+            }
+          }
+          continue;
         } else if (offerRunningControls) {
           const control = await presentRunBriefControlMenu(controls, ui, panel);
           if (control.action === "terminated") {
@@ -982,6 +1036,34 @@ export type MattAutoUi = {
    * braille spinner + OSC progress while Matt Auto waits on workers.
    */
   setTitle?(title: string): void;
+  /**
+   * Optional Pi `ctx.ui.custom()` — live wait surface (brief refresh + options).
+   * When present, preferred over blocking `select` during worker wait.
+   */
+  custom?: <T>(
+    factory: (
+      tui: { requestRender: () => void },
+      // Theme is Pi's Theme; keep loose so we do not depend on ThemeColor unions here.
+      theme: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        fg: (color: any, text: string) => string;
+        bold: (text: string) => string;
+      },
+      keybindings: unknown,
+      done: (value: T) => void,
+    ) => {
+      render: (width: number) => string[];
+      invalidate?: () => void;
+      handleInput?: (data: string) => void;
+      dispose?: () => void;
+    } | Promise<{
+      render: (width: number) => string[];
+      invalidate?: () => void;
+      handleInput?: (data: string) => void;
+      dispose?: () => void;
+    }>,
+    options?: { overlay?: boolean },
+  ) => Promise<T | undefined>;
 };
 
 const PREFLIGHT_HEADER = "--- Workflow preflight ---";

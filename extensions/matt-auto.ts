@@ -307,16 +307,9 @@ function createSkillsHost(
 }
 
 function uiFrom(ctx: {
-  ui: MattAutoUi & {
-    input?: (
-      title: string,
-      placeholder?: string,
-    ) => Promise<string | undefined>;
-    editor?: (title: string, prefill?: string) => Promise<string | undefined>;
-    setWidget?: MattAutoUi["setWidget"];
-    setStatus?: MattAutoUi["setStatus"];
-    setTitle?: MattAutoUi["setTitle"];
-  };
+  // Pi ExtensionUIContext is wider than MattAutoUi; pick methods we need.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ui: any;
 }): MattAutoUi {
   const ui: MattAutoUi = {
     select: (title, options) => ctx.ui.select(title, options),
@@ -343,6 +336,11 @@ function uiFrom(ctx: {
   if (typeof ctx.ui.setTitle === "function") {
     const setTitle = ctx.ui.setTitle.bind(ctx.ui);
     ui.setTitle = (title) => setTitle(title);
+  }
+  // Live wait surface: brief refresh + selectable Pause/Terminate (Pi custom UI).
+  if (typeof ctx.ui.custom === "function") {
+    const custom = ctx.ui.custom.bind(ctx.ui) as NonNullable<MattAutoUi["custom"]>;
+    ui.custom = custom;
   }
   return ui;
 }
