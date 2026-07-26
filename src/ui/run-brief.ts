@@ -1,4 +1,24 @@
-import type { WorkflowPanelState } from "../types.js";
+import type {
+  RunTerminationMode,
+  WorkflowPanelState,
+} from "../types.js";
+
+/**
+ * Predict Run termination mode (T1 stop-only vs T2 discard) from panel facts.
+ * Mirrors coordinator late-stage rule: integrated work or Workflow PR ⇒ stop-only.
+ * Used only for confirmation copy before `terminateRun()` decides authoritatively.
+ */
+export function predictRunTerminationMode(
+  panel: WorkflowPanelState,
+): RunTerminationMode {
+  if (panel.workflowPr) return "stop-only";
+  if (panel.ci && panel.ci.length > 0) return "stop-only";
+  if (panel.ticketProgress) {
+    if (panel.ticketProgress.closed > 0) return "stop-only";
+    if (panel.ticketProgress.awaitingCi.length > 0) return "stop-only";
+  }
+  return "discard-unintegrated";
+}
 
 /** Section ids for the full-screen run brief (display only). */
 export type RunBriefSectionId =
