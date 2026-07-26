@@ -280,7 +280,8 @@ export type WorkflowPanelState = {
   integration?: {
     ticketNumber: number;
     attempt: number;
-    status: "pending-retry" | "conflict-resolution";
+    /** running = unit currently executing (do not re-enter / do not P1-settle). */
+    status: "pending-retry" | "conflict-resolution" | "running";
     branchName: string;
     reason?: string;
   };
@@ -407,12 +408,12 @@ export type StageResult =
       ticketNumber: number;
       attempt: number;
       workerId: string;
-      /** Integration branch with the preserved in-progress merge. */
+      /** Integration branch (merge target / conflict workspace). */
       integrationBranch: string;
-      /** Integration workspace where the Conflict resolution worker runs. */
-      integrationWorktreePath: string;
-      /** Always true: this running Stage result is a Conflict resolution worker. */
-      conflictResolution: true;
+      /** Integration workspace when a conflict worker or known worktree exists. */
+      integrationWorktreePath?: string;
+      /** True when a Conflict resolution worker owns the unit. */
+      conflictResolution?: true;
     }
   | {
       status: "needs-disposition";

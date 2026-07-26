@@ -60,6 +60,7 @@ function isSettled(panel: WorkflowPanelState | undefined): boolean {
   if (panel.pipelinePaused) return false;
   if (panel.workers.some((w) => w.status === "running")) return false;
   if (panel.integration?.status === "conflict-resolution") return false;
+  if (panel.integration?.status === "running") return false;
   return true;
 }
 

@@ -1598,7 +1598,9 @@ export function createWorkflowCoordinator(
       }
 
       // Fail-closed Integration unit retry (one ticket at a time).
-      if (pendingIntegration) {
+      // While a unit is actively running, do not re-offer Retry (avoids the
+      // "already in progress" auto-advance race after conflict resolution).
+      if (pendingIntegration && !integrationInProgress && !activeConflictWorker) {
         return [
           {
             id: integrateTicketActionId(pendingIntegration.ticketNumber),
@@ -1608,6 +1610,10 @@ export function createWorkflowCoordinator(
               "Retry the serialized Integration unit (merge, Local verification, coordinator push).",
           },
         ];
+      }
+      if (pendingIntegration && (integrationInProgress || activeConflictWorker)) {
+        // Empty next list → wait surface owns progress until the unit settles.
+        return [];
       }
 
       // Slot math: N effective concurrency; slots = max(0, N - running).
@@ -2843,7 +2849,14 @@ export function createWorkflowCoordinator(
         delete unit.conflict;
         delete unit.lastFailure;
 
-        await finishIntegrationAfterMerge(bound, unit, integrationWorkspace);
+        // Mark in-progress so nextActions does not re-offer Retry / auto-advance
+        // into a second concurrent finish while this one is still running.
+        integrationInProgress = true;
+        try {
+          await finishIntegrationAfterMerge(bound, unit, integrationWorkspace);
+        } finally {
+          integrationInProgress = false;
+        }
         return;
       }
 
@@ -2991,6 +3004,27 @@ export function createWorkflowCoordinator(
     unit: PendingIntegration,
   ): Promise<StageResult> {
     if (integrationInProgress) {
+      // Same unit may still be finishing (e.g. post-conflict finishIntegrationAfterMerge
+      // in flight). Do not hard-fail the pipeline — wait loop treats integrate
+      // "running" as live work. Different ticket still blocked.
+      if (pendingIntegration?.ticketNumber === unit.ticketNumber) {
+        return {
+          status: "running",
+          stage: "integrate",
+          workflowId: unit.workflowId,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workerId: activeConflictWorker?.workerId ?? `integrate-${unit.ticketNumber}`,
+          integrationBranch:
+            unit.conflict?.integrationBranch ??
+            integrationBranchName(unit.workflowId),
+          ...(unit.conflict?.integrationWorktreePath
+            ? {
+                integrationWorktreePath: unit.conflict.integrationWorktreePath,
+              }
+            : {}),
+        };
+      }
       return {
         status: "failed",
         stage: "integrate",
@@ -3002,6 +3036,19 @@ export function createWorkflowCoordinator(
     }
 
     if (activeConflictWorker) {
+      if (activeConflictWorker.ticketNumber === unit.ticketNumber) {
+        return {
+          status: "running",
+          stage: "integrate",
+          workflowId: unit.workflowId,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workerId: activeConflictWorker.workerId,
+          integrationBranch: activeConflictWorker.integrationBranch,
+          integrationWorktreePath: activeConflictWorker.integrationWorktreePath,
+          conflictResolution: true,
+        };
+      }
       return {
         status: "failed",
         stage: "integrate",
@@ -3178,7 +3225,13 @@ export function createWorkflowCoordinator(
         mergeCommitSha: mergeResult.mergeCommitSha,
       });
 
-      return finishIntegrationAfterMerge(bound, unit, integrationWorkspace);
+      // Await so the finally block does not clear integrationInProgress while
+      // finishIntegrationAfterMerge is still running (retry race).
+      return await finishIntegrationAfterMerge(
+        bound,
+        unit,
+        integrationWorkspace,
+      );
     } finally {
       integrationInProgress = false;
     }
@@ -5119,6 +5172,19 @@ export function createWorkflowCoordinator(
         status: "conflict-resolution",
         branchName: activeConflictWorker.integrationBranch,
         ...(pendingIntegration?.lastFailure
+          ? { reason: pendingIntegration.lastFailure }
+          : {}),
+      };
+    } else if (pendingIntegration && integrationInProgress) {
+      // Unit is actively finishing (merge/verify/push) — wait must not P1-settle.
+      state.integration = {
+        ticketNumber: pendingIntegration.ticketNumber,
+        attempt: pendingIntegration.attempt,
+        status: "running",
+        branchName: pendingIntegration.conflict
+          ? pendingIntegration.conflict.integrationBranch
+          : pendingIntegration.branchName,
+        ...(pendingIntegration.lastFailure
           ? { reason: pendingIntegration.lastFailure }
           : {}),
       };

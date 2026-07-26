@@ -361,6 +361,7 @@ function runningWorkers(panel: WorkflowPanelState | undefined) {
 function hasP1RunLoopWork(panel: WorkflowPanelState | undefined): boolean {
   if (!panel) return false;
   if (panel.workers.some((w) => w.status === "needs-disposition")) return true;
+  // pending-retry is actionable; integration "running" is NOT P1 settle — wait.
   if (panel.integration?.status === "pending-retry") return true;
   return false;
 }
@@ -371,6 +372,8 @@ function hasLivePipelineWork(panel: WorkflowPanelState | undefined): boolean {
   if (panel.pipelinePaused || panel.runTerminated) return true;
   if (panel.workers.some((w) => w.status === "running")) return true;
   if (panel.integration?.status === "conflict-resolution") return true;
+  // Post-conflict finish / active integrate — do not auto-retry while busy.
+  if (panel.integration?.status === "running") return true;
   return false;
 }
 
