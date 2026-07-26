@@ -33,6 +33,10 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import {
+  assertValidWorkerConcurrency,
+  resolveEffectiveWorkerConcurrency,
+} from "./adapters/preferences.js";
 import { workerTranscriptPath } from "./adapters/transcripts.js";
 import { implementationWorktreePath } from "./adapters/workspace.js";
 import type {
@@ -4690,6 +4694,44 @@ export function createWorkflowCoordinator(
     await bound.preferences.clearRootWorkerProfile();
   }
 
+  async function getEffectiveWorkerConcurrency(): Promise<number> {
+    const bound = await requireScoped();
+    const root = await bound.preferences.getRootWorkerConcurrency();
+    const global = await bound.preferences.getGlobalWorkerConcurrency();
+    return resolveEffectiveWorkerConcurrency(root, global);
+  }
+
+  async function getGlobalWorkerConcurrency(): Promise<number | undefined> {
+    const bound = await requireScoped();
+    return bound.preferences.getGlobalWorkerConcurrency();
+  }
+
+  async function getRootWorkerConcurrency(): Promise<number | undefined> {
+    const bound = await requireScoped();
+    return bound.preferences.getRootWorkerConcurrency();
+  }
+
+  async function setGlobalWorkerConcurrency(
+    concurrency: number,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    assertValidWorkerConcurrency(concurrency);
+    await bound.preferences.setGlobalWorkerConcurrency(concurrency);
+  }
+
+  async function setRootWorkerConcurrency(
+    concurrency: number,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    assertValidWorkerConcurrency(concurrency);
+    await bound.preferences.setRootWorkerConcurrency(concurrency);
+  }
+
+  async function clearRootWorkerConcurrency(): Promise<void> {
+    const bound = await requireScoped();
+    await bound.preferences.clearRootWorkerConcurrency();
+  }
+
   async function listAvailableModels(): Promise<readonly AvailableModel[]> {
     return ports.models.listAvailableModels();
   }
@@ -4723,6 +4765,12 @@ export function createWorkflowCoordinator(
     setGlobalWorkerProfile,
     setRootWorkerProfile,
     clearRootWorkerProfile,
+    getEffectiveWorkerConcurrency,
+    getGlobalWorkerConcurrency,
+    getRootWorkerConcurrency,
+    setGlobalWorkerConcurrency,
+    setRootWorkerConcurrency,
+    clearRootWorkerConcurrency,
     listAvailableModels,
     getHomeModel,
     thinkingLevelsFor,

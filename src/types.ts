@@ -691,6 +691,27 @@ export type WorkflowCoordinator = {
   /** Remove the Workflow-root Worker profile override (global default remains). */
   clearRootWorkerProfile(): Promise<void>;
   /**
+   * Effective Worker concurrency after Workflow-root → global → default (2) precedence.
+   * Always a positive integer; never writes to GitHub.
+   */
+  getEffectiveWorkerConcurrency(): Promise<number>;
+  /** Configured global default Worker concurrency (no root override). */
+  getGlobalWorkerConcurrency(): Promise<number | undefined>;
+  /** Configured Workflow-root Worker concurrency override for the current root. */
+  getRootWorkerConcurrency(): Promise<number | undefined>;
+  /**
+   * Persist a global default Worker concurrency.
+   * Rejects non-integers and values < 1. Local prefs only — never GitHub.
+   */
+  setGlobalWorkerConcurrency(concurrency: number): Promise<void>;
+  /**
+   * Persist a Workflow-root Worker concurrency override for the current root.
+   * Rejects non-integers and values < 1. Local prefs only — never GitHub.
+   */
+  setRootWorkerConcurrency(concurrency: number): Promise<void>;
+  /** Remove the Workflow-root Worker concurrency override (global default remains). */
+  clearRootWorkerConcurrency(): Promise<void>;
+  /**
    * Authenticated available models from Pi’s catalog.
    * Used by Worker profile menus; never mutates the home model.
    */
