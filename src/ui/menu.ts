@@ -47,6 +47,7 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+import { buildRunBriefViewModel } from "./run-brief.js";
 
 /**
  * Choose the next pipeline action without asking the user when rules allow.
@@ -101,64 +102,128 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Options for the pipeline worker wait / run-brief refresh loop. */
+export type WaitForPipelineWorkersOptions = {
+  /** Poll interval between panel refreshes. Defaults to 2000ms. */
+  pollIntervalMs?: number;
+  /** Max poll iterations. Defaults to 1800 (~1 hour at 2s). */
+  maxTicks?: number;
+  /** Injectable sleep (tests). Defaults to real wall-clock sleep. */
+  sleep?: (ms: number) => Promise<void>;
+};
+
+function runningWorkers(panel: WorkflowPanelState | undefined) {
+  return panel?.workers.filter((w) => w.status === "running") ?? [];
+}
+
+function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
+  return (
+    panel?.workers.map((w) => ({
+      ticketNumber: w.ticketNumber,
+      attempt: w.attempt,
+      status: w.status,
+      workerId: w.workerId,
+      pid: w.pid,
+      processAlive: w.processAlive,
+      worktreePath: w.worktreePath,
+      transcriptPath: w.transcriptPath,
+      branchName: w.branchName,
+      progress: w.progress,
+    })) ?? []
+  );
+}
+
+/**
+ * Present the multi-section run brief as the primary wait-surface content.
+ * Uses multi-line notify (MVP primitive); content density matches the brief.
+ */
+function notifyRunBrief(
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+  type: "info" | "warning" | "error" = "info",
+): ReturnType<typeof buildRunBriefViewModel> {
+  const brief = buildRunBriefViewModel(panel);
+  ui.notify(brief.lines.join("\n"), type);
+  return brief;
+}
+
 /**
  * Wait while session-owned workers run. During that window nextActions is empty
  * on purpose; exiting the pipeline would dump the user back to the main menu.
+ *
+ * Primary operator surface is the full multi-section run brief (U2), refreshed
+ * each poll tick from `getPanelState()`. Settles when no workers are `running`
+ * (including needs-disposition) so Auto-Close can proceed.
  */
-async function waitForPipelineWorkers(
-  coordinator: WorkflowCoordinator,
+export async function waitForPipelineWorkers(
+  coordinator: Pick<WorkflowCoordinator, "getPanelState">,
   ui: MattAutoUi,
+  options: WaitForPipelineWorkersOptions = {},
 ): Promise<void> {
-  ui.notify(
-    "Pipeline waiting for Implementation / Conflict workers to finish…",
-    "info",
-  );
-  for (let i = 0; i < 1800; i += 1) {
-    // 1800 * 2s ≈ 1 hour max wait
-    await sleep(2000);
+  const pollIntervalMs = options.pollIntervalMs ?? 2000;
+  const maxTicks = options.maxTicks ?? 1800;
+  const sleepFn = options.sleep ?? sleep;
+
+  const initialPanel = await coordinator.getPanelState();
+  const initialRunning = runningWorkers(initialPanel);
+  if (initialRunning.length === 0) {
+    // Already settled (e.g. needs-disposition only) — do not block Auto-Close.
+    log("info", "pipeline:workers-settled", {
+      immediate: true,
+      panelWorkers: panelWorkerSnapshot(initialPanel),
+    });
+    if (initialPanel) {
+      notifyRunBrief(ui, initialPanel);
+    }
+    return;
+  }
+
+  const initialBrief = notifyRunBrief(ui, initialPanel!);
+  log("info", "pipeline:wait-workers", {
+    runningCount: initialRunning.length,
+    panelWorkers: panelWorkerSnapshot(initialPanel),
+    briefSections: initialBrief.sections.map((s) => s.id),
+  });
+
+  for (let i = 0; i < maxTicks; i += 1) {
+    await sleepFn(pollIntervalMs);
     const panel = await coordinator.getPanelState();
     // Panel may list pendingDisposition as a "worker" with status
     // needs-disposition — that is NOT still running. Only wait on live runs.
-    const running =
-      panel?.workers.filter((w) => w.status === "running") ?? [];
+    const running = runningWorkers(panel);
     if (running.length === 0) {
       // If disposition is pending, settle immediately so Auto-Close can run.
       // If panel is empty, also settle — caller will re-read nextActions
       // (may hit cooldown after abort/recovery instead of re-Implement thrash).
+      if (panel) {
+        notifyRunBrief(ui, panel);
+      }
       log("info", "pipeline:workers-settled", {
-        panelWorkers: panel?.workers.map((w) => ({
-          ticketNumber: w.ticketNumber,
-          attempt: w.attempt,
-          status: w.status,
-          workerId: w.workerId,
-          pid: w.pid,
-          processAlive: w.processAlive,
-          worktreePath: w.worktreePath,
-          transcriptPath: w.transcriptPath,
-          branchName: w.branchName,
-        })),
+        ticks: i + 1,
+        panelWorkers: panelWorkerSnapshot(panel),
       });
       return;
     }
-    if (i > 0 && i % 15 === 0) {
-      ui.notify(
-        `Still waiting on ${running.length} running worker(s)… (${formatPanelLines(panel!).join(" | ")})`,
-        "info",
-      );
-      log("debug", "pipeline:wait-workers-tick", {
-        running: running.map((w) => ({
-          ticketNumber: w.ticketNumber,
-          attempt: w.attempt,
-          workerId: w.workerId,
-          pid: w.pid,
-          processAlive: w.processAlive,
-          worktreePath: w.worktreePath,
-          transcriptPath: w.transcriptPath,
-          branchName: w.branchName,
-          progress: w.progress,
-        })),
-      });
-    }
+
+    // Refresh the full brief every tick so process-gone / progress stay visible.
+    const brief = notifyRunBrief(ui, panel!);
+    log("debug", "pipeline:wait-workers-tick", {
+      tick: i + 1,
+      runningCount: running.length,
+      running: running.map((w) => ({
+        ticketNumber: w.ticketNumber,
+        attempt: w.attempt,
+        workerId: w.workerId,
+        pid: w.pid,
+        processAlive: w.processAlive,
+        worktreePath: w.worktreePath,
+        transcriptPath: w.transcriptPath,
+        branchName: w.branchName,
+        progress: w.progress,
+      })),
+      briefSections: brief.sections.map((s) => s.id),
+      briefLines: brief.lines,
+    });
   }
   ui.notify(
     "Timed out waiting for workers. Re-run /matt-auto run to continue.",
