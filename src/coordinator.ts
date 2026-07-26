@@ -319,11 +319,21 @@ export function createWorkflowCoordinator(
   /** Session-local pending Stage confirmation (never remote until Publish). */
   let pending: PendingStage | undefined;
   /**
-   * Session-owned Implementation worker (single path for this ticket).
+   * Session-owned Implementation workers keyed by workerId.
+   * Holds running workers and completed workers waiting to become
+   * pendingDisposition (at most one pendingDisposition at a time).
    * Lifetime is bound to Workflow home; never durable across processes.
+   * Conflict resolution remains singular and separate.
    */
-  let activeWorker: ActiveImplementationWorker | undefined;
-  /** Pending Implementation disposition after a successful worker Stage result. */
+  const activeImplementationWorkers = new Map<
+    string,
+    ActiveImplementationWorker
+  >();
+  /**
+   * The single Implementation disposition currently offered as a Next action.
+   * Additional completed workers stay in activeImplementationWorkers until
+   * this slot frees and they can be promoted (Stage results are never dropped).
+   */
   let pendingDisposition: ActiveImplementationWorker | undefined;
   /**
    * Pending Integration unit after Close disposition (or a fail-closed retry).
@@ -361,6 +371,67 @@ export function createWorkflowCoordinator(
   let lastStopReason: "pipeline-pause" | "run-termination" | undefined;
   /** T1/T2 mode recorded when lastStopReason is run-termination. */
   let lastTerminationMode: RunTerminationMode | undefined;
+
+  function findImplementationWorker(
+    workerId: string,
+  ): ActiveImplementationWorker | undefined {
+    return (
+      activeImplementationWorkers.get(workerId) ??
+      (pendingDisposition?.workerId === workerId
+        ? pendingDisposition
+        : undefined)
+    );
+  }
+
+  function hasRunningImplementationWorkers(): boolean {
+    for (const worker of activeImplementationWorkers.values()) {
+      if (worker.status === "running") return true;
+    }
+    return false;
+  }
+
+  function findRunningWorkerForTicket(
+    ticketNumber: number,
+  ): ActiveImplementationWorker | undefined {
+    for (const worker of activeImplementationWorkers.values()) {
+      if (
+        worker.ticketNumber === ticketNumber &&
+        worker.status === "running"
+      ) {
+        return worker;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Promote the oldest completed worker waiting in the multi-worker list into
+   * the single pendingDisposition slot. Skips while Integration is pending so
+   * Close disposition cannot race a second Integration unit.
+   */
+  function promoteNextPendingDisposition(): void {
+    if (pendingDisposition || pendingIntegration) return;
+    for (const [workerId, worker] of activeImplementationWorkers) {
+      if (worker.status !== "needs-disposition") continue;
+      pendingDisposition = worker;
+      activeImplementationWorkers.delete(workerId);
+      return;
+    }
+  }
+
+  function listImplementationWorkersForPanel(): ActiveImplementationWorker[] {
+    const listed = [...activeImplementationWorkers.values()];
+    if (pendingDisposition) {
+      listed.push(pendingDisposition);
+    }
+    listed.sort((a, b) => {
+      if (a.ticketNumber !== b.ticketNumber) {
+        return a.ticketNumber - b.ticketNumber;
+      }
+      return a.attempt - b.attempt;
+    });
+    return listed;
+  }
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -474,7 +545,13 @@ export function createWorkflowCoordinator(
     bound: RootScopedPorts,
     active: ActiveWorkflow,
   ): Promise<void> {
-    if (pendingDisposition || pendingIntegration || activeWorker) return;
+    if (
+      pendingDisposition ||
+      pendingIntegration ||
+      activeImplementationWorkers.size > 0
+    ) {
+      return;
+    }
     const ticketNumbers = active.tickets ?? [];
     const rootPath = selectedPath ?? ports.startPath;
 
@@ -974,7 +1051,7 @@ export function createWorkflowCoordinator(
   function panelLines(
     workflowId: number,
     progress: TicketProgressSummary | undefined,
-    worker: ActiveImplementationWorker | undefined,
+    workers: readonly ActiveImplementationWorker[],
   ): string[] {
     const lines = [`Workflow #${workflowId}`];
     if (progress) {
@@ -982,14 +1059,10 @@ export function createWorkflowCoordinator(
         `Tickets: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed`,
       );
     }
-    if (worker) {
+    for (const worker of workers) {
       const progressText = worker.progress ? ` — ${worker.progress}` : "";
       lines.push(
         `Worker #${worker.ticketNumber} r${worker.attempt}: ${worker.status}${progressText}`,
-      );
-    } else if (pendingDisposition) {
-      lines.push(
-        `Worker #${pendingDisposition.ticketNumber} r${pendingDisposition.attempt}: needs-disposition`,
       );
     }
     if (activeConflictWorker) {
@@ -1311,8 +1384,8 @@ export function createWorkflowCoordinator(
     }
 
     if (isTicketWorkStage(active.stage)) {
-      // While a worker runs, the passive panel owns progress.
-      if (activeWorker || activeConflictWorker) {
+      // Conflict resolution is singular and owns the operator surface while alive.
+      if (activeConflictWorker) {
         return [];
       }
 
@@ -1323,7 +1396,7 @@ export function createWorkflowCoordinator(
         await recoverPendingDispositionFromTranscripts(bound, active);
       }
 
-      // After success, offer the Implementation disposition Next action only.
+      // P1: disposition is offered even while other Implementation workers run.
       if (pendingDisposition) {
         return [
           {
@@ -1347,6 +1420,12 @@ export function createWorkflowCoordinator(
               "Retry the serialized Integration unit (merge, Local verification, coordinator push).",
           },
         ];
+      }
+
+      // While Implementation workers run (and nothing needs disposition/integration),
+      // the passive panel owns progress.
+      if (hasRunningImplementationWorkers()) {
+        return [];
       }
 
       const actions: NextAction[] = [];
@@ -1954,11 +2033,25 @@ export function createWorkflowCoordinator(
       };
     }
 
-    if (activeWorker) {
+    // Completed workers waiting for the single pendingDisposition slot also block
+    // new launches (P1: process disposition before opening more implements).
+    for (const waiting of activeImplementationWorkers.values()) {
+      if (waiting.status === "needs-disposition") {
+        return {
+          status: "failed",
+          stage: "implement",
+          reason: `An Implementation disposition is pending for #${waiting.ticketNumber}. Choose Close, Leave open, or Investigate before launching another worker.`,
+          ticketNumber,
+        };
+      }
+    }
+
+    const alreadyRunning = findRunningWorkerForTicket(ticketNumber);
+    if (alreadyRunning) {
       return {
         status: "failed",
         stage: "implement",
-        reason: `An Implementation worker is already running for #${activeWorker.ticketNumber} (r${activeWorker.attempt}). The single-worker path does not launch concurrent workers.`,
+        reason: `An Implementation worker is already running for #${alreadyRunning.ticketNumber} (r${alreadyRunning.attempt}).`,
         ticketNumber,
       };
     }
@@ -2293,7 +2386,7 @@ export function createWorkflowCoordinator(
       startedAtMs: Date.now(),
       receivedStageResult: false,
     };
-    activeWorker = worker;
+    activeImplementationWorkers.set(workerId, worker);
 
     const transcriptKey = {
       workflowId: active.workflowId,
@@ -2347,7 +2440,7 @@ export function createWorkflowCoordinator(
         }),
       });
     } catch (error) {
-      activeWorker = undefined;
+      activeImplementationWorkers.delete(workerId);
       const message = error instanceof Error ? error.message : String(error);
       await bound.transcripts.append(transcriptKey, {
         type: "worker-launch-failed",
@@ -2379,6 +2472,24 @@ export function createWorkflowCoordinator(
     };
   }
 
+  /**
+   * Move a completed Implementation worker into the single pendingDisposition
+   * slot, or retain it on the multi-worker list when that slot (or Integration)
+   * is already occupied. Never drops a Stage result.
+   */
+  function settleCompletedImplementationWorker(
+    worker: ActiveImplementationWorker,
+  ): void {
+    worker.status = "needs-disposition";
+    if (!pendingDisposition && !pendingIntegration) {
+      pendingDisposition = worker;
+      activeImplementationWorkers.delete(worker.workerId);
+      return;
+    }
+    // Keep on the worker list until pendingDisposition / Integration frees.
+    activeImplementationWorkers.set(worker.workerId, worker);
+  }
+
   async function handleWorkerEvent(
     bound: RootScopedPorts,
     event: WorkerProtocolEvent,
@@ -2388,12 +2499,8 @@ export function createWorkflowCoordinator(
       return;
     }
 
-    const worker =
-      activeWorker?.workerId === event.workerId
-        ? activeWorker
-        : pendingDisposition?.workerId === event.workerId
-          ? pendingDisposition
-          : undefined;
+    // Route strictly by workerId so worker A never mutates worker B.
+    const worker = findImplementationWorker(event.workerId);
     if (!worker) {
       return;
     }
@@ -2406,30 +2513,29 @@ export function createWorkflowCoordinator(
     await bound.transcripts.append(transcriptKey, event);
 
     if (event.type === "progress") {
-      if (activeWorker?.workerId === worker.workerId) {
+      // Progress only mutates the addressed running worker (never worker B via A).
+      if (worker.status === "running") {
         worker.progress = event.message;
       }
       return;
     }
 
     if (event.type === "stage-result") {
-      // Stage results only apply to the running worker, not a pending disposition.
-      if (activeWorker?.workerId !== worker.workerId) {
+      // Stage results only apply to workers still in the multi-worker set.
+      if (!activeImplementationWorkers.has(worker.workerId)) {
         return;
       }
       worker.receivedStageResult = true;
       if (event.outcome.status === "completed") {
-        worker.status = "needs-disposition";
         if (event.outcome.summary) {
           worker.summary = event.outcome.summary;
         }
-        pendingDisposition = worker;
-        activeWorker = undefined;
+        settleCompletedImplementationWorker(worker);
         return;
       }
 
       worker.status = "failed";
-      activeWorker = undefined;
+      activeImplementationWorkers.delete(worker.workerId);
       return;
     }
 
@@ -2457,15 +2563,11 @@ export function createWorkflowCoordinator(
         });
         if (ahead.ahead) {
           worker.receivedStageResult = true;
-          worker.status = "needs-disposition";
           worker.summary =
             worker.progress ??
             `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
               (ahead.headSha ? ` @ ${ahead.headSha.slice(0, 8)}` : "");
-          pendingDisposition = worker;
-          if (activeWorker?.workerId === worker.workerId) {
-            activeWorker = undefined;
-          }
+          settleCompletedImplementationWorker(worker);
           await bound.transcripts.append(transcriptKey, {
             type: "stage-result-inferred",
             reason:
@@ -2484,9 +2586,7 @@ export function createWorkflowCoordinator(
 
     // Fail closed: agent settled without a Stage result and no local commits.
     worker.status = "compatibility-recovery";
-    if (activeWorker?.workerId === worker.workerId) {
-      activeWorker = undefined;
-    }
+    activeImplementationWorkers.delete(worker.workerId);
     // Cooldown so /matt-auto run does not immediately re-launch the same ticket.
     implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
     await bound.transcripts.append(transcriptKey, {
@@ -2622,6 +2722,8 @@ export function createWorkflowCoordinator(
 
     // Leave open / Investigate: no Integration unit, no remote writes, ticket stays open.
     if (decision !== "close") {
+      // Free the single disposition slot for the next completed multi-worker.
+      promoteNextPendingDisposition();
       return {
         status: "completed",
         stage: "implement",
@@ -2744,6 +2846,7 @@ export function createWorkflowCoordinator(
       // Already integrated (e.g. recovered from manifest) — do not re-merge.
       if (active.integratedTickets?.some((t) => t.number === unit.ticketNumber)) {
         pendingIntegration = undefined;
+        promoteNextPendingDisposition();
         await bound.transcripts.append(transcriptKey, {
           type: "integration-unit-skipped",
           reason: "Ticket already recorded as integrated on the Workflow manifest.",
@@ -3141,6 +3244,8 @@ export function createWorkflowCoordinator(
       }
 
       pendingIntegration = undefined;
+      // Integration slot free — promote any completed worker waiting for disposition.
+      promoteNextPendingDisposition();
 
       await bound.transcripts.append(transcriptKey, {
         type: "integration-unit-completed",
@@ -4070,11 +4175,16 @@ export function createWorkflowCoordinator(
     preservePendingIntegrationMessage?: string;
   }): Promise<PipelineAffectedAttempt[]> {
     const bound = scoped ?? (await requireScoped());
-    const worker = activeWorker;
+    // Abort live Implementation workers. Completed workers waiting for the
+    // single pendingDisposition slot keep their Stage results (same as
+    // pendingDisposition itself, which is never cleared here).
+    const runningWorkers = [...activeImplementationWorkers.values()].filter(
+      (w) => w.status === "running",
+    );
     const conflictWorker = activeConflictWorker;
     const affected: PipelineAffectedAttempt[] = [];
 
-    if (worker) {
+    for (const worker of runningWorkers) {
       affected.push({
         workflowId: worker.workflowId,
         ticketNumber: worker.ticketNumber,
@@ -4097,8 +4207,9 @@ export function createWorkflowCoordinator(
       // Best-effort abort; session teardown still clears local worker state.
     }
 
-    if (worker) {
+    for (const worker of runningWorkers) {
       worker.status = "aborted";
+      activeImplementationWorkers.delete(worker.workerId);
       if (options.setCooldown) {
         // Prevent the pipeline from immediately re-selecting the same ticket.
         implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
@@ -4133,7 +4244,6 @@ export function createWorkflowCoordinator(
       }
     }
 
-    activeWorker = undefined;
     activeConflictWorker = undefined;
     return affected;
   }
@@ -4229,7 +4339,7 @@ export function createWorkflowCoordinator(
 
     // Session-known attempt branches (in case list is incomplete in tests / recovery).
     const sessionBranches = [
-      activeWorker?.branchName,
+      ...[...activeImplementationWorkers.values()].map((w) => w.branchName),
       pendingDisposition?.branchName,
       pendingIntegration?.branchName,
       pendingIntegration?.conflict?.integrationBranch,
@@ -4279,6 +4389,14 @@ export function createWorkflowCoordinator(
         workflowId: pendingDisposition.workflowId,
         ticketNumber: pendingDisposition.ticketNumber,
         attempt: pendingDisposition.attempt,
+      });
+    }
+    for (const worker of activeImplementationWorkers.values()) {
+      if (worker.status !== "needs-disposition") continue;
+      extraAttempts.push({
+        workflowId: worker.workflowId,
+        ticketNumber: worker.ticketNumber,
+        attempt: worker.attempt,
       });
     }
     if (pendingIntegration) {
@@ -4340,11 +4458,19 @@ export function createWorkflowCoordinator(
       pendingIntegration = undefined;
       pendingCiRecovery = undefined;
       integrationInProgress = false;
+      // Discard completed-but-not-yet-disposed multi-worker entries too.
+      activeImplementationWorkers.clear();
     } else {
       // T1 stop-only: clear live run pointers but never rewrite integrated history.
       // Keep pendingIntegration conflict state recoverable for a later retry.
       pendingDisposition = undefined;
       pendingCiRecovery = undefined;
+      // Drop session disposition queue; transcripts remain for recovery.
+      for (const [id, worker] of [...activeImplementationWorkers]) {
+        if (worker.status === "needs-disposition") {
+          activeImplementationWorkers.delete(id);
+        }
+      }
     }
 
     pipelinePaused = false;
@@ -4368,24 +4494,27 @@ export function createWorkflowCoordinator(
    * so the pipeline does not wait forever on a zombie in-memory worker.
    */
   async function reconcileDeadWorkers(bound: RootScopedPorts): Promise<void> {
-    if (activeWorker && activeWorker.status === "running") {
-      const runtime = bound.workers.getRuntime(activeWorker.workerId);
+    const running = [...activeImplementationWorkers.values()].filter(
+      (w) => w.status === "running",
+    );
+    for (const worker of running) {
+      const runtime = bound.workers.getRuntime(worker.workerId);
       if (!runtime || !runtime.alive) {
         const transcriptKey = {
-          workflowId: activeWorker.workflowId,
-          ticketNumber: activeWorker.ticketNumber,
-          attempt: activeWorker.attempt,
+          workflowId: worker.workflowId,
+          ticketNumber: worker.ticketNumber,
+          attempt: worker.attempt,
         };
         await bound.transcripts.append(transcriptKey, {
           type: "process-gone",
-          workerId: activeWorker.workerId,
-          pid: activeWorker.pid ?? runtime?.pid,
+          workerId: worker.workerId,
+          pid: worker.pid ?? runtime?.pid,
           reason:
             "Panel still marked running but the OS process is gone; synthesizing process-exit.",
         });
         await handleWorkerEvent(bound, {
           type: "process-exit",
-          workerId: activeWorker.workerId,
+          workerId: worker.workerId,
           code: null,
         });
       }
@@ -4482,50 +4611,55 @@ export function createWorkflowCoordinator(
     if (!active) return undefined;
 
     const progress = await loadTicketProgress(bound, active);
-    const worker = activeWorker ?? pendingDisposition;
-    const workers = worker
-      ? [
-          panelWorkerInspection(
-            {
-              workerId: worker.workerId,
-              workflowId: worker.workflowId,
-              ticketNumber: worker.ticketNumber,
-              attempt: worker.attempt,
-              branchName: worker.branchName,
-              worktreePath: worker.worktreePath,
-              status: worker.status,
-              startedAtMs: worker.startedAtMs,
-              ...(worker.progress ? { progress: worker.progress } : {}),
-              ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
-            },
-            bound,
-          ),
-        ]
-      : activeConflictWorker
-        ? [
+    const implementationWorkers = listImplementationWorkersForPanel();
+    const workers =
+      implementationWorkers.length > 0
+        ? implementationWorkers.map((worker) =>
             panelWorkerInspection(
               {
-                workerId: activeConflictWorker.workerId,
-                workflowId: activeConflictWorker.workflowId,
-                ticketNumber: activeConflictWorker.ticketNumber,
-                attempt: activeConflictWorker.attempt,
-                branchName: activeConflictWorker.integrationBranch,
-                worktreePath: activeConflictWorker.integrationWorktreePath,
-                status: activeConflictWorker.status,
-                startedAtMs: activeConflictWorker.startedAtMs,
-                ...(activeConflictWorker.progress
-                  ? { progress: activeConflictWorker.progress }
-                  : {}),
-                ...(typeof activeConflictWorker.pid === "number"
-                  ? { pid: activeConflictWorker.pid }
-                  : {}),
+                workerId: worker.workerId,
+                workflowId: worker.workflowId,
+                ticketNumber: worker.ticketNumber,
+                attempt: worker.attempt,
+                branchName: worker.branchName,
+                worktreePath: worker.worktreePath,
+                status: worker.status,
+                startedAtMs: worker.startedAtMs,
+                ...(worker.progress ? { progress: worker.progress } : {}),
+                ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
               },
               bound,
             ),
-          ]
-        : [];
+          )
+        : activeConflictWorker
+          ? [
+              panelWorkerInspection(
+                {
+                  workerId: activeConflictWorker.workerId,
+                  workflowId: activeConflictWorker.workflowId,
+                  ticketNumber: activeConflictWorker.ticketNumber,
+                  attempt: activeConflictWorker.attempt,
+                  branchName: activeConflictWorker.integrationBranch,
+                  worktreePath: activeConflictWorker.integrationWorktreePath,
+                  status: activeConflictWorker.status,
+                  startedAtMs: activeConflictWorker.startedAtMs,
+                  ...(activeConflictWorker.progress
+                    ? { progress: activeConflictWorker.progress }
+                    : {}),
+                  ...(typeof activeConflictWorker.pid === "number"
+                    ? { pid: activeConflictWorker.pid }
+                    : {}),
+                },
+                bound,
+              ),
+            ]
+          : [];
 
-    const lines = panelLines(active.workflowId, progress, worker);
+    const lines = panelLines(
+      active.workflowId,
+      progress,
+      implementationWorkers,
+    );
     appendWorkflowPrPanelLines(lines, active);
     const state: WorkflowPanelState = {
       workflowId: active.workflowId,

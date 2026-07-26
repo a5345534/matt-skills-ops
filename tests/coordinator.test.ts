@@ -3223,16 +3223,224 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(workers.state.launches).toHaveLength(0);
   });
 
-  it("rejects a second concurrent launch on the single-worker path", async () => {
+  it("rejects a second concurrent launch for the same ticket", async () => {
     const { coordinator } = ticketsPublishedFixture();
 
     await coordinator.runNextAction(implementTicketActionId(43));
-    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    const second = await coordinator.runNextAction(implementTicketActionId(43));
 
     expect(second.status).toBe("failed");
     if (second.status === "failed") {
       expect(second.reason).toMatch(/already running/i);
     }
+  });
+
+  it("runs two Implementation workers concurrently with isolated event routing", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    const first = await coordinator.runNextAction(implementTicketActionId(43));
+    const second = await coordinator.runNextAction(implementTicketActionId(44));
+    expect(first).toMatchObject({
+      status: "running",
+      ticketNumber: 43,
+      workerId: "implement-42-43-r1",
+    });
+    expect(second).toMatchObject({
+      status: "running",
+      ticketNumber: 44,
+      workerId: "implement-42-44-r1",
+    });
+    expect(workers.state.launches).toHaveLength(2);
+    expect(workers.state.sinks.size).toBe(2);
+
+    await workers.emit("implement-42-43-r1", {
+      type: "progress",
+      workerId: "implement-42-43-r1",
+      message: "A tests",
+    });
+    await workers.emit("implement-42-44-r1", {
+      type: "progress",
+      workerId: "implement-42-44-r1",
+      message: "B tests",
+    });
+
+    const panelBothRunning = await coordinator.getPanelState();
+    expect(panelBothRunning?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "running",
+          progress: "A tests",
+          workerId: "implement-42-43-r1",
+          pid: 4242,
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "running",
+          progress: "B tests",
+          workerId: "implement-42-44-r1",
+          pid: 4242,
+        }),
+      ]),
+    );
+    expect(panelBothRunning?.workers).toHaveLength(2);
+    expect(
+      panelBothRunning?.lines.filter((l) => /Worker #/.test(l)),
+    ).toHaveLength(2);
+
+    // Worker A completes — B must remain running and untouched.
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "A done" },
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const panelAfterA = await coordinator.getPanelState();
+    expect(panelAfterA?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "needs-disposition",
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "running",
+          progress: "B tests",
+        }),
+      ]),
+    );
+    expect(panelAfterA?.workers).toHaveLength(2);
+
+    // Disposition for A is offered while B still runs (P1).
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(43),
+        label: "Disposition #43",
+        description: "A done",
+      },
+    ]);
+
+    // Progress / exit for B must not clear A's pending disposition.
+    await workers.emit("implement-42-44-r1", {
+      type: "progress",
+      workerId: "implement-42-44-r1",
+      message: "B still going",
+    });
+    const panelMidB = await coordinator.getPanelState();
+    expect(
+      panelMidB?.workers.find((w) => w.ticketNumber === 43)?.status,
+    ).toBe("needs-disposition");
+    expect(
+      panelMidB?.workers.find((w) => w.ticketNumber === 44),
+    ).toMatchObject({
+      status: "running",
+      progress: "B still going",
+    });
+  });
+
+  it("retains a second completed worker until the first disposition is resolved", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "First done" },
+    });
+    await workers.emit("implement-42-44-r1", {
+      type: "stage-result",
+      workerId: "implement-42-44-r1",
+      outcome: { status: "completed", summary: "Second done" },
+    });
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          ticketNumber: 43,
+          status: "needs-disposition",
+        }),
+        expect.objectContaining({
+          ticketNumber: 44,
+          status: "needs-disposition",
+        }),
+      ]),
+    );
+    expect(panel?.workers).toHaveLength(2);
+
+    // Only one disposition is pending as a Next action.
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(43),
+        label: "Disposition #43",
+        description: "First done",
+      },
+    ]);
+
+    await coordinator.confirmDisposition("leave-open");
+
+    // Second Stage result is promoted — not dropped.
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: dispositionActionId(44),
+        label: "Disposition #44",
+        description: "Second done",
+      },
+    ]);
+    const panelAfter = await coordinator.getPanelState();
+    expect(panelAfter?.workers).toEqual([
+      expect.objectContaining({
+        ticketNumber: 44,
+        status: "needs-disposition",
+      }),
+    ]);
+  });
+
+  it("aborts every running Implementation worker on abortWorkers / pause", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    await coordinator.abortWorkers();
+
+    expect(workers.state.abortAllCount).toBe(1);
+    expect(workers.state.aborts).toEqual(
+      expect.arrayContaining([
+        "implement-42-43-r1",
+        "implement-42-44-r1",
+      ]),
+    );
+
+    const panelAfterAbort = await coordinator.getPanelState();
+    expect(
+      panelAfterAbort?.workers.every((w) => w.status !== "running") ?? true,
+    ).toBe(true);
+
+    // Fresh launches after cooldown clear via successful re-launch path.
+    const relaunchA = await coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    const relaunchB = await coordinator.runNextAction(
+      implementTicketActionId(44),
+    );
+    expect(relaunchA).toMatchObject({ status: "running", attempt: 2 });
+    expect(relaunchB).toMatchObject({ status: "running", attempt: 2 });
+
+    const pause = await coordinator.pausePipeline();
+    expect(pause.abortedWorkerCount).toBe(2);
+    expect(pause.pipelinePaused).toBe(true);
+    expect(workers.state.abortAllCount).toBe(2);
+    expect(
+      pause.affectedAttempts.map((a) => a.ticketNumber).sort((a, b) => a - b),
+    ).toEqual([43, 44]);
   });
 
   it("numbers rework attempts without reusing a completed workspace identity", async () => {
