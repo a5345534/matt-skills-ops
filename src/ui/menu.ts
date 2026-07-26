@@ -305,8 +305,9 @@ function notifyRunBrief(
 ): ReturnType<typeof buildRunBriefViewModel> {
   const brief = buildRunBriefViewModel(panel);
   ui.notify(brief.lines.join("\n"), type);
-  // Secondary always-on Workflow panel — same panel state as the brief.
-  publishWorkflowPanel(ui, panel);
+  // Full brief is primary during wait — do not also paint the compact multi-line
+  // widget (that duplicated the ticket table). Keep a one-line footer status only.
+  publishWorkflowPanel(ui, panel, { mode: "status-only" });
   return brief;
 }
 

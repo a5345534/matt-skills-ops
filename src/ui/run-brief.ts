@@ -66,7 +66,12 @@ export function buildRunBriefViewModel(
   const context = contextSection(panel);
   if (context) sections.push(context);
 
-  const workers = workersSection(panel.workers);
+  const hasTicketTable = Boolean(
+    panel.ticketProgress &&
+      (panel.ticketProgress.items?.length ||
+        panel.ticketProgress.total > 0),
+  );
+  const workers = workersSection(panel.workers, hasTicketTable);
   if (workers) sections.push(workers);
 
   const integration = integrationSection(panel.integration);
@@ -203,11 +208,13 @@ export function deriveContextLabel(panel: WorkflowPanelState): string | undefine
 
 function workersSection(
   workers: WorkflowPanelState["workers"],
+  /** When true, ticket table already carries status — keep Workers to one line each. */
+  compact = false,
 ): RunBriefSection | undefined {
   if (workers.length === 0) return undefined;
   const lines: string[] = [];
   for (const worker of workers) {
-    lines.push(...formatWorkerLines(worker));
+    lines.push(...formatWorkerLines(worker, compact));
   }
   return {
     id: "workers",
@@ -216,10 +223,16 @@ function workersSection(
   };
 }
 
-function formatWorkerLines(worker: PanelWorker): string[] {
-  const lines = [
-    `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`,
-  ];
+function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
+  const head = `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`;
+  if (compact) {
+    // Paths/ids live in logs; table already shows status/runtime.
+    if (worker.progress) {
+      return [`${head} — ${worker.progress}`];
+    }
+    return [head];
+  }
+  const lines = [head];
   if (worker.workerId) {
     lines.push(`  workerId: ${worker.workerId}`);
   }

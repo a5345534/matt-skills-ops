@@ -115,15 +115,9 @@ describe("buildRunBriefViewModel", () => {
     expect(byId.workflow?.lines).toEqual(["Workflow #42: Ship run brief"]);
     expect(byId.pipeline?.lines).toEqual(["Status: running"]);
     expect(byId.context?.lines).toEqual(["Implementing #43 r2"]);
+    // Ticket table present → Workers is a single progress line (no path dump).
     expect(byId.workers?.lines).toEqual([
-      "#43 r2: running",
-      "  workerId: implement-42-43-r2",
-      "  pid: 4242",
-      "  processAlive: true",
-      "  branch: matt-auto/42/ticket-43/r2",
-      "  worktree: /workspaces/42/ticket-43/r2",
-      "  transcript: /transcripts/42/ticket-43/r2.jsonl",
-      "  progress: Running tests",
+      "#43 r2: running — Running tests",
     ]);
     expect(byId.integration?.lines).toEqual([
       "#44 r1: pending-retry",

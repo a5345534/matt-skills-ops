@@ -327,7 +327,7 @@ describe("waitForPipelineWorkers", () => {
     expect(ui.notices.at(-1)).toMatch(/Timed out waiting for workers/i);
   });
 
-  it("publishes secondary Workflow panel from the same panel DTO when TUI widgets exist", async () => {
+  it("uses status-only footer during wait so the compact widget does not duplicate the brief", async () => {
     const panels: WorkflowPanelState[] = [
       basePanel({ workers: [runningWorker()] }),
       basePanel({
@@ -362,12 +362,13 @@ describe("waitForPipelineWorkers", () => {
       { pollIntervalMs: 1, maxTicks: 10, sleep: async () => undefined },
     );
 
-    expect(widgetCalls.length).toBeGreaterThanOrEqual(2);
-    const published = widgetCalls.map((c) => (c.content ?? []).join("\n"));
-    expect(published.some((t) => t.includes("#19 r1: running · alive"))).toBe(
-      true,
-    );
-    expect(published.some((t) => t.includes("Workflow #42"))).toBe(true);
+    // Widget cleared (status-only) — no second ticket list.
+    expect(widgetCalls.some((c) => c.content === undefined)).toBe(true);
+    expect(
+      widgetCalls.every(
+        (c) => c.content === undefined || !(c.content ?? []).join("\n").includes("Tickets"),
+      ),
+    ).toBe(true);
     expect(statusCalls.some((c) => c.text?.includes("Workflow #42"))).toBe(
       true,
     );

@@ -168,10 +168,21 @@ export function formatCompactWorkflowPanelLines(
  * Missing APIs (or host throws) are a graceful no-op so `/matt-auto run` still works;
  * the full-screen run brief remains primary.
  */
+export type PublishWorkflowPanelOptions = {
+  /**
+   * `full` — widget lines + footer status (default).
+   * `status-only` — footer status only; clear the multi-line widget so it does
+   * not duplicate the full-screen run brief ticket table during auto-wait.
+   */
+  mode?: "full" | "status-only";
+};
+
 export function publishWorkflowPanel(
   ui: WorkflowPanelSurface,
   panel: WorkflowPanelState | undefined,
+  options: PublishWorkflowPanelOptions = {},
 ): CompactWorkflowPanelViewModel | undefined {
+  const mode = options.mode ?? "full";
   const vm = panel ? buildCompactWorkflowPanel(panel) : undefined;
   const show = Boolean(vm?.visible);
 
@@ -184,7 +195,11 @@ export function publishWorkflowPanel(
   try {
     if (show && vm) {
       if (hasWidget) {
-        ui.setWidget!(WORKFLOW_PANEL_WIDGET_KEY, [...vm.lines]);
+        if (mode === "status-only") {
+          ui.setWidget!(WORKFLOW_PANEL_WIDGET_KEY, undefined);
+        } else {
+          ui.setWidget!(WORKFLOW_PANEL_WIDGET_KEY, [...vm.lines]);
+        }
       }
       if (hasStatus) {
         ui.setStatus!(WORKFLOW_PANEL_STATUS_KEY, vm.statusLine);
