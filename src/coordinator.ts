@@ -3816,6 +3816,7 @@ export function createWorkflowCoordinator(
       ...(active.title ? { title: active.title } : {}),
     };
     await bound.preferences.clearActiveWorkflowId(active.targetBranch);
+    invalidatePanelCaches();
 
     // Close parent Workflow spec (Workflow ID) — part of delivery completion.
     // Soft-fail: artifacts are already gone; do not fail cleanup if close fails.
@@ -4470,14 +4471,55 @@ export function createWorkflowCoordinator(
     return entry;
   }
 
-  async function getPanelState(): Promise<WorkflowPanelState | undefined> {
+  /** Cached for wait-loop local panel snapshots (invalidate on tracker mutations). */
+  let cachedPanelActive: ActiveWorkflow | undefined;
+  let cachedTicketProgress:
+    | { workflowId: number; progress: TicketProgressSummary }
+    | undefined;
+
+  function invalidatePanelCaches(): void {
+    cachedPanelActive = undefined;
+    cachedTicketProgress = undefined;
+  }
+
+  async function getPanelState(options?: {
+    mode?: "full" | "local";
+  }): Promise<WorkflowPanelState | undefined> {
     const bound = await requireScoped();
     // Detect zombie running state before snapshotting the panel.
     await reconcileDeadWorkers(bound);
-    const active = await loadActiveWorkflow(bound);
+    const mode = options?.mode ?? "full";
+
+    let active: ActiveWorkflow | undefined;
+    if (mode === "local" && cachedPanelActive) {
+      active = cachedPanelActive;
+    } else {
+      active = await loadActiveWorkflow(bound);
+      cachedPanelActive = active;
+      if (!active) {
+        cachedTicketProgress = undefined;
+      }
+    }
     if (!active) return undefined;
 
-    const progress = await loadTicketProgress(bound, active);
+    let progress: TicketProgressSummary | undefined;
+    if (
+      mode === "local" &&
+      cachedTicketProgress &&
+      cachedTicketProgress.workflowId === active.workflowId
+    ) {
+      progress = cachedTicketProgress.progress;
+    } else {
+      progress = await loadTicketProgress(bound, active);
+      if (progress) {
+        cachedTicketProgress = {
+          workflowId: active.workflowId,
+          progress,
+        };
+      } else {
+        cachedTicketProgress = undefined;
+      }
+    }
     const worker = activeWorker ?? pendingDisposition;
     const workers = worker
       ? [

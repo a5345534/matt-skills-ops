@@ -500,7 +500,9 @@ export async function waitForPipelineWorkers(
   const sleepFn = options.sleep ?? sleep;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
-  const initialPanel = await coordinator.getPanelState();
+  // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
+  // so wait loops do not burn GraphQL quota every poll.
+  const initialPanel = await coordinator.getPanelState({ mode: "full" });
   const initialRunning = runningWorkers(initialPanel);
   const initialPaused = initialPanel?.pipelinePaused === true;
 
@@ -543,7 +545,7 @@ export async function waitForPipelineWorkers(
 
   try {
     for (let i = 0; i < maxTicks; i += 1) {
-      const panel = await coordinator.getPanelState();
+      const panel = await coordinator.getPanelState({ mode: "local" });
       if (!panel) {
         log("info", "pipeline:workers-settled", {
           ticks: i + 1,
@@ -588,7 +590,8 @@ export async function waitForPipelineWorkers(
         }
         const control = await presentRunBriefControlMenu(controls, ui, panel);
         if (control.action === "terminated") {
-          const latest = (await coordinator.getPanelState()) ?? panel;
+          const latest =
+            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
           notifyRunBrief(ui, latest, "warning");
           ui.notify(formatTerminateNotify(control.result), "warning");
           return { status: "terminated", result: control.result };
@@ -640,7 +643,8 @@ export async function waitForPipelineWorkers(
         } else if (queued === "terminate") {
           const result = await applyConfirmedTerminate(controls, ui, panel);
           if (result) {
-            const latest = (await coordinator.getPanelState()) ?? panel;
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
             notifyRunBrief(ui, latest, "warning");
             ui.notify(formatTerminateNotify(result), "warning");
             return { status: "terminated", result };
@@ -648,7 +652,8 @@ export async function waitForPipelineWorkers(
         } else if (options.offerRunningControls) {
           const control = await presentRunBriefControlMenu(controls, ui, panel);
           if (control.action === "terminated") {
-            const latest = (await coordinator.getPanelState()) ?? panel;
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
             notifyRunBrief(ui, latest, "warning");
             ui.notify(formatTerminateNotify(control.result), "warning");
             return { status: "terminated", result: control.result };

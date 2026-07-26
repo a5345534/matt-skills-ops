@@ -711,8 +711,14 @@ export type WorkflowCoordinator = {
   /**
    * Passive Workflow panel snapshot for the Active workflow.
    * `undefined` when there is no Active workflow.
+   *
+   * `mode: "local"` — use cached Active workflow + ticket progress; only refresh
+   * in-memory workers (for wait-loop ticks). Avoids GitHub GraphQL every poll.
+   * `mode: "full"` (default) — reload Active workflow and ticket progress from GitHub.
    */
-  getPanelState(): Promise<WorkflowPanelState | undefined>;
+  getPanelState(options?: {
+    mode?: "full" | "local";
+  }): Promise<WorkflowPanelState | undefined>;
   /**
    * Apply Implementation disposition (Close / Leave open / Investigate)
    * after a successful Implementation worker Stage result.

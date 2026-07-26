@@ -121,12 +121,12 @@ An Implementation worker whose lifetime is bound to the Workflow home Pi process
 _Avoid_: durable worker, orphan process
 
 **Worker concurrency**:
-The user-selected number of simultaneous Implementation workers. It defaults to two and has no Matt Auto hard upper limit.
-_Avoid_: fixed global worker cap
+The maximum number of simultaneous Implementation workers for a Workflow root. It resolves from a global default, then a Workflow-root override (same layering spirit as Worker profile). When unset, it defaults to two. It applies only to Implementation workers; Integration units, Conflict resolution, and Planning stages remain single-threaded. While any Implementation disposition or Integration unit is pending, Matt Auto does not open new Implementation workers (fill-slot only when those are clear); already-running workers are not aborted. `/matt-auto run` fills empty slots from the ready frontier and waits when slots are full.
+_Avoid_: fixed global worker cap, concurrent Integration units, concurrent Planning stages
 
 **Concurrency warning**:
-A non-blocking confirmation shown when a requested Worker concurrency exceeds a configurable warning threshold, initially four. Confirming launches the requested number without hidden throttling.
-_Avoid_: enforced concurrency maximum
+A non-blocking confirmation shown when the operator sets Worker concurrency above a warning threshold (initially four, fixed for the first slice). Confirming stores the value; run-time slot filling does not re-prompt per ticket. There is no hard maximum.
+_Avoid_: enforced concurrency maximum, per-launch concurrency prompts during run
 
 **Worker profile**:
 The model and thinking-level configuration used by Implementation workers. Matt Auto selects its model from Pi’s authenticated available-model catalog and its supported thinking level through Pi-style menus without changing the Workflow home model.
