@@ -7,6 +7,7 @@ import {
   createPreferencesPort,
   isValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
+  resolveWorkerConcurrency,
 } from "../src/adapters/preferences.js";
 import {
   DEFAULT_WORKER_CONCURRENCY,
@@ -94,6 +95,23 @@ describe("resolveEffectiveWorkerConcurrency", () => {
         0 as unknown as number,
       ),
     ).toBe(DEFAULT_WORKER_CONCURRENCY);
+  });
+});
+
+describe("resolveWorkerConcurrency", () => {
+  it("includes source for menu display (root → global → default)", () => {
+    expect(resolveWorkerConcurrency(undefined, undefined)).toEqual({
+      concurrency: 2,
+      source: "default",
+    });
+    expect(resolveWorkerConcurrency(undefined, 3)).toEqual({
+      concurrency: 3,
+      source: "global",
+    });
+    expect(resolveWorkerConcurrency(5, 3)).toEqual({
+      concurrency: 5,
+      source: "workflow-root",
+    });
   });
 });
 

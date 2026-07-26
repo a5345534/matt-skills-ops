@@ -30,6 +30,36 @@ export function assertValidWorkerConcurrency(
   }
 }
 
+/** Where an effective Worker concurrency value was resolved from. */
+export type WorkerConcurrencySource =
+  | "workflow-root"
+  | "global"
+  | "default";
+
+/** Effective Worker concurrency with the layer that supplied it. */
+export type ResolvedWorkerConcurrency = {
+  concurrency: number;
+  source: WorkerConcurrencySource;
+};
+
+/**
+ * Resolve effective Worker concurrency with source: root → global → default 2.
+ * Callers pass only validated or sanitized layer values.
+ */
+export function resolveWorkerConcurrency(
+  root: number | undefined,
+  global: number | undefined,
+  defaultValue: number = DEFAULT_WORKER_CONCURRENCY,
+): ResolvedWorkerConcurrency {
+  if (isValidWorkerConcurrency(root)) {
+    return { concurrency: root, source: "workflow-root" };
+  }
+  if (isValidWorkerConcurrency(global)) {
+    return { concurrency: global, source: "global" };
+  }
+  return { concurrency: defaultValue, source: "default" };
+}
+
 /**
  * Resolve effective Worker concurrency: root → global → default 2.
  * Callers pass only validated or sanitized layer values.
@@ -39,9 +69,7 @@ export function resolveEffectiveWorkerConcurrency(
   global: number | undefined,
   defaultValue: number = DEFAULT_WORKER_CONCURRENCY,
 ): number {
-  if (isValidWorkerConcurrency(root)) return root;
-  if (isValidWorkerConcurrency(global)) return global;
-  return defaultValue;
+  return resolveWorkerConcurrency(root, global, defaultValue).concurrency;
 }
 
 async function readPreferencesFile(

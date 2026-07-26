@@ -21,6 +21,11 @@ export {
   createPreferencesPort,
   isValidWorkerConcurrency,
   resolveEffectiveWorkerConcurrency,
+  resolveWorkerConcurrency,
+} from "./preferences.js";
+export type {
+  ResolvedWorkerConcurrency,
+  WorkerConcurrencySource,
 } from "./preferences.js";
 export {
   canLaunchImplementationWorker,
