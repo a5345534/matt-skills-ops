@@ -813,6 +813,9 @@ export async function waitForPipelineWorkers(
         if (canPresentLiveWaitControls(ui)) {
           const live = await presentLiveWaitControls(ui, controls, panel, {
             pollIntervalMs,
+            onTick: (p) => {
+              activity.tick(activityDetailFromPanel(p));
+            },
           });
           if (live.action === "resume") {
             await applyConfirmedResume(controls, ui, panel);
@@ -937,6 +940,9 @@ export async function waitForPipelineWorkers(
         } else if (canPresentLiveWaitControls(ui)) {
           const live = await presentLiveWaitControls(ui, controls, panel, {
             pollIntervalMs,
+            onTick: (p) => {
+              activity.tick(activityDetailFromPanel(p));
+            },
           });
           if (live.action === "settled") {
             // Panel may have P1 work or workers finished — re-check outer loop.

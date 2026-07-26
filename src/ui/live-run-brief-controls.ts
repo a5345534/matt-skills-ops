@@ -120,7 +120,15 @@ export async function presentLiveWaitControls(
   ui: LiveWaitCustomUi,
   coordinator: LiveWaitPanelSource,
   initialPanel: WorkflowPanelState,
-  options: { pollIntervalMs?: number; overlay?: boolean } = {},
+  options: {
+    pollIntervalMs?: number;
+    overlay?: boolean;
+    /**
+     * Called every poll while the live surface is open (e.g. ghostty title
+     * braille). Outer wait loops cannot tick during blocking `ui.custom()`.
+     */
+    onTick?: (panel: WorkflowPanelState) => void;
+  } = {},
 ): Promise<LiveWaitControlChoice> {
   const pollIntervalMs = options.pollIntervalMs ?? 500;
 
@@ -193,6 +201,13 @@ export async function presentLiveWaitControls(
             selectList = makeSelectList(panel, theme, (action) => {
               finish({ action });
             });
+          }
+
+          // Outer wait loop is blocked on this custom() — drive title/OSC here.
+          try {
+            options.onTick?.(panel);
+          } catch {
+            // Activity indicators must never break the wait surface.
           }
 
           tui.requestRender();
