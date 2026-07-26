@@ -217,6 +217,8 @@ type WorkspaceState = {
   attempts: Map<string, number>;
   cleanupCalls: number[];
   listBranchesCalls: number[];
+  removeLocalBranchesCalls: string[][];
+  removedBranches: Set<string>;
   failCreate?: boolean;
   failEnsureIntegration?: boolean;
   mergeResult?:
@@ -240,6 +242,8 @@ function createWorkspace(
     attempts: initial.attempts ?? new Map(),
     cleanupCalls: [],
     listBranchesCalls: [],
+    removeLocalBranchesCalls: [],
+    removedBranches: new Set(),
     ...(initial.failCreate !== undefined
       ? { failCreate: initial.failCreate }
       : {}),
@@ -281,6 +285,7 @@ function createWorkspace(
         `${input.workflowId}:${input.ticketNumber}`,
         input.attempt,
       );
+      state.removedBranches.delete(branchName);
       return { branchName, worktreePath };
     },
     ensureIntegrationWorkspace: async (input) => {
@@ -300,6 +305,7 @@ function createWorkspace(
         branchName,
         worktreePath,
       });
+      state.removedBranches.delete(branchName);
       return { branchName, worktreePath };
     },
     mergeIntoIntegration: async (input) => {
@@ -315,23 +321,67 @@ function createWorkspace(
     listWorkflowBranches: async (workflowId) => {
       state.listBranchesCalls.push(workflowId);
       const branches = new Set<string>();
-      branches.add(integrationBranchName(workflowId));
+      const integration = integrationBranchName(workflowId);
+      if (!state.removedBranches.has(integration)) {
+        // Only list Integration branch once it has been ensured or still present.
+        if (
+          state.integrationEnsures.some((e) => e.workflowId === workflowId) ||
+          state.creates.some((c) => c.workflowId === workflowId)
+        ) {
+          branches.add(integration);
+        }
+      }
       for (const create of state.creates) {
-        if (create.workflowId === workflowId) {
+        if (
+          create.workflowId === workflowId &&
+          !state.removedBranches.has(create.branchName)
+        ) {
           branches.add(create.branchName);
         }
       }
       return [...branches].sort();
     },
+    removeLocalBranches: async (branchNames) => {
+      state.removeLocalBranchesCalls.push([...branchNames]);
+      const removedLocalBranches: string[] = [];
+      const removedWorktrees: string[] = [];
+      for (const branch of branchNames) {
+        state.removedBranches.add(branch);
+        removedLocalBranches.push(branch);
+        removedWorktrees.push(
+          `/matt-auto-workspaces/${branch.replace(/\//g, "-")}`,
+        );
+        // Reset latestAttempt counters for discarded ticket attempts.
+        const match = /^matt-auto\/(\d+)\/ticket-(\d+)\/r(\d+)$/.exec(branch);
+        if (match) {
+          const workflowId = Number(match[1]);
+          const ticketNumber = Number(match[2]);
+          const attempt = Number(match[3]);
+          const key = `${workflowId}:${ticketNumber}`;
+          const current = state.attempts.get(key) ?? 0;
+          if (attempt >= current) {
+            // Recompute max remaining attempt for this ticket.
+            let max = 0;
+            for (const create of state.creates) {
+              if (
+                create.workflowId === workflowId &&
+                create.ticketNumber === ticketNumber &&
+                !state.removedBranches.has(create.branchName)
+              ) {
+                max = Math.max(max, create.attempt);
+              }
+            }
+            if (max > 0) state.attempts.set(key, max);
+            else state.attempts.delete(key);
+          }
+        }
+      }
+      return { removedLocalBranches, removedWorktrees };
+    },
     cleanupWorkflowWorkspaces: async (workflowId) => {
       state.cleanupCalls.push(workflowId);
       const branches = await port.listWorkflowBranches(workflowId);
-      return {
-        removedWorktrees: branches.map(
-          (b) => `/matt-auto-workspaces/${workflowId}/${b.replace(/\//g, "-")}`,
-        ),
-        removedLocalBranches: branches,
-      };
+      return port.removeLocalBranches(branches);
     },
     hasCommitsAhead: async () => ({ ahead: false, count: 0 }),
   };
@@ -3915,5 +3965,272 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
     expect(ids).toContain(reworkTicketActionId(43));
     expect(ids).not.toContain(START_FOLLOW_UP_ACTION.id);
     expect(ids).not.toContain(CLEANUP_WORKFLOW_ACTION.id);
+  });
+});
+
+describe("Workflow coordinator Pipeline pause and Run termination", () => {
+  it("Pause aborts session-owned workers, sets pipelinePaused, and leaves GitHub untouched", async () => {
+    const { coordinator, workers, tracker, transcripts, remoteGit } =
+      ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const issueStatesBefore = tracker.state.issues.map((i) => ({
+      number: i.number,
+      state: i.state,
+    }));
+
+    const paused = await coordinator.pausePipeline();
+    expect(paused).toEqual({
+      abortedWorkerCount: 1,
+      affectedAttempts: [
+        {
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          kind: "implementation",
+        },
+      ],
+      pipelinePaused: true,
+    });
+    expect(workers.state.abortAllCount).toBe(1);
+    expect(workers.state.aborts).toContain("implement-42-43-r1");
+    expect(coordinator.isPipelinePaused()).toBe(true);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+    expect(coordinator.isRunTerminated()).toBe(false);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.pipelinePaused).toBe(true);
+    expect(panel?.lastStopReason).toBe("pipeline-pause");
+    expect(panel?.workers ?? []).toEqual([]);
+
+    // No GitHub mutations on Pause.
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(
+      tracker.state.issues.map((i) => ({ number: i.number, state: i.state })),
+    ).toEqual(issueStatesBefore);
+    expect(remoteGit.state.pushes).toEqual([]);
+    expect(remoteGit.state.deleted).toEqual([]);
+
+    const events = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(
+      events.some((e) => (e as { type?: string }).type === "pipeline:pause"),
+    ).toBe(true);
+  });
+
+  it("Resume clears Pipeline pause so auto-advance can select Next again", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.pausePipeline();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    const resumed = await coordinator.resumePipeline();
+    expect(resumed).toEqual({ pipelinePaused: false });
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.pipelinePaused).toBe(false);
+    expect(panel?.lastStopReason).toBeUndefined();
+
+    // Orchestration-only: does not relaunch the aborted worker dialogue.
+    expect(workers.state.launches).toHaveLength(1);
+
+    // Without recovery cooldown, Next can offer the ticket again after Pause.
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toContain(implementTicketActionId(43));
+  });
+
+  it("Terminate before integrate uses T2 discard-unintegrated and removes attempt artifacts only", async () => {
+    const { coordinator, workers, workspace, tracker, transcripts, remoteGit } =
+      ticketsPublishedFixture();
+
+    // Create two unintegrated attempt workspaces (single-worker path: pause between).
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await coordinator.pausePipeline();
+    await coordinator.resumePipeline();
+    await coordinator.runNextAction(implementTicketActionId(44));
+
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const issuesBefore = structuredClone(tracker.state.issues);
+    const manifestBefore = structuredClone(tracker.state.manifests.get(42));
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("discard-unintegrated");
+    expect(terminated.runTerminated).toBe(true);
+    expect(terminated.abortedWorkerCount).toBe(1);
+    expect(terminated.affectedAttempts).toEqual([
+      {
+        workflowId: 42,
+        ticketNumber: 44,
+        attempt: 1,
+        kind: "implementation",
+      },
+    ]);
+    expect(terminated.discardedBranches).toEqual(
+      expect.arrayContaining([
+        "matt-auto/42/ticket-43/r1",
+        "matt-auto/42/ticket-44/r1",
+        "matt-auto/42/integration",
+      ]),
+    );
+    expect(workspace.state.removeLocalBranchesCalls.length).toBeGreaterThan(0);
+    expect(workers.state.aborts).toContain("implement-42-44-r1");
+
+    expect(coordinator.isRunTerminated()).toBe(true);
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.runTerminated).toBe(true);
+    expect(panel?.lastStopReason).toBe("run-termination");
+    expect(panel?.terminationMode).toBe("discard-unintegrated");
+
+    // GitHub history untouched (no integrate/PR rewrite, no ticket reopen).
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(tracker.state.manifests.get(42)).toEqual(manifestBefore);
+    expect(tracker.state.issues).toEqual(issuesBefore);
+    expect(remoteGit.state.deleted).toEqual([]);
+
+    const events44 = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 44,
+      attempt: 1,
+    });
+    expect(
+      events44.some(
+        (e) => (e as { type?: string }).type === "pipeline:terminate",
+      ),
+    ).toBe(true);
+
+    // Discarded attempts no longer count toward latestAttempt.
+    expect(await workspace.port.latestAttempt(42, 43)).toBe(0);
+    expect(await workspace.port.latestAttempt(42, 44)).toBe(0);
+  });
+
+  it("Terminate after successful Integration unit uses T1 stop-only and never discards integrated artifacts", async () => {
+    const { coordinator, workers, workspace, tracker, remoteGit } =
+      ticketsPublishedFixture();
+
+    // Integrate #43 successfully (pending CI).
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "Done #43" },
+    });
+    await coordinator.confirmDisposition("close");
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual([
+      {
+        number: 43,
+        attempt: 1,
+        branchName: "matt-auto/42/ticket-43/r1",
+      },
+    ]);
+
+    // Start another unintegrated worker, then terminate.
+    await coordinator.runNextAction(implementTicketActionId(44));
+    const manifestWritesBefore = tracker.state.writeManifestCalls;
+    const integratedBefore = structuredClone(
+      tracker.state.manifests.get(42)?.integratedTickets,
+    );
+    const pushesBefore = [...remoteGit.state.pushes];
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("stop-only");
+    expect(terminated.discardedBranches).toEqual([]);
+    expect(terminated.discardedWorktrees).toEqual([]);
+    expect(terminated.abortedWorkerCount).toBe(1);
+    expect(workspace.state.removeLocalBranchesCalls).toEqual([]);
+
+    // Integrated history preserved; no remote deletes; no manifest rewrite.
+    expect(tracker.state.writeManifestCalls).toBe(manifestWritesBefore);
+    expect(tracker.state.manifests.get(42)?.integratedTickets).toEqual(
+      integratedBefore,
+    );
+    expect(remoteGit.state.pushes).toEqual(pushesBefore);
+    expect(remoteGit.state.deleted).toEqual([]);
+    expect(tracker.state.issues.find((i) => i.number === 43)?.state).toBe("OPEN");
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.terminationMode).toBe("stop-only");
+    expect(panel?.lastStopReason).toBe("run-termination");
+    expect(coordinator.isRunTerminated()).toBe(true);
+  });
+
+  it("Terminate with a Workflow PR present is T1 stop-only even without integratedTickets length edge cases", async () => {
+    const tracker = createTracker({
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "pr-opened",
+        workerProfile: defaultWorkerProfile,
+        title: "Existing spec",
+        tickets: [43],
+        integrationBranch: "matt-auto/42/integration",
+        integratedTickets: [
+          {
+            number: 43,
+            attempt: 1,
+            branchName: "matt-auto/42/ticket-43/r1",
+          },
+        ],
+        workflowPr: {
+          number: 99,
+          url: "https://example.test/pr/99",
+          baseBranch: DEFAULT_TARGET_BRANCH,
+          headBranch: "matt-auto/42/integration",
+        },
+      },
+      tickets: [{ number: 43, title: "Ship core path", state: "CLOSED", blockedBy: [] }],
+    });
+    const workspace = createWorkspace("/repo");
+    const ports = createPorts({
+      defaultRoot: {
+        preferences: { globalWorkerProfile: defaultWorkerProfile },
+        tracker,
+        workspace,
+      },
+    });
+    const coordinator = createWorkflowCoordinator(ports);
+
+    const terminated = await coordinator.terminateRun();
+    expect(terminated.mode).toBe("stop-only");
+    expect(terminated.discardedBranches).toEqual([]);
+    expect(workspace.state.removeLocalBranchesCalls).toEqual([]);
+    expect(coordinator.isRunTerminated()).toBe(true);
+  });
+
+  it("beginPipelineRun clears pause and termination so a new run can auto-advance", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+    await coordinator.pausePipeline();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+
+    coordinator.beginPipelineRun();
+    expect(coordinator.isPipelinePaused()).toBe(false);
+    expect(coordinator.isRunTerminated()).toBe(false);
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+
+    await coordinator.terminateRun();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(true);
+    coordinator.beginPipelineRun();
+    expect(coordinator.isAutoAdvanceBlocked()).toBe(false);
+  });
+
+  it("exposes pipelinePaused on panel even when no workers are running", async () => {
+    const { coordinator } = ticketsPublishedFixture();
+    const before = await coordinator.getPanelState();
+    expect(before?.pipelinePaused).toBe(false);
+
+    await coordinator.pausePipeline();
+    const after = await coordinator.getPanelState();
+    expect(after?.pipelinePaused).toBe(true);
+    expect(after?.lastStopReason).toBe("pipeline-pause");
+    expect(after?.workers).toEqual([]);
   });
 });
