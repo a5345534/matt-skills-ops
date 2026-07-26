@@ -169,8 +169,16 @@ The Matt Auto-managed structured GitHub comment on a workflow’s spec issue. It
 _Avoid_: spec-body metadata, state-label proliferation
 
 **Workflow panel**:
-A persistent, compact, passive Pi TUI widget showing the current Active workflow’s progress while background work is running. Detailed actions remain in the Matt Auto menu.
-_Avoid_: forgotten background work, interactive persistent dashboard
+A persistent, passive Pi TUI surface showing the Active workflow’s live progress and diagnostics (stage, ticket/attempt, worker identity, process liveness, transcript/worktree paths, integration/PR/errors). It is read-only except for explicit pipeline controls (Pause / Resume / Terminate). It is not a general multi-action dashboard. While `/matt-auto run` is blocked on background work, the primary operator surface is a full-screen read-only brief with the same facts and controls; the compact panel remains a secondary, always-on summary when the TUI supports it.
+_Avoid_: forgotten background work, interactive persistent dashboard, one-line-only progress
+
+**Pipeline pause**:
+An operator control that, after confirmation, immediately aborts session-owned workers and stops auto-advance of the current Matt Auto run while leaving GitHub workflow state intact. Resume, after confirmation, continues orchestration in the same Workflow home, preferring to reuse the latest unintegrated Implementation attempt (branch/worktree/commits) rather than the aborted worker conversation.
+_Avoid_: SIGSTOP freeze of the worker LLM, token-level dialogue resume, silent pause without confirmation
+
+**Run termination**:
+An operator control that, after confirmation, ends the current Matt Auto run and aborts session-owned workers. Before any successful Integration unit, it may discard unintegrated attempt workspaces/branches (rollback-to-pre-implement for unfinished work only). After at least one ticket has successfully integrated (or a Workflow PR exists), termination degrades to stop-only: no rewrite of integrated history, closed tickets, or remote Integration state.
+_Avoid_: rewrite of integrated history, reopen-all-tickets rollback, silent terminate without confirmation
 
 **Follow-up workflow**:
 A new workflow, identified by a new spec issue, created for rework requested after the original Workflow PR has merged. It references rather than mutates the completed workflow.
