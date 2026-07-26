@@ -198,6 +198,42 @@ export function findLatestDraftText(
   return undefined;
 }
 
+/**
+ * Parse a publishable Create-spec draft from assistant texts that already include
+ * Matt Auto markers. Does not accept marker-less first-line fallback (safe for
+ * auto-publish). Optionally only search the trailing window (recent turns).
+ */
+export function parseMarkedSpecDraftFromTexts(
+  texts: readonly string[],
+  options: { recentWindow?: number } = {},
+): SpecDraft | undefined {
+  const window = options.recentWindow;
+  const slice =
+    typeof window === "number" && window > 0
+      ? texts.slice(-window)
+      : texts;
+  const marked = findLatestDraftText(slice, SPEC_START);
+  if (!marked) return undefined;
+  return parseSpecDraftFromAssistantText(marked);
+}
+
+/**
+ * Parse a tickets draft only from texts that include Matt Auto tickets markers.
+ */
+export function parseMarkedTicketsDraftFromTexts(
+  texts: readonly string[],
+  options: { recentWindow?: number } = {},
+): TicketsDraft | undefined {
+  const window = options.recentWindow;
+  const slice =
+    typeof window === "number" && window > 0
+      ? texts.slice(-window)
+      : texts;
+  const marked = findLatestDraftText(slice, TICKETS_START);
+  if (!marked) return undefined;
+  return parseTicketsDraftFromAssistantText(marked);
+}
+
 function includesMarker(text: string, marker: string): boolean {
   return text.replace(/^\s+/gm, "").includes(marker);
 }

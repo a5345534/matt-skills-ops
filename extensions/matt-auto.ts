@@ -28,8 +28,8 @@ import {
   createWorkersPort,
   createWorkspacePort,
   findLatestDraftText,
-  parseSpecDraftFromAssistantText,
-  parseTicketsDraftFromAssistantText,
+  parseMarkedSpecDraftFromTexts,
+  parseMarkedTicketsDraftFromTexts,
   type MattAutoLogger,
   type SkillsHost,
 } from "../src/adapters/index.js";
@@ -48,12 +48,68 @@ type PlanningSession = {
   waitForIdle: () => Promise<void>;
   /**
    * Snapshot the assistant-text stream length before sending a planning prompt.
-   * Only texts appended after this baseline belong to the current skill turn.
+   * Texts appended after this baseline belong to the current skill turn.
    */
   markAssistantBaseline: () => number;
   /** Assistant texts produced after markAssistantBaseline() (newest-last). */
   getAssistantTextsSince: (baseline: number) => string[];
 };
+
+const PLANNING_TURN_TIMEOUT_MS = 20 * 60 * 1000;
+/** Only reuse marked drafts from recent assistant turns (grill → draft → run). */
+const RECENT_DRAFT_WINDOW = 12;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * After sendUserMessage, wait until the home agent produces at least one new
+ * assistant text (or timeout). A bare waitForIdle() returns immediately when
+ * already idle — before the new turn starts — which caused empty Create-spec.
+ */
+async function waitForAssistantTextsSince(
+  planning: PlanningSession,
+  baseline: number,
+  log: MattAutoLogger | undefined,
+  label: string,
+): Promise<string[]> {
+  const started = Date.now();
+  let polls = 0;
+  while (Date.now() - started < PLANNING_TURN_TIMEOUT_MS) {
+    polls += 1;
+    // Let sendUserMessage schedule a turn before the first idle wait.
+    await sleep(polls === 1 ? 150 : 250);
+    await planning.waitForIdle();
+    const texts = planning.getAssistantTextsSince(baseline);
+    if (texts.length > 0) {
+      // Settle once more so multi-part assistant messages finish streaming.
+      await sleep(100);
+      await planning.waitForIdle();
+      const settled = planning.getAssistantTextsSince(baseline);
+      log?.debug(`${label}:turn-settled`, {
+        baseline,
+        textCount: settled.length,
+        polls,
+        ms: Date.now() - started,
+      });
+      return settled;
+    }
+    if (polls === 1 || polls % 10 === 0) {
+      log?.debug(`${label}:wait-empty`, {
+        baseline,
+        polls,
+        ms: Date.now() - started,
+      });
+    }
+  }
+  log?.warn(`${label}:wait-timeout`, {
+    baseline,
+    polls,
+    ms: Date.now() - started,
+  });
+  return planning.getAssistantTextsSince(baseline);
+}
 
 function extractAssistantText(message: {
   role?: string;
@@ -102,32 +158,51 @@ function createSkillsHost(
       log?.info("runCreateSpec:start");
       const started = Date.now();
 
-      // Only accept drafts produced after this prompt — never reuse older session text.
+      // Grill → (optional draft in session) → /matt-auto run: reuse a recent
+      // marked draft so we do not ignore work already in this home session.
+      const prior = planning.getAssistantTextsSince(0);
+      const reused = parseMarkedSpecDraftFromTexts(prior, {
+        recentWindow: RECENT_DRAFT_WINDOW,
+      });
+      if (reused) {
+        log?.info("runCreateSpec:reused-session-draft", {
+          title: reused.title,
+          bodyChars: reused.body.length,
+          priorTextCount: prior.length,
+          ms: Date.now() - started,
+        });
+        return { ok: true, draft: reused };
+      }
+
+      // No marked draft yet (typical right after grill): run to-spec and wait
+      // for a real agent turn — not a bare waitForIdle while still idle.
       const baseline = planning.markAssistantBaseline();
       planning.sendUserMessage(buildCreateSpecSkillPrompt());
-      await planning.waitForIdle();
-
-      const texts = planning.getAssistantTextsSince(baseline);
-      const marked =
-        findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---") ??
-        texts[texts.length - 1] ??
-        "";
+      const texts = await waitForAssistantTextsSince(
+        planning,
+        baseline,
+        log,
+        "runCreateSpec",
+      );
+      const draft = parseMarkedSpecDraftFromTexts(texts);
       log?.debug("runCreateSpec:assistant", {
         textCount: texts.length,
         baseline,
-        markedChars: marked.length,
-        hasMarker: marked.includes("MATT-AUTO-SPEC-DRAFT"),
+        hasMarker: Boolean(
+          findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---"),
+        ),
         ms: Date.now() - started,
       });
-      const draft = parseSpecDraftFromAssistantText(marked);
       if (!draft) {
         log?.warn("runCreateSpec:parse-failed", {
-          preview: marked.slice(0, 300),
+          preview: (texts[texts.length - 1] ?? "").slice(0, 300),
         });
         return {
           ok: false,
           reason:
-            "Create-spec finished but Matt Auto could not parse a publishable ---MATT-AUTO-SPEC-DRAFT--- block (check TITLE/BODY markers, no leading spaces preferred). Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
+            texts.length === 0
+              ? "Create-spec did not receive any assistant reply after invoking to-spec (turn wait timed out or never started). Retry Create-spec or /matt-auto run. Nothing was published to GitHub."
+              : "Create-spec finished but Matt Auto could not parse a publishable ---MATT-AUTO-SPEC-DRAFT--- block (markers required; no marker-less fallback). Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
         };
       }
       log?.info("runCreateSpec:ok", {
@@ -160,6 +235,20 @@ function createSkillsHost(
       });
       const started = Date.now();
 
+      const prior = planning.getAssistantTextsSince(0);
+      const reused = parseMarkedTicketsDraftFromTexts(prior, {
+        recentWindow: RECENT_DRAFT_WINDOW,
+      });
+      if (reused) {
+        log?.info("runCreateTickets:reused-session-draft", {
+          workflowId: input.workflowId,
+          ticketCount: reused.tickets.length,
+          localIds: reused.tickets.map((t) => t.localId),
+          ms: Date.now() - started,
+        });
+        return { ok: true, draft: reused };
+      }
+
       const basePrompt = buildCreateTicketsSkillPrompt(input);
       const retryPrompt = [
         basePrompt,
@@ -169,27 +258,26 @@ function createSkillsHost(
         "Output ONLY the ---MATT-AUTO-TICKETS-DRAFT--- JSON block this time — no PRD rewrite.",
       ].join("\n");
 
-      // One automatic retry when the model talks about PRDs instead of tickets.
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         const baseline = planning.markAssistantBaseline();
         planning.sendUserMessage(attempt === 1 ? basePrompt : retryPrompt);
-        await planning.waitForIdle();
-
-        const texts = planning.getAssistantTextsSince(baseline);
-        const marked =
-          findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---") ??
-          texts[texts.length - 1] ??
-          "";
+        const texts = await waitForAssistantTextsSince(
+          planning,
+          baseline,
+          log,
+          "runCreateTickets",
+        );
+        const draft = parseMarkedTicketsDraftFromTexts(texts);
         log?.debug("runCreateTickets:assistant", {
           workflowId: input.workflowId,
           attempt,
           textCount: texts.length,
           baseline,
-          markedChars: marked.length,
-          hasMarker: marked.includes("MATT-AUTO-TICKETS-DRAFT"),
+          hasMarker: Boolean(
+            findLatestDraftText(texts, "---MATT-AUTO-TICKETS-DRAFT---"),
+          ),
           ms: Date.now() - started,
         });
-        const draft = parseTicketsDraftFromAssistantText(marked);
         if (draft) {
           log?.info("runCreateTickets:ok", {
             ticketCount: draft.tickets.length,
@@ -201,14 +289,14 @@ function createSkillsHost(
         }
         log?.warn("runCreateTickets:parse-failed", {
           attempt,
-          preview: marked.slice(0, 300),
+          preview: (texts[texts.length - 1] ?? "").slice(0, 300),
         });
       }
 
       return {
         ok: false,
         reason:
-          "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block after 2 attempts. Retry Create-tickets. Nothing was published to GitHub.",
+          "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block after 2 attempts (markers required). Retry Create-tickets. Nothing was published to GitHub.",
       };
     },
   };
@@ -366,8 +454,8 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         : undefined;
 
       // Planning skills run in this Workflow home session so grill context remains.
-      // Draft parsing uses only assistant texts after markAssistantBaseline() so
-      // older session PRDs / markers cannot be mistaken for a fresh skill result.
+      // Marked drafts may be reused from recent turns; new skill turns wait until
+      // assistant text actually appears (not bare waitForIdle while still idle).
       planningSession = {
         sendUserMessage: (text: string) => {
           pi.sendUserMessage(text);

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   isPublishableSpecDraft,
+  parseMarkedSpecDraftFromTexts,
+  parseMarkedTicketsDraftFromTexts,
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
 } from "../src/adapters/planning-draft.js";
@@ -103,5 +105,72 @@ describe("parseTicketsDraftFromAssistantText", () => {
     expect(draft?.tickets).toHaveLength(2);
     expect(draft?.tickets[0]?.localId).toBe("1");
     expect(draft?.tickets[1]?.blockedBy).toEqual(["1"]);
+  });
+});
+
+describe("parseMarkedSpecDraftFromTexts", () => {
+  const marked = `
+---MATT-AUTO-SPEC-DRAFT---
+TITLE: Run brief UI
+BODY:
+## Problem Statement
+
+Operators cannot see pipeline progress during /matt-auto run waits.
+
+## Solution
+
+Show a full-screen read-only brief with Pause, Resume, and Terminate.
+---END-MATT-AUTO-SPEC-DRAFT---
+`;
+
+  it("finds a marked draft among prior assistant texts", () => {
+    const draft = parseMarkedSpecDraftFromTexts([
+      "grill consensus only",
+      marked,
+      "ok shall we implement?",
+    ]);
+    expect(draft?.title).toBe("Run brief UI");
+    expect(draft?.body).toMatch(/full-screen read-only brief/);
+  });
+
+  it("ignores marker-less first-line fallback for auto-publish safety", () => {
+    expect(
+      parseMarkedSpecDraftFromTexts([
+        "已提交並推送。\n\nSome body that is long enough to look real but has no markers at all here.",
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("respects recentWindow so ancient marked drafts are ignored", () => {
+    expect(
+      parseMarkedSpecDraftFromTexts(
+        [marked, "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        { recentWindow: 3 },
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe("parseMarkedTicketsDraftFromTexts", () => {
+  it("requires tickets markers", () => {
+    const text = `
+---MATT-AUTO-TICKETS-DRAFT---
+\`\`\`json
+{
+  "tickets": [
+    {
+      "localId": "1",
+      "title": "Brief wait loop",
+      "body": "## What to build\\n\\nFull-screen brief.\\n\\n## Acceptance criteria\\n- [ ] Shows workers",
+      "blockedBy": []
+    }
+  ]
+}
+\`\`\`
+---END-MATT-AUTO-TICKETS-DRAFT---
+`;
+    const draft = parseMarkedTicketsDraftFromTexts(["noise", text]);
+    expect(draft?.tickets).toHaveLength(1);
+    expect(draft?.tickets[0]?.localId).toBe("1");
   });
 });
