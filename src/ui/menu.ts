@@ -1,3 +1,5 @@
+import { readFile, unlink } from "node:fs/promises";
+import path from "node:path";
 import type { MattAutoLogger } from "../adapters/logger.js";
 import {
   isValidWorkerConcurrency,
@@ -100,6 +102,8 @@ export function selectPipelineAction(
   if (inFlight.length === 1) return inFlight[0];
 
   // Prefer continuing an in-flight workflow over opening a new Create-spec.
+  // Rework before Implement: reopening an upstream ticket must win over
+  // launching dependents that only look ready because the blocker was closed.
   return (
     inFlight.find((a) => a.id === CREATE_TICKETS_ACTION.id) ??
     inFlight.find((a) => a.id.startsWith(DISPOSITION_ACTION_PREFIX)) ??
@@ -109,8 +113,8 @@ export function selectPipelineAction(
     inFlight.find((a) => a.id === OPEN_WORKFLOW_PR_ACTION.id) ??
     inFlight.find((a) => a.id === MERGE_WORKFLOW_PR_ACTION.id) ??
     inFlight.find((a) => a.id === CLEANUP_WORKFLOW_ACTION.id) ??
-    inFlight.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
     inFlight.find((a) => a.id.startsWith(REWORK_TICKET_ACTION_PREFIX)) ??
+    inFlight.find((a) => a.id.startsWith(IMPLEMENT_TICKET_ACTION_PREFIX)) ??
     // Create-spec alone among remaining options (e.g. with implement) still auto.
     inFlight.find((a) => a.id === CREATE_SPEC_ACTION.id)
   );
@@ -136,14 +140,24 @@ export type WaitForPipelineWorkersOptions = {
   offerRunningControls?: boolean;
 };
 
-/** Queued operator action while the wait loop auto-polls (no blocking menu). */
-export type PipelineWaitControlRequest = "pause" | "terminate";
+/**
+ * Queued operator action while the wait loop auto-polls (no blocking menu).
+ * - pause / terminate: confirm then apply
+ * - menu: open Pause/Resume/Terminate select menu
+ * - terminate-now: emergency stop without confirmation (file control only)
+ */
+export type PipelineWaitControlRequest =
+  | "pause"
+  | "terminate"
+  | "menu"
+  | "terminate-now";
 
 let pendingPipelineWaitControl: PipelineWaitControlRequest | undefined;
 
 /**
- * Request Pause/Terminate during an auto-waiting run (e.g. keyboard shortcut).
- * Consumed on the next wait-loop tick; still requires confirmation dialogs.
+ * Request Pause/Terminate/menu during an auto-waiting run (e.g. keyboard shortcut).
+ * Consumed on the next wait-loop tick; pause/terminate still require confirmation
+ * unless the request is `terminate-now`.
  */
 export function queuePipelineWaitControl(
   action: PipelineWaitControlRequest,
@@ -154,6 +168,44 @@ export function queuePipelineWaitControl(
 /** Test helper: clear any queued wait control. */
 export function clearPipelineWaitControlQueue(): void {
   pendingPipelineWaitControl = undefined;
+}
+
+/** Absolute path of the out-of-band run control file under a Workflow root. */
+export function runControlFilePath(workflowRoot: string): string {
+  return path.join(workflowRoot, ".pi", "matt-auto", "run-control");
+}
+
+/**
+ * Read and clear `.pi/matt-auto/run-control` if present.
+ * Contents (trimmed, case-insensitive): pause | terminate | stop | menu |
+ * terminate-now | stop-now.
+ */
+export async function readAndClearRunControlFile(
+  workflowRoot: string,
+): Promise<PipelineWaitControlRequest | undefined> {
+  const file = runControlFilePath(workflowRoot);
+  try {
+    const raw = (await readFile(file, "utf8")).trim().toLowerCase();
+    try {
+      await unlink(file);
+    } catch {
+      // best-effort clear
+    }
+    if (raw === "pause") return "pause";
+    if (raw === "terminate" || raw === "stop") return "terminate";
+    if (raw === "menu" || raw === "controls") return "menu";
+    if (raw === "terminate-now" || raw === "stop-now") return "terminate-now";
+    log("warn", "pipeline:run-control-unknown", { raw, file });
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function consumePendingWaitControl(): PipelineWaitControlRequest | undefined {
+  const queued = pendingPipelineWaitControl;
+  pendingPipelineWaitControl = undefined;
+  return queued;
 }
 
 /** How the run-brief wait loop ended. */
@@ -171,6 +223,7 @@ export type RunBriefCoordinator = Pick<
   | "terminateRun"
   | "isPipelinePaused"
   | "isRunTerminated"
+  | "reconcileBlockedRunningWorkers"
 >;
 
 // --- Run brief controls (Pause / Resume / Terminate) ---
@@ -318,6 +371,48 @@ function hasControlApis(
     typeof c.resumePipeline === "function" &&
     typeof c.terminateRun === "function"
   );
+}
+
+function hasReconcileBlockedApi(
+  coordinator: Pick<WorkflowCoordinator, "getPanelState">,
+): coordinator is Pick<WorkflowCoordinator, "getPanelState"> &
+  Pick<WorkflowCoordinator, "reconcileBlockedRunningWorkers"> {
+  const c = coordinator as Partial<WorkflowCoordinator>;
+  return typeof c.reconcileBlockedRunningWorkers === "function";
+}
+
+async function applyQueuedWaitControl(
+  controls: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+  queued: PipelineWaitControlRequest,
+): Promise<
+  | { action: "continue" }
+  | { action: "paused" }
+  | { action: "resumed" }
+  | { action: "terminated"; result: RunTerminationResult }
+  | { action: "unchanged" }
+> {
+  if (queued === "pause") {
+    const applied = await applyConfirmedPause(controls, ui, panel);
+    return applied ? { action: "paused" } : { action: "unchanged" };
+  }
+  if (queued === "terminate") {
+    const result = await applyConfirmedTerminate(controls, ui, panel);
+    if (result) return { action: "terminated", result };
+    return { action: "unchanged" };
+  }
+  if (queued === "terminate-now") {
+    log("warn", "run-brief:operator-terminate-now", {
+      workflowId: panel.workflowId,
+    });
+    const result = await controls.terminateRun();
+    return { action: "terminated", result };
+  }
+  if (queued === "menu") {
+    return presentRunBriefControlMenu(controls, ui, panel);
+  }
+  return { action: "unchanged" };
 }
 
 /**
@@ -564,8 +659,16 @@ export async function waitForPipelineWorkers(
   }
 
   if (!options.offerRunningControls && !initialPaused) {
+    const controlPath = runControlFilePath(process.cwd());
     ui.notify(
-      "Auto-waiting for workers — brief refreshes continuously (no Continue needed). Pause/Terminate: Ctrl+Alt+P / Ctrl+Alt+T (then confirm), or when paused use Resume/Terminate.",
+      [
+        "Auto-waiting for workers — brief refreshes continuously (no Continue needed).",
+        "Stop controls:",
+        "  • Ctrl+Alt+M — open Pause / Terminate menu (then confirm)",
+        "  • Ctrl+Alt+P — Pause · Ctrl+Alt+T — Terminate (then confirm)",
+        `  • From another shell: echo terminate > ${controlPath}`,
+        `  • Emergency (no confirm): echo terminate-now > ${controlPath}`,
+      ].join("\n"),
       "info",
     );
   }
@@ -579,6 +682,19 @@ export async function waitForPipelineWorkers(
   pendingPipelineWaitControl = undefined;
 
   try {
+    // Catch dependents that were launched while a blocker was briefly closed
+    // (e.g. Auto-Close then Rework) before the wait surface took over.
+    if (hasReconcileBlockedApi(coordinator)) {
+      const reconciled = await coordinator.reconcileBlockedRunningWorkers();
+      if (reconciled.abortedWorkerCount > 0) {
+        ui.notify(
+          `Aborted ${reconciled.abortedWorkerCount} Implementation worker(s) that are blocked by open upstream tickets.`,
+          "warning",
+        );
+        log("info", "pipeline:reconcile-blocked-workers", reconciled);
+      }
+    }
+
     for (let i = 0; i < maxTicks; i += 1) {
       const panel = await coordinator.getPanelState({ mode: "local" });
       if (!panel) {
@@ -623,6 +739,28 @@ export async function waitForPipelineWorkers(
           });
           return { status: "settled" };
         }
+        // File / shortcut can terminate while the paused menu is about to open.
+        const queuedWhilePaused =
+          consumePendingWaitControl() ??
+          (await readAndClearRunControlFile(process.cwd()));
+        if (queuedWhilePaused === "terminate-now") {
+          const result = await controls.terminateRun();
+          const latest =
+            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+          notifyRunBrief(ui, latest, "warning");
+          ui.notify(formatTerminateNotify(result), "warning");
+          return { status: "terminated", result };
+        }
+        if (queuedWhilePaused === "terminate") {
+          const result = await applyConfirmedTerminate(controls, ui, panel);
+          if (result) {
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, latest, "warning");
+            ui.notify(formatTerminateNotify(result), "warning");
+            return { status: "terminated", result };
+          }
+        }
         const control = await presentRunBriefControlMenu(controls, ui, panel);
         if (control.action === "terminated") {
           const latest =
@@ -659,6 +797,26 @@ export async function waitForPipelineWorkers(
         return { status: "settled" };
       }
 
+      // Periodic reconcile (every ~5s): dependents launched while a blocker was
+      // briefly closed must not keep running after the frontier re-blocks them.
+      if (
+        hasReconcileBlockedApi(coordinator) &&
+        (i === 0 || (i + 1) % 10 === 0)
+      ) {
+        const reconciled = await coordinator.reconcileBlockedRunningWorkers();
+        if (reconciled.abortedWorkerCount > 0) {
+          ui.notify(
+            `Aborted ${reconciled.abortedWorkerCount} Implementation worker(s) blocked by open upstream tickets.`,
+            "warning",
+          );
+          log("info", "pipeline:reconcile-blocked-workers", {
+            ticks: i + 1,
+            ...reconciled,
+          });
+          continue;
+        }
+      }
+
       const brief = notifyRunBrief(ui, panel);
       const tickPayload: Record<string, unknown> = {
         tick: i + 1,
@@ -685,23 +843,30 @@ export async function waitForPipelineWorkers(
 
       // Continuous auto-wait by default (no "Continue waiting" gate).
       // Optional blocking menu for tests / offerRunningControls.
-      // Shortcuts queue pause/terminate via queuePipelineWaitControl.
+      // Shortcuts + run-control file queue pause/terminate/menu.
       if (controls) {
-        const queued = pendingPipelineWaitControl;
-        pendingPipelineWaitControl = undefined;
+        const queued =
+          consumePendingWaitControl() ??
+          (await readAndClearRunControlFile(process.cwd()));
 
-        if (queued === "pause") {
-          const applied = await applyConfirmedPause(controls, ui, panel);
-          if (applied) continue;
-        } else if (queued === "terminate") {
-          const result = await applyConfirmedTerminate(controls, ui, panel);
-          if (result) {
+        if (queued) {
+          const control = await applyQueuedWaitControl(
+            controls,
+            ui,
+            panel,
+            queued,
+          );
+          if (control.action === "terminated") {
             const latest =
               (await coordinator.getPanelState({ mode: "local" })) ?? panel;
             notifyRunBrief(ui, latest, "warning");
-            ui.notify(formatTerminateNotify(result), "warning");
-            return { status: "terminated", result };
+            ui.notify(formatTerminateNotify(control.result), "warning");
+            return { status: "terminated", result: control.result };
           }
+          if (control.action === "paused") {
+            continue;
+          }
+          // menu decline / pause cancel / continue → keep waiting
         } else if (options.offerRunningControls) {
           const control = await presentRunBriefControlMenu(controls, ui, panel);
           if (control.action === "terminated") {
@@ -1227,15 +1392,74 @@ export async function runPostGrillPipeline(
 ): Promise<void> {
   // Clear prior pause / termination so this run can auto-advance.
   coordinator.beginPipelineRun();
+  const controlPath = runControlFilePath(process.cwd());
   ui.notify(
-    "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement… Stage confirmation is auto-Publish; disposition is auto-Close. Run brief controls: Pause / Resume / Terminate (each requires confirm).",
+    [
+      "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement…",
+      "Stage confirmation is auto-Publish; disposition is auto-Close.",
+      "Stop controls (while waiting): Ctrl+Alt+M menu · Ctrl+Alt+P Pause · Ctrl+Alt+T Terminate (confirm required).",
+      `Out-of-band: echo terminate > ${controlPath}`,
+      `Emergency (no confirm): echo terminate-now > ${controlPath}`,
+    ].join("\n"),
     "info",
   );
   log("info", "pipeline:start", {
     logFile: menuLogger?.filePath(),
+    runControlFile: controlPath,
   });
 
   for (let step = 0; step < 50; step += 1) {
+    // Out-of-band stop between stages (shortcuts + run-control file).
+    const midRunControl =
+      consumePendingWaitControl() ??
+      (await readAndClearRunControlFile(process.cwd()));
+    if (midRunControl === "terminate-now" || midRunControl === "terminate") {
+      if (midRunControl === "terminate") {
+        const panel = await coordinator.getPanelState({ mode: "local" });
+        if (panel) {
+          const confirmed = await confirmTerminateControl(
+            ui,
+            panel.workflowId,
+            predictRunTerminationMode(panel),
+          );
+          if (!confirmed) {
+            ui.notify("Terminate cancelled — pipeline continues.", "info");
+          } else {
+            const result = await coordinator.terminateRun();
+            ui.notify(formatTerminateNotify(result), "warning");
+            log("info", "pipeline:stop", {
+              reason: "run-terminated",
+              step,
+              mode: result.mode,
+              via: "mid-run-control",
+            });
+            return;
+          }
+        } else {
+          const result = await coordinator.terminateRun();
+          ui.notify(formatTerminateNotify(result), "warning");
+          return;
+        }
+      } else {
+        const result = await coordinator.terminateRun();
+        ui.notify(formatTerminateNotify(result), "warning");
+        log("info", "pipeline:stop", {
+          reason: "run-terminated",
+          step,
+          mode: result.mode,
+          via: "terminate-now",
+        });
+        return;
+      }
+    } else if (midRunControl === "pause") {
+      const panel = await coordinator.getPanelState({ mode: "local" });
+      if (panel) {
+        await applyConfirmedPause(coordinator, ui, panel);
+      } else {
+        await coordinator.pausePipeline();
+      }
+    }
+
     if (coordinator.isRunTerminated()) {
       ui.notify("Run terminated — pipeline stopped.", "warning");
       log("info", "pipeline:stop", { reason: "run-terminated", step });

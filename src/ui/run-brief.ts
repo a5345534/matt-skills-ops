@@ -30,6 +30,7 @@ export type RunBriefSectionId =
   | "ci"
   | "workflow-pr"
   | "tickets"
+  | "controls"
   | "stop";
 
 /** One labeled block of operator-facing brief lines. */
@@ -85,6 +86,9 @@ export function buildRunBriefViewModel(
 
   const tickets = ticketsSection(panel);
   if (tickets) sections.push(tickets);
+
+  const controls = controlsSection(panel);
+  if (controls) sections.push(controls);
 
   const stop = stopSection(panel);
   if (stop) sections.push(stop);
@@ -465,10 +469,14 @@ export function formatTicketTableRow(
   if (item.status === "closed" || item.state === "CLOSED") {
     status = "closed";
   } else if (worker) {
-    status =
-      worker.status === "needs-disposition"
-        ? `needs-disp r${worker.attempt}`
-        : `${worker.status} r${worker.attempt}`;
+    if (worker.status === "needs-disposition") {
+      status = `needs-disp r${worker.attempt}`;
+    } else if (item.status === "blocked" && worker.status === "running") {
+      // Stale: launched while ready, then an upstream blocker reopened.
+      status = `stale-block r${worker.attempt}`;
+    } else {
+      status = `${worker.status} r${worker.attempt}`;
+    }
   } else if (integration) {
     status = `integrating r${integration.attempt}`;
   } else if (ci) {
@@ -490,6 +498,33 @@ export function formatTicketTableRow(
     padCell(status, COL.status),
     padCell(title, COL.title),
   ].join(" ");
+}
+
+/** Always-visible operator stop surface while a run is live. */
+function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined {
+  if (panel.runTerminated) return undefined;
+  if (panel.pipelinePaused) {
+    return {
+      id: "controls",
+      title: "Controls",
+      lines: [
+        "Paused — choose Resume or Terminate in the control menu.",
+        "Shortcuts: Ctrl+Alt+M (menu) · Ctrl+Alt+T (terminate)",
+        "Shell: echo terminate > .pi/matt-auto/run-control",
+        "Emergency (no confirm): echo terminate-now > .pi/matt-auto/run-control",
+      ],
+    };
+  }
+  return {
+    id: "controls",
+    title: "Controls",
+    lines: [
+      "Ctrl+Alt+M — open Pause / Terminate menu (confirm required)",
+      "Ctrl+Alt+P — Pause · Ctrl+Alt+T — Terminate (confirm required)",
+      "Shell: echo terminate > .pi/matt-auto/run-control",
+      "Emergency (no confirm): echo terminate-now > .pi/matt-auto/run-control",
+    ],
+  };
 }
 
 function stopSection(

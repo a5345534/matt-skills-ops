@@ -85,3 +85,28 @@ export function canLaunchImplementationWorker(input: {
 }): boolean {
   return implementationLaunchBlockReason(input) === undefined;
 }
+
+/**
+ * Running Implementation ticket numbers that must be aborted because the
+ * tracker frontier now lists them as blocked (open blockers).
+ *
+ * Happens after Rework reopens an upstream ticket while a dependent was
+ * already launched, or when GitHub blocked-by edges change mid-run.
+ */
+export function runningTicketsBlockedByOpen(
+  runningTicketNumbers: readonly number[],
+  blockedTickets: readonly { number: number }[],
+): number[] {
+  if (runningTicketNumbers.length === 0 || blockedTickets.length === 0) {
+    return [];
+  }
+  const blocked = new Set(blockedTickets.map((t) => t.number));
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const n of runningTicketNumbers) {
+    if (!Number.isFinite(n) || seen.has(n)) continue;
+    seen.add(n);
+    if (blocked.has(n)) out.push(n);
+  }
+  return out.sort((a, b) => a - b);
+}

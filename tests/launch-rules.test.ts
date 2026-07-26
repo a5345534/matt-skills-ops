@@ -4,6 +4,7 @@ import {
   computeImplementationSlots,
   countRunningImplementationWorkers,
   implementationLaunchBlockReason,
+  runningTicketsBlockedByOpen,
 } from "../src/launch-rules.js";
 
 describe("countRunningImplementationWorkers", () => {
@@ -105,5 +106,33 @@ describe("implementationLaunchBlockReason / canLaunchImplementationWorker", () =
         readyCount: 0,
       }),
     ).toBe("pending-disposition");
+  });
+});
+
+describe("runningTicketsBlockedByOpen", () => {
+  it("returns running tickets that appear on the blocked frontier", () => {
+    expect(
+      runningTicketsBlockedByOpen(
+        [281, 282, 283],
+        [{ number: 282 }, { number: 283 }],
+      ),
+    ).toEqual([282, 283]);
+  });
+
+  it("returns empty when nothing overlaps", () => {
+    expect(
+      runningTicketsBlockedByOpen([281], [{ number: 282 }]),
+    ).toEqual([]);
+    expect(runningTicketsBlockedByOpen([], [{ number: 282 }])).toEqual([]);
+    expect(runningTicketsBlockedByOpen([281], [])).toEqual([]);
+  });
+
+  it("dedupes and sorts", () => {
+    expect(
+      runningTicketsBlockedByOpen(
+        [283, 282, 282],
+        [{ number: 283 }, { number: 282 }],
+      ),
+    ).toEqual([282, 283]);
   });
 });

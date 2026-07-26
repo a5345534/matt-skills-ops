@@ -39,6 +39,7 @@ import {
   presentMainMenu,
   presentNextActions,
   queuePipelineWaitControl,
+  runControlFilePath,
   runPostGrillPipeline,
   setMenuLogger,
   type MattAutoUi,
@@ -447,7 +448,8 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     assistantTexts.length = 0;
   });
 
-  // Queue Pause/Terminate during auto-waiting wait loop (home agent idle; no blocking menu).
+  // Queue Pause/Terminate/menu during auto-waiting wait loop (home agent idle).
+  // Also readable via .pi/matt-auto/run-control when shortcuts are unavailable.
   pi.registerShortcut("ctrl+alt+p", {
     description: "Matt Auto: queue Pause while /matt-auto run is auto-waiting",
     handler: () => {
@@ -460,12 +462,19 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       queuePipelineWaitControl("terminate");
     },
   });
+  pi.registerShortcut("ctrl+alt+m", {
+    description:
+      "Matt Auto: open Pause / Terminate control menu while /matt-auto run is auto-waiting",
+    handler: () => {
+      queuePipelineWaitControl("menu");
+    },
+  });
 
   pi.registerCommand("matt-auto", {
     description:
       "Matt Auto: post-grill pipeline from to-spec through delivery (stage-gated menus)",
     getArgumentCompletions: (prefix) => {
-      const args = ["next", "run"];
+      const args = ["next", "run", "stop", "pause", "resume"];
       const filtered = args.filter((a) => a.startsWith(prefix.trim()));
       return filtered.map((value) => ({ value, label: value }));
     },
@@ -532,8 +541,79 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           return;
         }
 
+        // Out-of-band controls when /matt-auto run is blocking (prefer shortcuts
+        // or the run-control file). These also work between runs.
+        if (subcommand === "stop" || subcommand === "terminate") {
+          const controlPath = runControlFilePath(ctx.cwd);
+          if (active.isRunTerminated()) {
+            ui.notify("Run is already terminated.", "info");
+            return;
+          }
+          // Always write the control file so an in-flight wait loop can see it
+          // even when this command races with a blocking /matt-auto run.
+          try {
+            const { writeFile, mkdir } = await import("node:fs/promises");
+            const pathMod = await import("node:path");
+            await mkdir(pathMod.dirname(controlPath), { recursive: true });
+            await writeFile(controlPath, "terminate\n", "utf8");
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            ui.notify(`Failed to write run-control file: ${message}`, "error");
+          }
+          queuePipelineWaitControl("terminate");
+          if (typeof active.terminateRun === "function" && !active.isPipelinePaused()) {
+            // If no wait loop is active, terminate immediately (with confirm via notify).
+            // When a wait loop is active it will consume the queue/file instead.
+            ui.notify(
+              [
+                "Terminate requested.",
+                "If /matt-auto run is auto-waiting: confirm the Terminate dialog, or it will pick up the control file.",
+                `Control file: ${controlPath}`,
+                "Emergency (no confirm, another shell): echo terminate-now > .pi/matt-auto/run-control",
+              ].join("\n"),
+              "warning",
+            );
+          }
+          return;
+        }
+
+        if (subcommand === "pause") {
+          const controlPath = runControlFilePath(ctx.cwd);
+          try {
+            const { writeFile, mkdir } = await import("node:fs/promises");
+            const pathMod = await import("node:path");
+            await mkdir(pathMod.dirname(controlPath), { recursive: true });
+            await writeFile(controlPath, "pause\n", "utf8");
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            ui.notify(`Failed to write run-control file: ${message}`, "error");
+          }
+          queuePipelineWaitControl("pause");
+          ui.notify(
+            [
+              "Pause requested for the active Matt Auto run.",
+              "If auto-waiting: confirm the Pause dialog when it appears.",
+              `Control file: ${controlPath}`,
+            ].join("\n"),
+            "warning",
+          );
+          return;
+        }
+
+        if (subcommand === "resume") {
+          if (!active.isPipelinePaused()) {
+            ui.notify("Pipeline is not paused.", "info");
+            return;
+          }
+          await active.resumePipeline();
+          ui.notify("Pipeline resumed.", "info");
+          return;
+        }
+
         ctx.ui.notify(
-          `Unknown Matt Auto argument "${subcommand}". Try /matt-auto, /matt-auto next, or /matt-auto run.`,
+          `Unknown Matt Auto argument "${subcommand}". Try /matt-auto, /matt-auto next, /matt-auto run, /matt-auto stop, /matt-auto pause, or /matt-auto resume.`,
           "error",
         );
       } finally {

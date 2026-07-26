@@ -779,6 +779,15 @@ export type WorkflowCoordinator = {
   /** True after Run termination until {@link beginPipelineRun}. */
   isRunTerminated(): boolean;
   /**
+   * Abort running Implementation workers whose tickets are blocked by open
+   * upstream tickets (e.g. after Rework reopens a closed blocker).
+   * Safe to call repeatedly; no-op when the frontier still lists them ready.
+   */
+  reconcileBlockedRunningWorkers(): Promise<{
+    abortedWorkerCount: number;
+    affectedAttempts: readonly PipelineAffectedAttempt[];
+  }>;
+  /**
    * Clear Pipeline pause / Run termination so a new auto-advance run can start.
    * Called at the start of `/matt-auto run` (or equivalent).
    */

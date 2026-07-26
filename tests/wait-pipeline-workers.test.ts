@@ -155,6 +155,10 @@ function controlCoordinator(
       handlers.isPipelinePaused ? handlers.isPipelinePaused() : paused,
     isRunTerminated: () =>
       handlers.isRunTerminated ? handlers.isRunTerminated() : terminated,
+    reconcileBlockedRunningWorkers: async () => ({
+      abortedWorkerCount: 0,
+      affectedAttempts: [],
+    }),
   };
 }
 

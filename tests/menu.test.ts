@@ -675,6 +675,22 @@ describe("selectPipelineAction", () => {
     expect(chosen?.id).toBe("implement-ticket:12");
   });
 
+  it("prefers Rework over Implement so reopened blockers win over dependents", () => {
+    const chosen = selectPipelineAction([
+      {
+        id: "implement-ticket:282",
+        label: "Implement #282",
+        description: "dependent",
+      },
+      {
+        id: "rework-ticket:281",
+        label: "Rework #281",
+        description: "blocker",
+      },
+    ]);
+    expect(chosen?.id).toBe("rework-ticket:281");
+  });
+
   it("does not auto-pick Create-spec when Start Follow-up is also offered (post-cleanup)", () => {
     const chosen = selectPipelineAction([
       {

@@ -182,7 +182,13 @@ describe("buildRunBriefViewModel", () => {
     const brief = buildRunBriefViewModel(panel);
     const ids = brief.sections.map((s) => s.id);
 
-    expect(ids).toEqual(["workflow", "pipeline", "context", "workers"]);
+    expect(ids).toEqual([
+      "workflow",
+      "pipeline",
+      "context",
+      "workers",
+      "controls",
+    ]);
     expect(brief.sections.find((s) => s.id === "workflow")?.lines).toEqual([
       "Workflow #42",
     ]);
@@ -196,6 +202,9 @@ describe("buildRunBriefViewModel", () => {
       "#43 r1: needs-disposition",
       "  branch: matt-auto/42/ticket-43/r1",
     ]);
+    expect(brief.sections.find((s) => s.id === "controls")?.lines.join("\n")).toContain(
+      "Ctrl+Alt+M",
+    );
     // Missing optional sections are absent, not empty placeholders that throw.
     expect(ids).not.toContain("integration");
     expect(ids).not.toContain("ci");
@@ -294,7 +303,11 @@ describe("buildRunBriefViewModel", () => {
   it("does not throw on a minimal empty-worker panel", () => {
     expect(() => buildRunBriefViewModel(basePanel())).not.toThrow();
     const brief = buildRunBriefViewModel(basePanel());
-    expect(brief.sections.map((s) => s.id)).toEqual(["workflow", "pipeline"]);
+    expect(brief.sections.map((s) => s.id)).toEqual([
+      "workflow",
+      "pipeline",
+      "controls",
+    ]);
     expect(brief.lines.length).toBeGreaterThan(0);
   });
 });

@@ -49,6 +49,7 @@ import {
   computeImplementationSlots,
   countRunningImplementationWorkers,
   implementationLaunchBlockReason,
+  runningTicketsBlockedByOpen,
 } from "./launch-rules.js";
 import type {
   RootScopedPorts,
@@ -4447,8 +4448,90 @@ export function createWorkflowCoordinator(
       };
     }
 
+    // Dependents may already be running if they were launched while this ticket
+    // was briefly closed. Abort them before opening the rework Implementation.
+    await reconcileBlockedRunningWorkers();
+
     // Fresh numbered attempt workspace + Implementation worker (does not reuse completed workspace).
     return startImplementation(ticketNumber);
+  }
+
+  /**
+   * Abort running Implementation workers whose tickets are on the blocked
+   * frontier (open blockers). Used after Rework reopens an upstream ticket and
+   * periodically during the wait surface.
+   */
+  async function reconcileBlockedRunningWorkers(): Promise<{
+    abortedWorkerCount: number;
+    affectedAttempts: readonly PipelineAffectedAttempt[];
+  }> {
+    const running = [...activeImplementationWorkers.values()].filter(
+      (w) => w.status === "running",
+    );
+    if (running.length === 0) {
+      return { abortedWorkerCount: 0, affectedAttempts: [] };
+    }
+
+    const bound = scoped ?? (await requireScoped());
+    const active = await loadActiveWorkflow(bound);
+    if (!active || !isTicketWorkStage(active.stage)) {
+      return { abortedWorkerCount: 0, affectedAttempts: [] };
+    }
+
+    const progress = await loadTicketProgress(bound, active, { force: true });
+    if (!progress || progress.blocked.length === 0) {
+      return { abortedWorkerCount: 0, affectedAttempts: [] };
+    }
+
+    const toAbort = new Set(
+      runningTicketsBlockedByOpen(
+        running.map((w) => w.ticketNumber),
+        progress.blocked,
+      ),
+    );
+    if (toAbort.size === 0) {
+      return { abortedWorkerCount: 0, affectedAttempts: [] };
+    }
+
+    const affected: PipelineAffectedAttempt[] = [];
+    for (const worker of running) {
+      if (!toAbort.has(worker.ticketNumber)) continue;
+      const openBlockers =
+        progress.blocked.find((b) => b.number === worker.ticketNumber)
+          ?.openBlockers ?? [];
+      try {
+        await bound.workers.abort(worker.workerId);
+      } catch {
+        // Best-effort; still drop session state so the run loop does not wait.
+      }
+      worker.status = "aborted";
+      activeImplementationWorkers.delete(worker.workerId);
+      // Cooldown so auto-advance does not immediately re-pick a still-blocked ticket.
+      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      await bound.transcripts.append(
+        {
+          workflowId: worker.workflowId,
+          ticketNumber: worker.ticketNumber,
+          attempt: worker.attempt,
+        },
+        {
+          type: "worker-aborted",
+          reason: "open-blockers",
+          openBlockers,
+        },
+      );
+      affected.push({
+        workflowId: worker.workflowId,
+        ticketNumber: worker.ticketNumber,
+        attempt: worker.attempt,
+        kind: "implementation",
+      });
+    }
+
+    if (affected.length > 0) {
+      invalidatePanelCaches();
+    }
+    return { abortedWorkerCount: affected.length, affectedAttempts: affected };
   }
 
   /**
@@ -5247,6 +5330,7 @@ export function createWorkflowCoordinator(
     terminateRun,
     isPipelinePaused,
     isRunTerminated,
+    reconcileBlockedRunningWorkers,
     beginPipelineRun,
     isAutoAdvanceBlocked,
     getWorkerTranscript,
