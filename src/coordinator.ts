@@ -49,10 +49,15 @@ import type {
   ImplementationWorkerStatus,
   IntegratedTicketRef,
   NextAction,
+  PipelineAffectedAttempt,
+  PipelinePauseResult,
+  PipelineResumeResult,
   PreflightCheck,
   PreflightResult,
   ReadyTicket,
   ResolvedWorkerProfile,
+  RunTerminationMode,
+  RunTerminationResult,
   SpecDraft,
   StageConfirmationDecision,
   StageResult,
@@ -195,6 +200,17 @@ export function createWorkflowCoordinator(
   /** Ticket numbers that recently hit implementation recovery — skip auto re-launch. */
   const implementationRecoveryCooldown = new Map<number, number>();
   const IMPLEMENTATION_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+  /**
+   * Session-owned Pipeline pause flag. When true, auto-advance / preferred Next
+   * must not continue the run loop. Cleared only by Resume or beginPipelineRun.
+   */
+  let pipelinePaused = false;
+  /** Session-owned Run termination flag until the next explicit pipeline run. */
+  let runTerminated = false;
+  /** Last operator stop that affected the run loop (panel / brief surface). */
+  let lastStopReason: "pipeline-pause" | "run-termination" | undefined;
+  /** T1/T2 mode recorded when lastStopReason is run-termination. */
+  let lastTerminationMode: RunTerminationMode | undefined;
 
   function bindRoot(rootPath: string): void {
     selectedPath = rootPath;
@@ -3691,10 +3707,37 @@ export function createWorkflowCoordinator(
     return startImplementation(ticketNumber);
   }
 
-  async function abortWorkers(): Promise<void> {
+  /**
+   * Abort session-owned Implementation + Conflict resolution workers.
+   * @param setCooldown - when true (session teardown), block auto re-launch briefly.
+   * @param transcriptEvent - structured event appended to each affected attempt.
+   */
+  async function abortSessionWorkers(options: {
+    setCooldown: boolean;
+    transcriptEvent: Record<string, unknown>;
+    preservePendingIntegrationMessage?: string;
+  }): Promise<PipelineAffectedAttempt[]> {
     const bound = scoped ?? (await requireScoped());
     const worker = activeWorker;
     const conflictWorker = activeConflictWorker;
+    const affected: PipelineAffectedAttempt[] = [];
+
+    if (worker) {
+      affected.push({
+        workflowId: worker.workflowId,
+        ticketNumber: worker.ticketNumber,
+        attempt: worker.attempt,
+        kind: "implementation",
+      });
+    }
+    if (conflictWorker) {
+      affected.push({
+        workflowId: conflictWorker.workflowId,
+        ticketNumber: conflictWorker.ticketNumber,
+        attempt: conflictWorker.attempt,
+        kind: "conflict-resolution",
+      });
+    }
 
     try {
       await bound.workers.abortAll();
@@ -3704,15 +3747,17 @@ export function createWorkflowCoordinator(
 
     if (worker) {
       worker.status = "aborted";
-      // Prevent the pipeline from immediately re-selecting the same ticket.
-      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      if (options.setCooldown) {
+        // Prevent the pipeline from immediately re-selecting the same ticket.
+        implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      }
       await bound.transcripts.append(
         {
           workflowId: worker.workflowId,
           ticketNumber: worker.ticketNumber,
           attempt: worker.attempt,
         },
-        { type: "worker-aborted" },
+        options.transcriptEvent,
       );
     }
 
@@ -3724,19 +3769,242 @@ export function createWorkflowCoordinator(
           ticketNumber: conflictWorker.ticketNumber,
           attempt: conflictWorker.attempt,
         },
-        { type: "conflict-resolution-aborted" },
+        options.transcriptEvent,
       );
       if (
         pendingIntegration &&
         pendingIntegration.ticketNumber === conflictWorker.ticketNumber
       ) {
         pendingIntegration.lastFailure =
+          options.preservePendingIntegrationMessage ??
           "Conflict resolution worker aborted with Workflow home. In-progress merge is preserved for retry.";
       }
     }
 
     activeWorker = undefined;
     activeConflictWorker = undefined;
+    return affected;
+  }
+
+  async function abortWorkers(): Promise<void> {
+    await abortSessionWorkers({
+      setCooldown: true,
+      transcriptEvent: { type: "worker-aborted" },
+    });
+  }
+
+  function isPipelinePaused(): boolean {
+    return pipelinePaused;
+  }
+
+  function isRunTerminated(): boolean {
+    return runTerminated;
+  }
+
+  function isAutoAdvanceBlocked(): boolean {
+    return pipelinePaused || runTerminated;
+  }
+
+  function beginPipelineRun(): void {
+    pipelinePaused = false;
+    runTerminated = false;
+    lastStopReason = undefined;
+    lastTerminationMode = undefined;
+  }
+
+  async function pausePipeline(): Promise<PipelinePauseResult> {
+    const affectedAttempts = await abortSessionWorkers({
+      setCooldown: false,
+      transcriptEvent: {
+        type: "pipeline:pause",
+        reason: "pipeline-pause",
+      },
+      preservePendingIntegrationMessage:
+        "Conflict resolution worker aborted by Pipeline pause. In-progress merge is preserved for retry.",
+    });
+
+    pipelinePaused = true;
+    runTerminated = false;
+    lastStopReason = "pipeline-pause";
+    lastTerminationMode = undefined;
+
+    return {
+      abortedWorkerCount: affectedAttempts.length,
+      affectedAttempts,
+      pipelinePaused: true,
+    };
+  }
+
+  async function resumePipeline(): Promise<PipelineResumeResult> {
+    pipelinePaused = false;
+    if (lastStopReason === "pipeline-pause") {
+      lastStopReason = undefined;
+    }
+    // Resume never clears Run termination — that ends the run deliberately.
+    return { pipelinePaused: false };
+  }
+
+  function resolveTerminationMode(
+    active: ActiveWorkflow | undefined,
+  ): RunTerminationMode {
+    const hasIntegrated =
+      (active?.integratedTickets?.length ?? 0) > 0 || Boolean(active?.workflowPr);
+    return hasIntegrated ? "stop-only" : "discard-unintegrated";
+  }
+
+  /**
+   * Collect local unintegrated attempt / integration branches for T2 discard.
+   * Never includes branches recorded on integratedTickets.
+   */
+  async function collectUnintegratedBranches(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<string[]> {
+    const integratedBranches = new Set(
+      (active.integratedTickets ?? []).map((t) => t.branchName),
+    );
+    const listed = await bound.workspace.listWorkflowBranches(active.workflowId);
+    const candidates = new Set<string>();
+
+    for (const branch of listed) {
+      if (integratedBranches.has(branch)) continue;
+      // T2 has no successful integrate / PR — discard attempt + integration branches.
+      candidates.add(branch);
+    }
+
+    // Session-known attempt branches (in case list is incomplete in tests / recovery).
+    const sessionBranches = [
+      activeWorker?.branchName,
+      pendingDisposition?.branchName,
+      pendingIntegration?.branchName,
+      pendingIntegration?.conflict?.integrationBranch,
+      activeConflictWorker?.integrationBranch,
+    ].filter((b): b is string => Boolean(b));
+    for (const branch of sessionBranches) {
+      if (!integratedBranches.has(branch)) {
+        candidates.add(branch);
+      }
+    }
+
+    return [...candidates].sort();
+  }
+
+  async function terminateRun(): Promise<RunTerminationResult> {
+    const bound = scoped ?? (await requireScoped());
+    const active = await loadActiveWorkflow(bound);
+    const mode = resolveTerminationMode(active);
+
+    const affectedAttempts = await abortSessionWorkers({
+      setCooldown: false,
+      transcriptEvent: {
+        type: "pipeline:terminate",
+        reason: "run-termination",
+        mode,
+      },
+      preservePendingIntegrationMessage:
+        mode === "stop-only"
+          ? "Conflict resolution worker aborted by Run termination (stop-only). In-progress merge is preserved."
+          : "Conflict resolution worker aborted by Run termination; unintegrated artifacts may be discarded.",
+    });
+
+    // Also log terminate against pending disposition / integration attempts that
+    // had no live worker (so attempt history still records the stop).
+    const loggedKeys = new Set(
+      affectedAttempts.map(
+        (a) => `${a.workflowId}:${a.ticketNumber}:${a.attempt}`,
+      ),
+    );
+    const extraAttempts: Array<{
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+    }> = [];
+    if (pendingDisposition) {
+      extraAttempts.push({
+        workflowId: pendingDisposition.workflowId,
+        ticketNumber: pendingDisposition.ticketNumber,
+        attempt: pendingDisposition.attempt,
+      });
+    }
+    if (pendingIntegration) {
+      extraAttempts.push({
+        workflowId: pendingIntegration.workflowId,
+        ticketNumber: pendingIntegration.ticketNumber,
+        attempt: pendingIntegration.attempt,
+      });
+    }
+    for (const key of extraAttempts) {
+      const id = `${key.workflowId}:${key.ticketNumber}:${key.attempt}`;
+      if (loggedKeys.has(id)) continue;
+      loggedKeys.add(id);
+      await bound.transcripts.append(key, {
+        type: "pipeline:terminate",
+        reason: "run-termination",
+        mode,
+      });
+    }
+
+    let discardedBranches: readonly string[] = [];
+    let discardedWorktrees: readonly string[] = [];
+
+    if (mode === "discard-unintegrated" && active) {
+      const toRemove = await collectUnintegratedBranches(bound, active);
+      if (toRemove.length > 0) {
+        // Record terminate on discarded attempts even when no live worker remained.
+        for (const branch of toRemove) {
+          const match =
+            /^matt-auto\/(\d+)\/ticket-(\d+)\/r(\d+)$/.exec(branch);
+          if (!match) continue;
+          const key = {
+            workflowId: Number(match[1]),
+            ticketNumber: Number(match[2]),
+            attempt: Number(match[3]),
+          };
+          const id = `${key.workflowId}:${key.ticketNumber}:${key.attempt}`;
+          if (loggedKeys.has(id)) continue;
+          loggedKeys.add(id);
+          await bound.transcripts.append(key, {
+            type: "pipeline:terminate",
+            reason: "run-termination",
+            mode,
+            discarded: true,
+          });
+        }
+        try {
+          const removed = await bound.workspace.removeLocalBranches(toRemove);
+          discardedBranches = removed.removedLocalBranches;
+          discardedWorktrees = removed.removedWorktrees;
+        } catch {
+          // Best-effort local discard; run still ends.
+          discardedBranches = [];
+          discardedWorktrees = [];
+        }
+      }
+      // Session-local unfinished work is discarded with T2 artifacts.
+      pendingDisposition = undefined;
+      pendingIntegration = undefined;
+      pendingCiRecovery = undefined;
+      integrationInProgress = false;
+    } else {
+      // T1 stop-only: clear live run pointers but never rewrite integrated history.
+      // Keep pendingIntegration conflict state recoverable for a later retry.
+      pendingDisposition = undefined;
+      pendingCiRecovery = undefined;
+    }
+
+    pipelinePaused = false;
+    runTerminated = true;
+    lastStopReason = "run-termination";
+    lastTerminationMode = mode;
+
+    return {
+      mode,
+      abortedWorkerCount: affectedAttempts.length,
+      affectedAttempts,
+      discardedBranches,
+      discardedWorktrees,
+      runTerminated: true,
+    };
   }
 
   /**
@@ -3896,7 +4164,17 @@ export function createWorkflowCoordinator(
       workflowId: active.workflowId,
       lines,
       workers,
+      pipelinePaused,
     };
+    if (runTerminated) {
+      state.runTerminated = true;
+    }
+    if (lastStopReason) {
+      state.lastStopReason = lastStopReason;
+    }
+    if (lastTerminationMode) {
+      state.terminationMode = lastTerminationMode;
+    }
     if (progress) {
       state.ticketProgress = progress;
     }
@@ -4085,6 +4363,13 @@ export function createWorkflowCoordinator(
     getPanelState,
     confirmDisposition,
     abortWorkers,
+    pausePipeline,
+    resumePipeline,
+    terminateRun,
+    isPipelinePaused,
+    isRunTerminated,
+    beginPipelineRun,
+    isAutoAdvanceBlocked,
     getWorkerTranscript,
   };
 }

@@ -310,10 +310,13 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
       return [...found].sort();
     },
 
-    async cleanupWorkflowWorkspaces(workflowId) {
-      const branchNames = await this.listWorkflowBranches(workflowId);
+    async removeLocalBranches(branchNames) {
+      const unique = [...new Set(branchNames.filter(Boolean))].sort();
       const removedWorktrees: string[] = [];
       const removedLocalBranches: string[] = [];
+      if (unique.length === 0) {
+        return { removedWorktrees, removedLocalBranches };
+      }
 
       // Remove worktrees first so branch -D succeeds.
       const listed = await run(root, "git", [
@@ -340,7 +343,7 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
 
         for (const entry of entries) {
           if (!entry.path || !entry.branch) continue;
-          if (!branchNames.includes(entry.branch)) continue;
+          if (!unique.includes(entry.branch)) continue;
           // Never remove the main Workflow root worktree.
           if (path.resolve(entry.path) === root) continue;
           const removed = await run(root, "git", [
@@ -355,6 +358,22 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
         }
       }
 
+      for (const branchName of unique) {
+        const deleted = await run(root, "git", ["branch", "-D", branchName]);
+        if (deleted.code === 0) {
+          removedLocalBranches.push(branchName);
+        }
+      }
+
+      return { removedWorktrees, removedLocalBranches };
+    },
+
+    async cleanupWorkflowWorkspaces(workflowId) {
+      const branchNames = await this.listWorkflowBranches(workflowId);
+      const removed = await this.removeLocalBranches(branchNames);
+      const removedWorktrees = [...removed.removedWorktrees];
+      const removedLocalBranches = [...removed.removedLocalBranches];
+
       // Also drop known sibling layout paths if still present without branch mapping.
       const siblingRoot = path.join(
         path.dirname(root),
@@ -362,7 +381,6 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
         String(workflowId),
       );
       if (await pathExists(siblingRoot)) {
-        // Best-effort: remove any remaining worktrees under the sibling root.
         const listedAgain = await run(root, "git", [
           "worktree",
           "list",
@@ -374,27 +392,19 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
             const worktreePath = line.slice("worktree ".length).trim();
             if (!worktreePath.startsWith(siblingRoot)) continue;
             if (path.resolve(worktreePath) === root) continue;
-            const removed = await run(root, "git", [
+            const removedWt = await run(root, "git", [
               "worktree",
               "remove",
               "--force",
               worktreePath,
             ]);
-            if (removed.code === 0 && !removedWorktrees.includes(worktreePath)) {
+            if (
+              removedWt.code === 0 &&
+              !removedWorktrees.includes(worktreePath)
+            ) {
               removedWorktrees.push(worktreePath);
             }
           }
-        }
-      }
-
-      for (const branchName of branchNames) {
-        const deleted = await run(root, "git", [
-          "branch",
-          "-D",
-          branchName,
-        ]);
-        if (deleted.code === 0) {
-          removedLocalBranches.push(branchName);
         }
       }
 

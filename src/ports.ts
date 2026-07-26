@@ -164,6 +164,14 @@ export type WorkspacePort = {
     removedLocalBranches: readonly string[];
   }>;
   /**
+   * Remove specific local worktrees and branches (Run termination T2).
+   * Does not touch remotes, GitHub history, or branches not listed.
+   */
+  removeLocalBranches(branchNames: readonly string[]): Promise<{
+    removedWorktrees: readonly string[];
+    removedLocalBranches: readonly string[];
+  }>;
+  /**
    * True when the worktree HEAD has commits not contained in baseRef
    * (used to infer Implementation success if the worker omits Stage result JSON).
    */
