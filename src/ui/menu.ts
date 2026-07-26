@@ -55,6 +55,7 @@ import type {
   WorkflowPanelState,
   WorkflowRoot,
 } from "../types.js";
+import { getTrackerGhMetrics } from "../adapters/tracker-rate-limit.js";
 import { startGhosttyActivity } from "./ghostty-activity.js";
 import {
   buildRunBriefViewModel,
@@ -532,7 +533,9 @@ export async function waitForPipelineWorkers(
   const sleepFn = options.sleep ?? sleep;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
-  const initialPanel = await coordinator.getPanelState();
+  // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
+  // so wait loops do not burn GraphQL quota every poll.
+  const initialPanel = await coordinator.getPanelState({ mode: "full" });
   const initialRunning = runningWorkers(initialPanel);
   const initialPaused = initialPanel?.pipelinePaused === true;
   const initialP1 = hasP1RunLoopWork(initialPanel);
@@ -577,7 +580,7 @@ export async function waitForPipelineWorkers(
 
   try {
     for (let i = 0; i < maxTicks; i += 1) {
-      const panel = await coordinator.getPanelState();
+      const panel = await coordinator.getPanelState({ mode: "local" });
       if (!panel) {
         log("info", "pipeline:workers-settled", {
           ticks: i + 1,
@@ -622,7 +625,8 @@ export async function waitForPipelineWorkers(
         }
         const control = await presentRunBriefControlMenu(controls, ui, panel);
         if (control.action === "terminated") {
-          const latest = (await coordinator.getPanelState()) ?? panel;
+          const latest =
+            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
           notifyRunBrief(ui, latest, "warning");
           ui.notify(formatTerminateNotify(control.result), "warning");
           return { status: "terminated", result: control.result };
@@ -656,7 +660,7 @@ export async function waitForPipelineWorkers(
       }
 
       const brief = notifyRunBrief(ui, panel);
-      log("debug", "pipeline:wait-workers-tick", {
+      const tickPayload: Record<string, unknown> = {
         tick: i + 1,
         runningCount: running.length,
         running: running.map((w) => ({
@@ -672,7 +676,12 @@ export async function waitForPipelineWorkers(
         })),
         briefSections: brief.sections.map((s) => s.id),
         briefLines: brief.lines,
-      });
+      };
+      // Periodic tracker metrics (every ~30s at 2s poll) for rate-limit diagnosis.
+      if (i === 0 || (i + 1) % 15 === 0) {
+        tickPayload.trackerGh = getTrackerGhMetrics();
+      }
+      log("debug", "pipeline:wait-workers-tick", tickPayload);
 
       // Continuous auto-wait by default (no "Continue waiting" gate).
       // Optional blocking menu for tests / offerRunningControls.
@@ -687,7 +696,8 @@ export async function waitForPipelineWorkers(
         } else if (queued === "terminate") {
           const result = await applyConfirmedTerminate(controls, ui, panel);
           if (result) {
-            const latest = (await coordinator.getPanelState()) ?? panel;
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
             notifyRunBrief(ui, latest, "warning");
             ui.notify(formatTerminateNotify(result), "warning");
             return { status: "terminated", result };
@@ -695,7 +705,8 @@ export async function waitForPipelineWorkers(
         } else if (options.offerRunningControls) {
           const control = await presentRunBriefControlMenu(controls, ui, panel);
           if (control.action === "terminated") {
-            const latest = (await coordinator.getPanelState()) ?? panel;
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
             notifyRunBrief(ui, latest, "warning");
             ui.notify(formatTerminateNotify(control.result), "warning");
             return { status: "terminated", result: control.result };

@@ -8,6 +8,16 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "../constants.js";
 import type { TrackerPort, TrackerTicket } from "../ports.js";
+import {
+  buildBatchedListTicketsQuery,
+  chunkIssueNumbers,
+} from "./tracker-queries.js";
+import {
+  isGraphqlRateLimitMessage,
+  noteGraphqlRateLimit,
+  recordGraphqlAttempt,
+  recordRestAttempt,
+} from "./tracker-rate-limit.js";
 import type {
   ActiveWorkflow,
   WorkerProfile,
@@ -53,6 +63,14 @@ async function run(
   command: string,
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  const isGraphql =
+    command === "gh" && args.includes("api") && args.includes("graphql");
+  if (isGraphql) {
+    recordGraphqlAttempt();
+  } else if (command === "gh") {
+    recordRestAttempt();
+  }
+
   try {
     const { stdout, stderr } = await execFileAsync(command, args, {
       cwd,
@@ -67,10 +85,18 @@ async function run(
       stderr?: string;
       message?: string;
     };
+    const stderr = err.stderr ?? err.message ?? "";
+    const stdout = err.stdout ?? "";
+    const detail = `${stderr}
+${stdout}`;
+    // gh may surface GraphQL quota errors even on non-graphql subcommands.
+    if (isGraphqlRateLimitMessage(detail)) {
+      noteGraphqlRateLimit(detail);
+    }
     return {
       code: typeof err.code === "number" ? err.code : 1,
-      stdout: err.stdout ?? "",
-      stderr: err.stderr ?? err.message ?? "",
+      stdout,
+      stderr,
     };
   }
 }
@@ -488,58 +514,71 @@ export function createTrackerPort(cwd: string): TrackerPort {
       const repo = await resolveRepoFullName(cwd);
       if (!repo) return [];
 
+      type IssueNode = {
+        number: number;
+        title: string;
+        state: string;
+        blockedBy?: { nodes?: Array<{ number: number; state: string }> };
+      };
+
       const tickets: TrackerTicket[] = [];
-      for (const number of issueNumbers) {
+      // One GraphQL request per chunk instead of one request per issue.
+      for (const chunk of chunkIssueNumbers(issueNumbers)) {
+        const query = buildBatchedListTicketsQuery(
+          repo.owner,
+          repo.name,
+          chunk,
+        );
         const result = await run(cwd, "gh", [
           "api",
           "graphql",
           "-f",
-          `query=query {
-            repository(owner: "${repo.owner}", name: "${repo.name}") {
-              issue(number: ${number}) {
-                number
-                title
-                state
-                blockedBy(first: 50) {
-                  nodes { number state }
-                }
-              }
-            }
-          }`,
+          `query=${query}`,
         ]);
-        if (result.code !== 0) continue;
+        if (result.code !== 0) {
+          const detail = `${result.stderr}
+${result.stdout}`;
+          if (isGraphqlRateLimitMessage(detail)) {
+            noteGraphqlRateLimit(detail);
+            // Fail the whole listTickets so callers can keep stale cache.
+            throw new Error(
+              result.stderr.trim() ||
+                "GitHub GraphQL API rate limit exceeded while listing tickets.",
+            );
+          }
+          continue;
+        }
         try {
           const parsed = JSON.parse(result.stdout) as {
             data?: {
-              repository?: {
-                issue?: {
-                  number: number;
-                  title: string;
-                  state: string;
-                  blockedBy?: {
-                    nodes?: Array<{ number: number; state: string }>;
-                  };
-                } | null;
-              };
+              repository?: Record<string, IssueNode | null | undefined>;
             };
           };
-          const issue = parsed.data?.repository?.issue;
-          if (!issue) continue;
-          const state = issue.state === "CLOSED" ? "CLOSED" : "OPEN";
-          tickets.push({
-            number: issue.number,
-            title: issue.title,
-            state,
-            blockedBy: (issue.blockedBy?.nodes ?? []).map((node) => ({
-              number: node.number,
-              state: node.state === "CLOSED" ? "CLOSED" : "OPEN",
-            })),
-          });
+          const repository = parsed.data?.repository;
+          if (!repository) continue;
+          for (let index = 0; index < chunk.length; index += 1) {
+            const issue = repository[`i${index}`];
+            if (!issue) continue;
+            const state = issue.state === "CLOSED" ? "CLOSED" : "OPEN";
+            tickets.push({
+              number: issue.number,
+              title: issue.title,
+              state,
+              blockedBy: (issue.blockedBy?.nodes ?? []).map((node) => ({
+                number: node.number,
+                state: node.state === "CLOSED" ? "CLOSED" : "OPEN",
+              })),
+            });
+          }
         } catch {
-          // skip malformed
+          // skip malformed chunk
         }
       }
-      return tickets;
+      // Stable order matching input numbers when present.
+      const byNumber = new Map(tickets.map((t) => [t.number, t]));
+      return issueNumbers
+        .map((n) => byNumber.get(n))
+        .filter((t): t is TrackerTicket => t !== undefined);
     },
 
     async addBlockedBy(issueNumber, blockerIssueNumber) {
