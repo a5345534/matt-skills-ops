@@ -11,6 +11,9 @@
   "pi": {
     "extensions": [
       "./extensions"
+    ],
+    "skills": [
+      "./skills/**"
     ]
   },
   "exports": {
@@ -26,6 +29,7 @@
   },
   "files": [
     "extensions",
+    "skills",
     "src",
     "README.md",
     "CONTEXT.md",

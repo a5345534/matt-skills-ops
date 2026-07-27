@@ -22,15 +22,16 @@ describe("appendImplementationRoutingPolicy", () => {
   it("appends policy once", () => {
     const once = appendImplementationRoutingPolicy("BASE");
     expect(once).toContain("BASE");
-    expect(once).toContain("Matt Auto delivery routing");
+    expect(once).toContain("Matt Auto (installed package");
     expect(once).toContain("/matt-auto");
     const twice = appendImplementationRoutingPolicy(once);
     expect(twice).toBe(once);
   });
 
-  it("mentions grill docs-only and multi-ticket path", () => {
-    expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/Grill/i);
-    expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/documentation only/i);
+  it("requires offering /matt-auto after grill/ADR and names the command", () => {
+    expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/MUST surface Matt Auto/i);
+    expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/shared understanding/i);
     expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/matt-auto run/i);
+    expect(IMPLEMENTATION_ROUTING_POLICY).toMatch(/Do not assume the user knows/i);
   });
 });

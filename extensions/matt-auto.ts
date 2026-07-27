@@ -396,6 +396,19 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     };
   });
 
+  // Make Matt Auto visible at session open (footer status), not only in system prompt.
+  pi.on("session_start", async (_event, ctx) => {
+    if (isMattAutoWorkerProcess()) return;
+    try {
+      ctx.ui.setStatus?.(
+        "matt-auto",
+        "Matt Auto · after grill/ADR offer /matt-auto run",
+      );
+    } catch {
+      // status optional
+    }
+  });
+
   function ensureCoordinator(
     cwd: string,
     modelRegistry: Parameters<typeof createModelsPort>[0],
