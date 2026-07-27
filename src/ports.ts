@@ -231,6 +231,31 @@ export type VerificationPort = {
  * System boundary: `git push` to the Workflow root remote.
  * Workers never receive this port.
  */
+/**
+ * Safe Workflow-root pull after cleanup.
+ * Soft outcomes: skip when dirty / wrong branch / non-FF; never force/reset.
+ */
+export type SafePullResult =
+  | {
+      ok: true;
+      pulled: true;
+      branch: string;
+      /** True when submodule checkouts were updated to recorded gitlinks. */
+      submodulesUpdated?: boolean;
+    }
+  | {
+      ok: true;
+      pulled: false;
+      skipped: true;
+      branch: string;
+      reason: string;
+    }
+  | {
+      ok: false;
+      branch: string;
+      reason: string;
+    };
+
 export type RemoteGitPort = {
   /**
    * Push a local branch to the Workflow root remote.
@@ -242,6 +267,12 @@ export type RemoteGitPort = {
    * Only the Workflow coordinator may call this after Workflow PR merge.
    */
   deleteRemoteBranches(branchNames: readonly string[]): Promise<void>;
+  /**
+   * Safely fast-forward the Workflow root to origin/<branch> when safe:
+   * clean worktree, HEAD on that branch, FF-only. Soft-skips otherwise.
+   * Optionally updates submodules to recorded gitlinks after a successful pull.
+   */
+  safePullBranch(branchName: string): Promise<SafePullResult>;
 };
 
 /** Launch parameters for one session-owned Implementation worker. */

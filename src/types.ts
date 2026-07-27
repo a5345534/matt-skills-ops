@@ -481,6 +481,17 @@ export type StageResult =
       parentSpecClosed?: boolean;
       /** Soft-fail detail when parent close failed after artifact cleanup. */
       parentSpecCloseWarning?: string;
+      /**
+       * Safe auto-pull of Workflow root target branch after cleanup.
+       * Soft-skipped when dirty / wrong branch / non-FF; never fails cleanup.
+       */
+      localPull?: {
+        pulled: boolean;
+        skipped?: boolean;
+        branch: string;
+        reason?: string;
+        submodulesUpdated?: boolean;
+      };
       /** Original Workflow ID when a Follow-up workflow was created. */
       followUpOf?: number;
       /** True when this Stage result is a pre-merge Rework attempt. */

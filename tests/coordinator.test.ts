@@ -472,11 +472,29 @@ type RemoteGitState = {
 };
 
 function createRemoteGit(
-  initial: { failPush?: boolean; failDelete?: boolean } = {},
-): { port: RemoteGitPort; state: RemoteGitState } {
-  const state: RemoteGitState = {
-    pushes: [],
-    deleted: [],
+  initial: {
+    failPush?: boolean;
+    failDelete?: boolean;
+    /** Default safe-pull success (FF). */
+    pullResult?: import("../src/ports.js").SafePullResult;
+  } = {},
+): {
+  port: RemoteGitPort;
+  state: RemoteGitState & {
+    pulls: string[];
+    pullResult: import("../src/ports.js").SafePullResult;
+  };
+} {
+  const state = {
+    pushes: [] as string[],
+    deleted: [] as string[][],
+    pulls: [] as string[],
+    pullResult: initial.pullResult ?? {
+      ok: true as const,
+      pulled: true as const,
+      branch: "main",
+      submodulesUpdated: true,
+    },
     ...(initial.failPush !== undefined ? { failPush: initial.failPush } : {}),
     ...(initial.failDelete !== undefined
       ? { failDelete: initial.failDelete }
@@ -496,6 +514,14 @@ function createRemoteGit(
           throw new Error(`delete remote failed for ${branchNames.join(", ")}`);
         }
         state.deleted.push([...branchNames]);
+      },
+      safePullBranch: async (branchName) => {
+        state.pulls.push(branchName);
+        const r = state.pullResult;
+        if (r.ok && "branch" in r) {
+          return { ...r, branch: branchName };
+        }
+        return { ...r, branch: branchName };
       },
     },
   };
@@ -4577,9 +4603,11 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
       cleanedLocal: true,
       cleanedRemote: true,
       parentSpecClosed: true,
+      localPull: { pulled: true, branch: "main" },
     });
     expect(workspace.state.cleanupCalls).toEqual([42]);
     expect(remoteGit.state.deleted).toHaveLength(1);
+    expect(remoteGit.state.pulls).toEqual(["main"]);
     const deleted = remoteGit.state.deleted[0] ?? [];
     expect(deleted).toContain("matt-auto/42/integration");
     expect(deleted).toContain("matt-auto/42/ticket-43/r1");
@@ -4593,7 +4621,7 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
       tracker.state.closeIssueComments.some(
         (c) =>
           c.number === 42 &&
-          c.comment.includes("git pull") &&
+          c.comment.includes("fast-forwarded") &&
           c.comment.includes("/reload"),
       ),
     ).toBe(true);

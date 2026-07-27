@@ -2077,6 +2077,13 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
           "parentSpecCloseWarning" in result
             ? result.parentSpecCloseWarning
             : undefined;
+        const localPull =
+          "localPull" in result ? result.localPull : undefined;
+        const pullMsg = localPull?.pulled
+          ? `Local branch ${localPull.branch} fast-forwarded to origin${localPull.submodulesUpdated ? " (submodules updated)" : ""}. Please /reload Pi.`
+          : localPull?.skipped
+            ? `Auto-pull skipped (${localPull.reason ?? "unsafe"}). Run git pull manually if needed, then /reload Pi.`
+            : "Please git pull on the Workflow root and /reload Pi to pick up merged work.";
         ui.notify(
           [
             `Workflow cleanup completed for #${result.workflowId}.`,
@@ -2088,14 +2095,14 @@ function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
               : parentClosed === false
                 ? `Parent Workflow spec #${result.workflowId} was not closed${parentWarn ? `: ${parentWarn}` : ""}. Close it manually if needed.`
                 : undefined,
-            "Please git pull on the Workflow root and /reload Pi to pick up merged work.",
+            pullMsg,
             result.removedBranches?.length
               ? `Branches: ${result.removedBranches.join(", ")}.`
               : undefined,
           ]
             .filter(Boolean)
             .join(" "),
-          parentClosed === false ? "warning" : "info",
+          parentClosed === false || localPull?.skipped ? "warning" : "info",
         );
         return;
       }

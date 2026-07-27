@@ -4262,16 +4262,67 @@ export function createWorkflowCoordinator(
     await bound.preferences.clearActiveWorkflowId(active.targetBranch);
     invalidatePanelCaches();
 
+    // Safe local pull of target branch when worktree allows (FF-only).
+    // Soft-skip dirty/wrong-branch/non-FF — never fail cleanup over pull.
+    let localPull:
+      | {
+          pulled: boolean;
+          skipped?: boolean;
+          branch: string;
+          reason?: string;
+          submodulesUpdated?: boolean;
+        }
+      | undefined;
+    try {
+      const pull = await bound.remoteGit.safePullBranch(active.targetBranch);
+      if (pull.ok && pull.pulled) {
+        localPull = {
+          pulled: true,
+          branch: pull.branch,
+          ...(pull.submodulesUpdated !== undefined
+            ? { submodulesUpdated: pull.submodulesUpdated }
+            : {}),
+        };
+      } else if (pull.ok && !pull.pulled) {
+        localPull = {
+          pulled: false,
+          skipped: true,
+          branch: pull.branch,
+          reason: pull.reason,
+        };
+      } else {
+        localPull = {
+          pulled: false,
+          skipped: true,
+          branch: pull.branch,
+          reason: pull.reason,
+        };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      localPull = {
+        pulled: false,
+        skipped: true,
+        branch: active.targetBranch,
+        reason: message,
+      };
+    }
+
     // Close parent Workflow spec (Workflow ID) — part of delivery completion.
     // Soft-fail: artifacts are already gone; do not fail cleanup if close fails.
     let parentSpecClosed = false;
     let parentSpecCloseWarning: string | undefined;
+    const pullLine = localPull?.pulled
+      ? `Workflow root fast-forwarded to origin/${localPull.branch}${localPull.submodulesUpdated ? " (submodules updated)" : ""}. Please /reload Pi to pick up the merged work.`
+      : localPull?.skipped
+        ? `Auto-pull skipped (${localPull.reason ?? "unsafe"}). Please \`git pull\` on the Workflow root and /reload Pi when ready.`
+        : "Please `git pull` on the Workflow root and `/reload` Pi so your session picks up the merged work.";
     const closeComment = [
       `Workflow #${active.workflowId} cleanup completed.`,
       active.workflowPr
         ? `Workflow PR #${active.workflowPr.number}${active.workflowPr.url ? ` (${active.workflowPr.url})` : ""} merged; local workspaces/transcripts and remote matt-auto branches removed.`
         : `Local workspaces/transcripts and remote matt-auto branches removed.`,
-      "Please `git pull` on the Workflow root and `/reload` Pi so your session picks up the merged work.",
+      pullLine,
     ].join("\n\n");
     try {
       await bound.tracker.closeIssue(active.workflowId, {
@@ -4295,6 +4346,7 @@ export function createWorkflowCoordinator(
       ...(parentSpecCloseWarning
         ? { parentSpecCloseWarning }
         : {}),
+      ...(localPull ? { localPull } : {}),
       ...(active.workflowPr
         ? {
             workflowPrNumber: active.workflowPr.number,
