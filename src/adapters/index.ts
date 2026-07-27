@@ -1,5 +1,7 @@
 export {
+  COMMON_DEFAULT_BRANCH_CANDIDATES,
   createEnvironmentPort,
+  detectDefaultBranchName,
   resolveGitRoot,
 } from "./environment.js";
 export {

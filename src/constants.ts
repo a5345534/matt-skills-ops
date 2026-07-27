@@ -1,4 +1,5 @@
 /** Default Target branch when no Workflow-root override is configured. */
+/** Fallback when preferences and git detection both yield nothing. */
 export const DEFAULT_TARGET_BRANCH = "main";
 
 /**

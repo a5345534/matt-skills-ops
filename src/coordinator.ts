@@ -634,9 +634,16 @@ export function createWorkflowCoordinator(
 
   async function resolveTargetBranch(
     preferences: RootScopedPorts["preferences"],
+    environment?: RootScopedPorts["environment"],
   ): Promise<string> {
     const configured = await preferences.getConfiguredTargetBranch();
-    return configured ?? DEFAULT_TARGET_BRANCH;
+    if (configured) return configured;
+    // Auto-detect primary branch (origin/HEAD → main/master/…) when unset.
+    if (environment) {
+      const detected = await environment.detectDefaultBranch();
+      if (detected) return detected;
+    }
+    return DEFAULT_TARGET_BRANCH;
   }
 
   /**
@@ -752,7 +759,7 @@ export function createWorkflowCoordinator(
     bound: RootScopedPorts,
     options: { force?: boolean } = {},
   ): Promise<ActiveWorkflow | undefined> {
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
     const hint = await bound.preferences.getActiveWorkflowId(targetBranch);
     const cacheKey = `${targetBranch}:${hint ?? ""}`;
     const now = Date.now();
@@ -1443,7 +1450,7 @@ export function createWorkflowCoordinator(
       return preflightCache.result;
     }
 
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
 
     const [
       hasGitHubRemote,
@@ -1537,7 +1544,7 @@ export function createWorkflowCoordinator(
           description: CREATE_SPEC_ACTION.description,
         },
       ];
-      const targetBranch = await resolveTargetBranch(bound.preferences);
+      const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
       if (
         lastCompletedWorkflow &&
         lastCompletedWorkflow.targetBranch === targetBranch
@@ -2004,7 +2011,7 @@ export function createWorkflowCoordinator(
 
     // decision === "publish"
     const draft = current.draft;
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
     const workerProfile = await resolveWorkerProfile(bound);
     if (!workerProfile) {
       return {
@@ -2168,7 +2175,7 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
     const manifest: WorkflowManifest = {
       schema: WORKFLOW_MANIFEST_SCHEMA,
       version: 1,
@@ -2292,7 +2299,7 @@ export function createWorkflowCoordinator(
       active.workflowId,
       ticketNumber,
     );
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
     // Dependents branch from the Integration branch after successful units.
     const baseRef = active.integrationBranch ?? targetBranch;
     const rootPath = selectedPath ?? ports.startPath;
@@ -2761,7 +2768,7 @@ export function createWorkflowCoordinator(
     if (event.code === 0 || event.code === null) {
       try {
         const active = await loadActiveWorkflow(bound);
-        const targetBranch = await resolveTargetBranch(bound.preferences);
+        const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
         const baseRef =
           active?.integrationBranch && active.integrationBranch.length > 0
             ? active.integrationBranch
@@ -3116,7 +3123,7 @@ export function createWorkflowCoordinator(
         };
       }
 
-      const targetBranch = await resolveTargetBranch(bound.preferences);
+      const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
       const expectedIntegrationBranch = integrationBranchName(unit.workflowId);
 
       let integrationWorkspace: { branchName: string; worktreePath: string };
@@ -4115,7 +4122,7 @@ export function createWorkflowCoordinator(
 
     // Dual-root: publish + re-check submodule pointers before merge (#30).
     try {
-      const targetBranch = await resolveTargetBranch(bound.preferences);
+      const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
       const integrationWorkspace =
         await bound.workspace.ensureIntegrationWorkspace({
           workflowId: active.workflowId,
@@ -4410,7 +4417,7 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const targetBranch = await resolveTargetBranch(bound.preferences);
+    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
     if (
       !lastCompletedWorkflow ||
       lastCompletedWorkflow.targetBranch !== targetBranch

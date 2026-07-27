@@ -69,6 +69,7 @@ function createEnvironment(
     hasGitHubRemote: async () => true,
     isGhAuthenticated: async () => true,
     targetBranchExists: async () => true,
+    detectDefaultBranch: async () => "main",
     ...overrides,
   };
 }

@@ -21,6 +21,12 @@ export type EnvironmentPort = {
   isGhAuthenticated(): Promise<boolean>;
   /** Whether the given branch exists locally or on a remote. */
   targetBranchExists(branch: string): Promise<boolean>;
+  /**
+   * Best-effort default branch for this Workflow root when preferences do not
+   * set Target branch: origin/HEAD, then common names that exist (main/master/…).
+   * Undefined when nothing can be detected.
+   */
+  detectDefaultBranch(): Promise<string | undefined>;
 };
 
 /**

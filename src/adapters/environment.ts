@@ -58,27 +58,78 @@ export function createEnvironmentPort(cwd: string): EnvironmentPort {
     },
 
     async targetBranchExists(branch: string) {
-      const local = await run(cwd, "git", [
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        branch,
-      ]);
-      if (local.code === 0) return true;
+      return branchExistsLocallyOrOrigin(cwd, branch);
+    },
 
-      const remoteRef = await run(cwd, "git", [
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        `refs/remotes/origin/${branch}`,
-      ]);
-      if (remoteRef.code === 0) return true;
-
-      // Avoid git ls-remote (network) on every menu open. If the branch is not
-      // known locally, treat it as missing and let the user fetch/create it.
-      return false;
+    async detectDefaultBranch() {
+      return detectDefaultBranchName(cwd);
     },
   };
+}
+
+async function branchExistsLocallyOrOrigin(
+  cwd: string,
+  branch: string,
+): Promise<boolean> {
+  const local = await run(cwd, "git", [
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    branch,
+  ]);
+  if (local.code === 0) return true;
+
+  const remoteRef = await run(cwd, "git", [
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `refs/remotes/origin/${branch}`,
+  ]);
+  if (remoteRef.code === 0) return true;
+
+  // Avoid git ls-remote (network) on every menu open. If the branch is not
+  // known locally, treat it as missing and let the user fetch/create it.
+  return false;
+}
+
+/** Common default branch names, preferred order when origin/HEAD is missing. */
+export const COMMON_DEFAULT_BRANCH_CANDIDATES = [
+  "main",
+  "master",
+  "trunk",
+  "develop",
+] as const;
+
+/**
+ * Detect the repo's primary branch without preferences:
+ * 1) symbolic-ref origin/HEAD (e.g. refs/remotes/origin/master)
+ * 2) first common name that exists locally or as origin/*
+ */
+export async function detectDefaultBranchName(
+  cwd: string,
+): Promise<string | undefined> {
+  const sym = await run(cwd, "git", [
+    "symbolic-ref",
+    "--quiet",
+    "refs/remotes/origin/HEAD",
+  ]);
+  if (sym.code === 0) {
+    const ref = sym.stdout.trim();
+    // refs/remotes/origin/main  or  origin/main
+    const match =
+      /^refs\/remotes\/origin\/(.+)$/.exec(ref) ??
+      /^origin\/(.+)$/.exec(ref);
+    if (match?.[1] && match[1].length > 0) {
+      return match[1];
+    }
+  }
+
+  for (const name of COMMON_DEFAULT_BRANCH_CANDIDATES) {
+    if (await branchExistsLocallyOrOrigin(cwd, name)) {
+      return name;
+    }
+  }
+  return undefined;
 }
 
 /** Resolve the nearest enclosing Git repository root, or cwd if not in a repo. */
