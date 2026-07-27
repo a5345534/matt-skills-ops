@@ -264,6 +264,16 @@ function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
   return lines;
 }
 
+/** Keep conflict reasons short in the brief — multi-page git dump can stall/crash the TUI. */
+export function formatIntegrationReasonForBrief(
+  reason: string,
+  maxLen = 180,
+): string {
+  const oneLine = reason.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return `${oneLine.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
 function integrationSection(
   integration: WorkflowPanelState["integration"],
 ): RunBriefSection | undefined {
@@ -273,7 +283,9 @@ function integrationSection(
     `  branch: ${integration.branchName}`,
   ];
   if (integration.reason) {
-    lines.push(`  reason: ${integration.reason}`);
+    lines.push(
+      `  reason: ${formatIntegrationReasonForBrief(integration.reason)}`,
+    );
   }
   return {
     id: "integration",
