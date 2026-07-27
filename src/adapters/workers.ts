@@ -218,9 +218,14 @@ export function createWorkersPort(): WorkersPort {
         input.prompt,
       ];
 
+      // Mark workers so home-session policy (prefer /matt-auto for delivery)
+      // is not injected into implement/conflict prompts.
+      const workerRole = input.workerId.startsWith("conflict-")
+        ? "conflict-worker"
+        : "implementation-worker";
       const child = spawn("pi", args, {
         cwd: input.worktreePath,
-        env: { ...process.env },
+        env: { ...process.env, MATT_AUTO_ROLE: workerRole },
         stdio: ["ignore", "pipe", "pipe"],
       });
 

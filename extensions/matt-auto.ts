@@ -34,6 +34,10 @@ import {
   type SkillsHost,
 } from "../src/adapters/index.js";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
+import {
+  appendImplementationRoutingPolicy,
+  isMattAutoWorkerProcess,
+} from "../src/policy/implementation-routing.js";
 import type { WorkflowCoordinator } from "../src/types.js";
 import {
   presentMainMenu,
@@ -381,6 +385,15 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         if (assistantTexts.length > 50) assistantTexts.shift();
       }
     }
+  });
+
+  // Workflow home only: bias multi-ticket delivery toward /matt-auto without
+  // editing Matt skill files. Workers skip via MATT_AUTO_ROLE.
+  pi.on("before_agent_start", async (event) => {
+    if (isMattAutoWorkerProcess()) return undefined;
+    return {
+      systemPrompt: appendImplementationRoutingPolicy(event.systemPrompt),
+    };
   });
 
   function ensureCoordinator(
