@@ -113,6 +113,12 @@ type ImplementationAttemptHistory = {
   implementCompleted: boolean;
   disposition?: ImplementationDispositionDecision;
   integrationFailedReason?: string;
+  /** Restored from integration-unit-conflict / conflict-resolution-launch. */
+  integrationConflict?: {
+    integrationBranch: string;
+    integrationWorktreePath: string;
+    message: string;
+  };
   integrationComplete: boolean;
   summary?: string;
   headSha?: string;
@@ -129,6 +135,13 @@ function analyzeImplementationAttemptEvents(
   let implementCompleted = false;
   let disposition: ImplementationDispositionDecision | undefined;
   let integrationFailedReason: string | undefined;
+  let integrationConflict:
+    | {
+        integrationBranch: string;
+        integrationWorktreePath: string;
+        message: string;
+      }
+    | undefined;
   let integrationComplete = false;
   let summary: string | undefined;
   let headSha: string | undefined;
@@ -142,6 +155,7 @@ function analyzeImplementationAttemptEvents(
       implementCompleted = false;
       disposition = undefined;
       integrationFailedReason = undefined;
+      integrationConflict = undefined;
       summary = undefined;
       headSha = undefined;
       continue;
@@ -218,6 +232,58 @@ function analyzeImplementationAttemptEvents(
       continue;
     }
 
+    // Merge conflict path: ticket still needs Integration (Retry / conflict worker).
+    if (type === "integration-unit-conflict") {
+      disposition = "close";
+      implementCompleted = true;
+      integrationComplete = false;
+      integrationFailedReason =
+        typeof e.reason === "string"
+          ? e.reason
+          : "Integration unit conflict";
+      continue;
+    }
+
+    if (type === "conflict-resolution-launch") {
+      disposition = "close";
+      implementCompleted = true;
+      integrationComplete = false;
+      const branch =
+        typeof e.integrationBranch === "string"
+          ? e.integrationBranch
+          : undefined;
+      const worktree =
+        typeof e.integrationWorktreePath === "string"
+          ? e.integrationWorktreePath
+          : undefined;
+      const message =
+        typeof e.message === "string"
+          ? e.message
+          : (integrationFailedReason ?? "Merge conflict");
+      if (branch && worktree) {
+        integrationConflict = {
+          integrationBranch: branch,
+          integrationWorktreePath: worktree,
+          message,
+        };
+      }
+      if (!integrationFailedReason) {
+        integrationFailedReason = message;
+      }
+      continue;
+    }
+
+    if (type === "conflict-resolution-failed") {
+      disposition = "close";
+      implementCompleted = true;
+      integrationComplete = false;
+      integrationFailedReason =
+        typeof e.reason === "string"
+          ? e.reason
+          : "Conflict resolution failed";
+      continue;
+    }
+
     if (
       type === "integration-unit-completed" ||
       type === "integration-unit-complete" ||
@@ -226,6 +292,7 @@ function analyzeImplementationAttemptEvents(
       implementCompleted = false;
       disposition = undefined;
       integrationFailedReason = undefined;
+      integrationConflict = undefined;
       integrationComplete = true;
       summary = undefined;
       headSha = undefined;
@@ -239,6 +306,7 @@ function analyzeImplementationAttemptEvents(
     ...(integrationFailedReason !== undefined
       ? { integrationFailedReason }
       : {}),
+    ...(integrationConflict !== undefined ? { integrationConflict } : {}),
     ...(summary !== undefined ? { summary } : {}),
     ...(headSha !== undefined ? { headSha } : {}),
   };
@@ -696,11 +764,12 @@ export function createWorkflowCoordinator(
         attempt,
       );
 
-      // Prefer retrying a failed Integration over re-Implementing.
+      // Prefer retrying a failed / conflicted Integration over re-Implementing.
       if (
         history.disposition === "close" &&
         history.implementCompleted &&
-        history.integrationFailedReason
+        history.integrationFailedReason &&
+        !history.integrationComplete
       ) {
         pendingIntegration = {
           workflowId: active.workflowId,
@@ -709,6 +778,9 @@ export function createWorkflowCoordinator(
           branchName,
           worktreePath,
           lastFailure: history.integrationFailedReason,
+          ...(history.integrationConflict
+            ? { conflict: history.integrationConflict }
+            : {}),
         };
         implementationRecoveryCooldown.delete(ticketNumber);
         return;

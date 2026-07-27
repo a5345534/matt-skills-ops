@@ -3147,6 +3147,60 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
   });
 
+  it("recovers Retry Integration after submodule merge conflict (not re-Implement)", async () => {
+    // Mirrors Workflow #298 / #301: conflict worker died; new session must not
+    // offer Implement for a completed r1 awaiting Integration.
+    const attempts = new Map<string, number>([["42:43", 1]]);
+    const workspace = createWorkspace("/repo", { attempts });
+    const transcripts = createTranscripts();
+    const key = { workflowId: 42, ticketNumber: 43, attempt: 1 };
+    await transcripts.port.append(key, {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed", summary: "done" },
+    });
+    await transcripts.port.append(key, {
+      type: "disposition",
+      decision: "close",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-start",
+      ticketBranch: "matt-auto/42/ticket-43/r1",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-conflict",
+      reason:
+        "Merge conflict integrating matt-auto/42/ticket-43/r1 into matt-auto/42/integration: submodule aos-core",
+      phase: "merge",
+    });
+    await transcripts.port.append(key, {
+      type: "conflict-resolution-launch",
+      workerId: "conflict-42-43-r1",
+      skillCommand: "/resolving-merge-conflicts",
+      integrationBranch: "matt-auto/42/integration",
+      integrationWorktreePath: "/matt-auto-workspaces/42/integration",
+      message: "submodule aos-core conflict",
+    });
+
+    const { coordinator } = ticketsPublishedFixture({
+      workspace,
+      transcripts,
+    });
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+    expect(actions[0]?.description).toMatch(/submodule|conflict/i);
+
+    // Retry Integration re-enters the conflict path (does not re-Implement).
+    const retried = await coordinator.runNextAction(integrateTicketActionId(43));
+    expect(retried.status).toBe("running");
+    if (retried.status === "running") {
+      expect(retried.stage).toBe("integrate");
+      expect(retried.conflictResolution).toBe(true);
+    }
+  });
+
   it("aborts the session-owned worker cleanly and leaves GitHub state recoverable", async () => {
     const { coordinator, workers, tracker } = ticketsPublishedFixture();
 
