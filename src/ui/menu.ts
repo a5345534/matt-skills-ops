@@ -10,6 +10,7 @@ import {
   canPresentLiveWaitControls,
   presentLiveWaitControls,
 } from "./live-run-brief-controls.js";
+import { signalMattAutoComplete } from "./terminal-notify.js";
 import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
@@ -1539,6 +1540,13 @@ export async function runPostGrillPipeline(
     runControlFile: controlPath,
   });
 
+  // Set before each return so finally can fire a terminal/title completion signal
+  // (pi-notify only hooks agent_end — slash-command runs never get a bell otherwise).
+  let endSignal:
+    | { body: string; warning?: boolean; title?: string }
+    | undefined;
+
+  try {
   for (let step = 0; step < 50; step += 1) {
     // Out-of-band stop between stages (shortcuts + run-control file).
     const midRunControl =
@@ -1594,6 +1602,10 @@ export async function runPostGrillPipeline(
     if (coordinator.isRunTerminated()) {
       ui.notify("Run terminated — pipeline stopped.", "warning");
       log("info", "pipeline:stop", { reason: "run-terminated", step });
+      endSignal = {
+        body: "Matt Auto run terminated.",
+        warning: true,
+      };
       return;
     }
 
@@ -1606,6 +1618,10 @@ export async function runPostGrillPipeline(
           step,
           mode: waitResult.result.mode,
         });
+        endSignal = {
+          body: "Matt Auto run terminated.",
+          warning: true,
+        };
         return;
       }
       continue;
@@ -1622,6 +1638,10 @@ export async function runPostGrillPipeline(
     if (!preflight.ok) {
       ui.notify(summarizePreflightFailures(preflight), "warning");
       log("warn", "pipeline:stop", { reason: "preflight-failed", step });
+      endSignal = {
+        body: "Matt Auto preflight failed — see notice in session.",
+        warning: true,
+      };
       return;
     }
 
@@ -1672,6 +1692,10 @@ export async function runPostGrillPipeline(
       if (coordinator.isRunTerminated()) {
         ui.notify("Run terminated — pipeline stopped.", "warning");
         log("info", "pipeline:stop", { reason: "run-terminated", step });
+        endSignal = {
+          body: "Matt Auto run terminated.",
+          warning: true,
+        };
         return;
       }
       const waitResult = await waitForPipelineWorkers(coordinator, ui);
@@ -1681,6 +1705,10 @@ export async function runPostGrillPipeline(
           step,
           mode: waitResult.result.mode,
         });
+        endSignal = {
+          body: "Matt Auto run terminated.",
+          warning: true,
+        };
         return;
       }
       continue;
@@ -1780,17 +1808,29 @@ export async function runPostGrillPipeline(
       result.status === "compatibility-recovery"
     ) {
       ui.notify("Pipeline stopped.", "warning");
+      const detail =
+        "reason" in result && typeof result.reason === "string"
+          ? result.reason
+          : result.status;
       log("warn", "pipeline:stop", {
         reason: result.status,
         step,
         stage: "stage" in result ? result.stage : undefined,
         detail: "reason" in result ? result.reason : undefined,
       });
+      endSignal = {
+        body: `Matt Auto stopped: ${detail.slice(0, 160)}`,
+        warning: true,
+      };
       return;
     }
 
     // Workflow fully delivered — do not auto Create-spec / Follow-up next.
     if (result.status === "completed" && result.stage === "cleanup") {
+      const wf =
+        "workflowId" in result && typeof result.workflowId === "number"
+          ? result.workflowId
+          : undefined;
       ui.notify(
         "Workflow cleanup finished. Pipeline stopped — start Create-spec or Follow-up deliberately if needed.",
         "info",
@@ -1799,8 +1839,13 @@ export async function runPostGrillPipeline(
         reason: "workflow-complete",
         step,
         stage: "cleanup",
-        workflowId: "workflowId" in result ? result.workflowId : undefined,
+        workflowId: wf,
       });
+      endSignal = {
+        body: wf
+          ? `Workflow #${wf} complete (cleanup finished). Ready for next steps.`
+          : "Matt Auto workflow complete (cleanup finished).",
+      };
       return;
     }
 
@@ -1833,6 +1878,20 @@ export async function runPostGrillPipeline(
 
   ui.notify("Pipeline reached step limit — re-run /matt-auto run to continue.", "warning");
   log("warn", "pipeline:stop", { reason: "step-limit" });
+  endSignal = {
+    body: "Matt Auto pipeline reached step limit — re-run /matt-auto run.",
+    warning: true,
+  };
+  } finally {
+    if (endSignal) {
+      signalMattAutoComplete(ui, {
+        cwd: process.cwd(),
+        body: endSignal.body,
+        ...(endSignal.warning ? { warning: true } : {}),
+        ...(endSignal.title ? { title: endSignal.title } : {}),
+      });
+    }
+  }
 }
 
 async function resolveStageResult(

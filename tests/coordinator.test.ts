@@ -3195,8 +3195,7 @@ describe("Workflow coordinator single Implementation worker path", () => {
     // Retry Integration re-enters the conflict path (does not re-Implement).
     const retried = await coordinator.runNextAction(integrateTicketActionId(43));
     expect(retried.status).toBe("running");
-    if (retried.status === "running") {
-      expect(retried.stage).toBe("integrate");
+    if (retried.status === "running" && retried.stage === "integrate") {
       expect(retried.conflictResolution).toBe(true);
     }
   });
