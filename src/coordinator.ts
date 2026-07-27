@@ -3180,6 +3180,43 @@ export function createWorkflowCoordinator(
         };
       }
 
+      // Dual-root: publish ticket-branch submodule commits BEFORE merge.
+      // Git cannot merge gitlinks when the target SHA is missing from the object
+      // store / remote ("無法合併子模組 … 提交不存在").
+      const preMergePublish = await ensureSubmoduleGitlinksPublished(
+        unit.worktreePath,
+      );
+      if (!preMergePublish.ok) {
+        const reason = `Cannot integrate #${unit.ticketNumber}: ${preMergePublish.reason}`;
+        unit.lastFailure = reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason,
+          phase: "submodule-pre-merge-publish",
+          ...(preMergePublish.path
+            ? { submodulePath: preMergePublish.path }
+            : {}),
+          ...(preMergePublish.sha ? { submoduleSha: preMergePublish.sha } : {}),
+          ...(preMergePublish.remote
+            ? { submoduleRemote: preMergePublish.remote }
+            : {}),
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+        };
+      }
+      if (preMergePublish.published.length > 0) {
+        await bound.transcripts.append(transcriptKey, {
+          type: "submodule-publish",
+          phase: "pre-merge",
+          published: preMergePublish.published,
+        });
+      }
+
       // Local merge only — no push yet.
       const mergeResult = await bound.workspace.mergeIntoIntegration({
         workflowId: unit.workflowId,
