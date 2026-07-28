@@ -66,6 +66,21 @@ export {
   discoverLocalVerificationCommands,
 } from "./verification.js";
 export { createRemoteGitPort } from "./remote-git.js";
+export {
+  COORDINATION_REF_PREFIX,
+  InMemoryCoordinationStore,
+  assertCoordinationLeaseKey,
+  coordinationLeaseRefName,
+  createCoordinationPort,
+  createFakeCoordinationPort,
+  createInMemoryCoordinationPort,
+  createInMemoryCoordinationStore,
+  workerCapacityPolicyRefName,
+} from "./coordination.js";
+export type {
+  CoordinationPortOptions,
+  InMemoryCoordinationPortOptions,
+} from "./coordination.js";
 export { createCiPort } from "./ci.js";
 export {
   ensureSubmoduleGitlinksPublished,

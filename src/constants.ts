@@ -9,6 +9,16 @@ export const DEFAULT_TARGET_BRANCH = "main";
 export const DEFAULT_WORKER_CONCURRENCY = 2;
 
 /**
+ * Default lifetime for a renewable remote coordination lease. The coordinator
+ * renews well before this TTL; expiry allows a crashed Workflow home to be
+ * safely reclaimed through a fenced conditional ref update.
+ */
+export const DEFAULT_COORDINATION_LEASE_TTL_MS = 60_000;
+
+/** Recommended cadence for renewing a live coordination lease. */
+export const DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
  * Concurrency warning threshold for the configure UI.
  * Setting N above this shows a one-time confirmation; run-time filling does not re-prompt.
  * Fixed for this slice (initially four).
