@@ -326,6 +326,10 @@ type ActiveImplementationWorker = {
    * Absent only for transcript-recovered attempts created before this metadata.
    */
   workerProfile?: WorkerProfile;
+  /** Pi agent turns observed for this active worker process. */
+  turnCount?: number;
+  /** Epoch ms of Pi's most recent turn_start event. */
+  lastTurnStartedAtMs?: number;
   progress?: string;
   summary?: string;
   /** OS pid of the `pi --mode json` child when known. */
@@ -350,6 +354,10 @@ type ActiveConflictWorker = {
   status: ImplementationWorkerStatus;
   /** Exact model profile used for this launched conflict-resolution attempt. */
   workerProfile?: WorkerProfile;
+  /** Pi agent turns observed for this active conflict worker process. */
+  turnCount?: number;
+  /** Epoch ms of Pi's most recent turn_start event. */
+  lastTurnStartedAtMs?: number;
   progress?: string;
   /** OS pid of the conflict-resolution child when known. */
   pid?: number;
@@ -2682,6 +2690,7 @@ export function createWorkflowCoordinator(
       worktreePath: workspace.worktreePath,
       status: "running",
       workerProfile: { ...workerProfile.profile },
+      turnCount: 0,
       startedAtMs: Date.now(),
       receivedStageResult: false,
     };
@@ -2811,6 +2820,14 @@ export function createWorkflowCoordinator(
     };
     await bound.transcripts.append(transcriptKey, event);
 
+    if (event.type === "turn-start") {
+      if (worker.status === "running") {
+        worker.turnCount = (worker.turnCount ?? 0) + 1;
+        worker.lastTurnStartedAtMs = event.timestampMs;
+      }
+      return;
+    }
+
     if (event.type === "progress") {
       // Progress only mutates the addressed running worker (never worker B via A).
       if (worker.status === "running") {
@@ -2911,6 +2928,14 @@ export function createWorkflowCoordinator(
       attempt: worker.attempt,
     };
     await bound.transcripts.append(transcriptKey, event);
+
+    if (event.type === "turn-start") {
+      if (worker.status === "running") {
+        worker.turnCount = (worker.turnCount ?? 0) + 1;
+        worker.lastTurnStartedAtMs = event.timestampMs;
+      }
+      return;
+    }
 
     if (event.type === "progress") {
       worker.progress = event.message;
@@ -3422,6 +3447,7 @@ export function createWorkflowCoordinator(
       integrationWorktreePath: conflict.integrationWorktreePath,
       status: "running",
       workerProfile: { ...workerProfile.profile },
+      turnCount: 0,
       startedAtMs: Date.now(),
       receivedStageResult: false,
     };
@@ -5211,6 +5237,8 @@ export function createWorkflowCoordinator(
       worktreePath: string;
       status: ImplementationWorkerStatus;
       workerProfile?: WorkerProfile;
+      turnCount?: number;
+      lastTurnStartedAtMs?: number;
       progress?: string;
       pid?: number;
       startedAtMs?: number;
@@ -5249,6 +5277,12 @@ export function createWorkflowCoordinator(
       entry.processAlive = runtime?.alive ?? false;
     } else if (runtime) {
       entry.processAlive = runtime.alive;
+    }
+    if (typeof worker.turnCount === "number") {
+      entry.turnCount = worker.turnCount;
+    }
+    if (typeof worker.lastTurnStartedAtMs === "number") {
+      entry.lastTurnStartedAtMs = worker.lastTurnStartedAtMs;
     }
     if (worker.progress) {
       entry.progress = worker.progress;
@@ -5331,6 +5365,12 @@ export function createWorkflowCoordinator(
                 ...(worker.workerProfile
                   ? { workerProfile: worker.workerProfile }
                   : {}),
+                ...(typeof worker.turnCount === "number"
+                  ? { turnCount: worker.turnCount }
+                  : {}),
+                ...(typeof worker.lastTurnStartedAtMs === "number"
+                  ? { lastTurnStartedAtMs: worker.lastTurnStartedAtMs }
+                  : {}),
                 startedAtMs: worker.startedAtMs,
                 ...(worker.progress ? { progress: worker.progress } : {}),
                 ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
@@ -5351,6 +5391,15 @@ export function createWorkflowCoordinator(
                   status: activeConflictWorker.status,
                   ...(activeConflictWorker.workerProfile
                     ? { workerProfile: activeConflictWorker.workerProfile }
+                    : {}),
+                  ...(typeof activeConflictWorker.turnCount === "number"
+                    ? { turnCount: activeConflictWorker.turnCount }
+                    : {}),
+                  ...(typeof activeConflictWorker.lastTurnStartedAtMs === "number"
+                    ? {
+                        lastTurnStartedAtMs:
+                          activeConflictWorker.lastTurnStartedAtMs,
+                      }
                     : {}),
                   startedAtMs: activeConflictWorker.startedAtMs,
                   ...(activeConflictWorker.progress

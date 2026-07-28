@@ -367,7 +367,19 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       }
     | undefined;
   let planningSession: PlanningSession | undefined;
+  /**
+   * Esc dismissed a paused run back to chat. The coordinator is still alive,
+   * but its foreground run loop returned; `/matt-auto resume` must restart it.
+   */
+  let pausedRunDismissed = false;
   const assistantTexts: string[] = [];
+
+  const markPipelineStarted = () => {
+    pausedRunDismissed = false;
+  };
+  const markPausedRunDismissed = () => {
+    pausedRunDismissed = true;
+  };
 
   const skillsHost = createSkillsHost(
     () => activeUi,
@@ -430,6 +442,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       void coordinator.abortWorkers();
     }
 
+    pausedRunDismissed = false;
     logger = createMattAutoLogger(cwd);
     setMenuLogger(logger);
     logger.info("coordinator:bind", { cwd });
@@ -470,6 +483,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     boundModelRegistry = undefined;
     activeUi = undefined;
     planningSession = undefined;
+    pausedRunDismissed = false;
     assistantTexts.length = 0;
   });
 
@@ -699,7 +713,10 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
 
       try {
         if (subcommand === "" || subcommand === "menu") {
-          await presentMainMenu(active, ui);
+          await presentMainMenu(active, ui, {
+            onPipelineStarted: markPipelineStarted,
+            onPausedDismissed: markPausedRunDismissed,
+          });
           return;
         }
 
@@ -709,8 +726,12 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         }
 
         if (subcommand === "run") {
+          pausedRunDismissed = false;
           ui.notify(`Matt Auto log: ${logger.filePath()}`, "info");
-          await runPostGrillPipeline(active, ui);
+          await runPostGrillPipeline(active, ui, {
+            onPipelineStarted: markPipelineStarted,
+            onPausedDismissed: markPausedRunDismissed,
+          });
           return;
         }
 
@@ -720,6 +741,26 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           const controlPath = runControlFilePath(ctx.cwd);
           if (active.isRunTerminated()) {
             ui.notify("Run is already terminated.", "info");
+            return;
+          }
+          // Esc returned a paused run to chat, so no foreground wait loop
+          // remains to consume a control file. Keep termination explicitly
+          // confirmed here rather than silently leaving an unreachable pause.
+          if (pausedRunDismissed && active.isPipelinePaused()) {
+            const confirmed = await ui.select(
+              "Terminate paused Matt Auto run?",
+              ["Confirm Terminate", "Cancel"],
+            );
+            if (confirmed !== "Confirm Terminate") {
+              ui.notify("Terminate cancelled — pipeline remains paused.", "info");
+              return;
+            }
+            const result = await active.terminateRun();
+            pausedRunDismissed = false;
+            ui.notify(
+              `Run terminated (${result.mode}). Aborted ${result.abortedWorkerCount} worker(s).`,
+              "warning",
+            );
             return;
           }
           // Always write the control file so an in-flight wait loop can see it
@@ -780,8 +821,21 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
             ui.notify("Pipeline is not paused.", "info");
             return;
           }
+          const restartDismissedRun = pausedRunDismissed;
           await active.resumePipeline();
-          ui.notify("Pipeline resumed.", "info");
+          pausedRunDismissed = false;
+          if (!restartDismissedRun) {
+            ui.notify("Pipeline resumed.", "info");
+            return;
+          }
+          ui.notify(
+            "Pipeline resumed. Restarting orchestration (attempt reuse preferred).",
+            "info",
+          );
+          await runPostGrillPipeline(active, ui, {
+            onPipelineStarted: markPipelineStarted,
+            onPausedDismissed: markPausedRunDismissed,
+          });
           return;
         }
 

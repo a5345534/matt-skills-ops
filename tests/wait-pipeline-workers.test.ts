@@ -711,6 +711,17 @@ describe("waitForPipelineWorkers", () => {
     expect(result).toEqual({ status: "settled" });
   });
 
+  it("returns paused when Esc cancels a paused fallback control menu", async () => {
+    const ui = mockUi(); // select() returns undefined, equivalent to Esc.
+    const result = await waitForPipelineWorkers(
+      controlCoordinator(() => basePanel({ pipelinePaused: true })),
+      ui,
+      { pollIntervalMs: 1, maxTicks: 5, sleep: async () => undefined },
+    );
+    expect(result).toEqual({ status: "paused" });
+    expect(ui.notices.some((n) => n.includes("/matt-auto resume"))).toBe(true);
+  });
+
   it("defaults to a select menu with Keep waiting / Pause / Terminate (not shortcuts-only)", async () => {
     const ui = mockUi();
     const coordinator = controlCoordinator(() =>

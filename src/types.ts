@@ -266,6 +266,10 @@ export type WorkflowPanelState = {
      * Frozen at launch, so it remains accurate if the configured profile changes.
      */
     workerProfile?: WorkerProfile;
+    /** Number of Pi agent turns observed since this worker launched. */
+    turnCount?: number;
+    /** Epoch ms when Pi emitted the most recent `turn_start` for this worker. */
+    lastTurnStartedAtMs?: number;
     /** OS pid of the `pi --mode json` child when known. */
     pid?: number;
     worktreePath?: string;
@@ -359,9 +363,15 @@ export type RunTerminationResult = {
 
 /**
  * Worker protocol events derived from a worker's Pi JSON event stream.
- * Carries progress and Stage results only — no GitHub mutation authority.
+ * Carries turn telemetry, progress, and Stage results only — no GitHub mutation authority.
  */
 export type WorkerProtocolEvent =
+  | {
+      /** One Pi agent turn began; timestamp comes from Pi's JSON event stream. */
+      type: "turn-start";
+      workerId: string;
+      timestampMs: number;
+    }
   | {
       type: "progress";
       workerId: string;

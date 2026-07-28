@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildRunBriefViewModel,
   deriveContextLabel,
+  formatLastTurnStartedAt,
   formatRunBriefLines,
   formatRuntimeMs,
   predictRunTerminationMode,
@@ -41,6 +42,7 @@ describe("buildRunBriefViewModel", () => {
             modelId: "gpt-5.6-terra",
             thinkingLevel: "max",
           },
+          turnCount: 4,
           progress: "Running tests",
         },
       ],
@@ -124,6 +126,7 @@ describe("buildRunBriefViewModel", () => {
     // Ticket table present → Workers is a single progress line (no path dump).
     expect(byId.workers?.lines).toEqual([
       "#43 r2: running · model=openai-codex/gpt-5.6-terra:max — Running tests",
+      "  turns: 4 · last turn: —",
     ]);
     expect(byId.integration?.lines).toEqual([
       "#44 r1: pending-retry",
@@ -257,6 +260,12 @@ describe("buildRunBriefViewModel", () => {
       "Last stop: run termination",
       "Termination mode: discard unintegrated attempts",
     ]);
+  });
+
+  it("formats latest worker turn with a stable timestamp and age", () => {
+    expect(formatLastTurnStartedAt(1_700_000_000_000, 1_700_000_065_000)).toBe(
+      "22:13:20Z (1m05s ago)",
+    );
   });
 
   it("shows total run elapsed on the Pipeline section", () => {

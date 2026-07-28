@@ -509,6 +509,53 @@ describe("runPostGrillPipeline fill slots then wait", () => {
     expect(new Set(state.integrations).size).toBe(state.integrations.length);
   });
 
+  it("returns to chat when a paused wait is dismissed and marks it resumable", async () => {
+    const notices: string[] = [];
+    const pausedPanel: WorkflowPanelState = {
+      workflowId: 42,
+      title: "Paused run",
+      lines: ["Workflow #42"],
+      workers: [],
+      pipelinePaused: true,
+    };
+    const coordinator = {
+      beginPipelineRun: () => undefined,
+      isRunTerminated: () => false,
+      isPipelinePaused: () => true,
+      isAutoAdvanceBlocked: () => true,
+      getPanelState: async () => pausedPanel,
+      pausePipeline: async () => ({
+        abortedWorkerCount: 0,
+        affectedAttempts: [],
+        pipelinePaused: true as const,
+      }),
+      resumePipeline: async () => ({ pipelinePaused: false as const }),
+      terminateRun: async () => ({
+        mode: "stop-only" as const,
+        abortedWorkerCount: 0,
+        affectedAttempts: [],
+        discardedBranches: [],
+        discardedWorktrees: [],
+        runTerminated: true as const,
+      }),
+    } as unknown as WorkflowCoordinator;
+    const ui: MattAutoUi = {
+      // Esc / cancel in the fallback paused control menu.
+      select: async () => undefined,
+      notify: (message) => notices.push(message),
+    };
+    let dismissed = false;
+
+    await runPostGrillPipeline(coordinator, ui, {
+      onPausedDismissed: () => {
+        dismissed = true;
+      },
+    });
+
+    expect(dismissed).toBe(true);
+    expect(notices.some((n) => n.includes("/matt-auto resume"))).toBe(true);
+  });
+
   it("waits when slots are full instead of offering overflow implements", async () => {
     const { coordinator, state } = createRunLoopFake({
       concurrency: 2,

@@ -2841,6 +2841,11 @@ describe("Workflow coordinator single Implementation worker path", () => {
 
     await coordinator.runNextAction(implementTicketActionId(43));
     await workers.emit("implement-42-43-r1", {
+      type: "turn-start",
+      workerId: "implement-42-43-r1",
+      timestampMs: 1_700_000_000_000,
+    });
+    await workers.emit("implement-42-43-r1", {
       type: "progress",
       workerId: "implement-42-43-r1",
       message: "Running tests",
@@ -2855,6 +2860,8 @@ describe("Workflow coordinator single Implementation worker path", () => {
         status: "running",
         progress: "Running tests",
         workerProfile: defaultWorkerProfile,
+        turnCount: 1,
+        lastTurnStartedAtMs: 1_700_000_000_000,
         branchName: "matt-auto/42/ticket-43/r1",
         workerId: "implement-42-43-r1",
         pid: 4242,

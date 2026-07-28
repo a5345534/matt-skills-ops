@@ -64,6 +64,39 @@ export function formatWorkerModel(
   return `${provider}/${modelId}:${thinkingLevel}`;
 }
 
+/** Exact UTC clock time plus live elapsed age for Pi's latest turn_start. */
+export function formatLastTurnStartedAt(
+  timestampMs: number | undefined,
+  nowMs = Date.now(),
+): string {
+  if (
+    typeof timestampMs !== "number" ||
+    !Number.isFinite(timestampMs) ||
+    timestampMs < 0
+  ) {
+    return "—";
+  }
+  const date = new Date(timestampMs);
+  if (!Number.isFinite(date.getTime())) return "—";
+  const clock = date.toISOString().slice(11, 19);
+  return `${clock}Z (${formatRuntimeMs(Math.max(0, nowMs - timestampMs))} ago)`;
+}
+
+/** Per-worker Pi turn telemetry; never sums concurrent worker conversations. */
+export function formatWorkerTurnSummary(worker: PanelWorker): string | undefined {
+  if (
+    typeof worker.turnCount !== "number" &&
+    typeof worker.lastTurnStartedAtMs !== "number"
+  ) {
+    return undefined;
+  }
+  const turns =
+    typeof worker.turnCount === "number" && worker.turnCount >= 0
+      ? String(worker.turnCount)
+      : "—";
+  return `turns: ${turns} · last turn: ${formatLastTurnStartedAt(worker.lastTurnStartedAtMs)}`;
+}
+
 export type BuildRunBriefOptions = {
   /**
    * When true, omit the textual Controls section (live custom UI already hosts
@@ -260,17 +293,22 @@ function workersSection(
 function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
   const head = `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`;
   const model = formatWorkerModel(worker.workerProfile);
+  const turnSummary = formatWorkerTurnSummary(worker);
   if (compact) {
     // Paths/ids live in logs; table already shows status/runtime.
     const withModel = model ? `${head} · model=${model}` : head;
-    if (worker.progress) {
-      return [`${withModel} — ${worker.progress}`];
-    }
-    return [withModel];
+    const lines = [
+      worker.progress ? `${withModel} — ${worker.progress}` : withModel,
+    ];
+    if (turnSummary) lines.push(`  ${turnSummary}`);
+    return lines;
   }
   const lines = [head];
   if (model) {
     lines.push(`  model: ${model}`);
+  }
+  if (turnSummary) {
+    lines.push(`  ${turnSummary}`);
   }
   if (worker.workerId) {
     lines.push(`  workerId: ${worker.workerId}`);
@@ -555,7 +593,8 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
       id: "controls",
       title: "Controls",
       lines: [
-        "Paused — use the select menu: Resume pipeline… / Terminate run…",
+        "Paused — Resume pipeline… / Terminate run…; Esc returns to chat",
+        "Resume later: /matt-auto resume",
         "Shell fallback: echo terminate-now > .pi/matt-auto/run-control",
       ],
     };

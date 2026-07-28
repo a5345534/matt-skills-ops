@@ -25,7 +25,9 @@ export type LiveWaitControlChoice =
   | { action: "settled" }
   | { action: "pause" }
   | { action: "terminate" }
-  | { action: "resume" };
+  | { action: "resume" }
+  /** Esc on a paused surface: return to chat while preserving pause state. */
+  | { action: "dismissed" };
 
 /** Minimal custom-UI surface from Pi extension context. */
 export type LiveWaitCustomUi = {
@@ -64,6 +66,10 @@ function isSettled(panel: WorkflowPanelState | undefined): boolean {
   return true;
 }
 
+function canDismissPausedLiveWait(panel: WorkflowPanelState): boolean {
+  return panel.pipelinePaused === true;
+}
+
 function controlItems(panel: WorkflowPanelState): SelectItem[] {
   if (panel.pipelinePaused) {
     return [
@@ -97,6 +103,7 @@ function makeSelectList(
   panel: WorkflowPanelState,
   theme: LiveWaitTheme,
   onPick: (action: "pause" | "terminate" | "resume") => void,
+  onCancel: () => void,
 ): SelectList {
   const list = new SelectList(controlItems(panel), 4, {
     selectedPrefix: (t) => theme.fg("accent", t),
@@ -108,8 +115,7 @@ function makeSelectList(
   list.onSelect = (item) => {
     onPick(item.value as "pause" | "terminate" | "resume");
   };
-  // Esc keeps the live surface open (unlike blocking select cancel).
-  list.onCancel = () => undefined;
+  list.onCancel = onCancel;
   return list;
 }
 
@@ -151,9 +157,20 @@ export async function presentLiveWaitControls(
         done(choice);
       };
 
-      let selectList = makeSelectList(panel, theme, (action) => {
-        finish({ action });
-      });
+      const dismissIfPaused = () => {
+        // Esc is a safe dismissal only after Pause has aborted all workers.
+        // The coordinator remains paused; `/matt-auto resume` can restart it.
+        if (canDismissPausedLiveWait(panel)) finish({ action: "dismissed" });
+      };
+
+      let selectList = makeSelectList(
+        panel,
+        theme,
+        (action) => {
+          finish({ action });
+        },
+        dismissIfPaused,
+      );
 
       const title = new Text(
         theme.fg(
@@ -165,11 +182,12 @@ export async function presentLiveWaitControls(
         1,
         0,
       );
-      const help = new Text(
-        theme.fg(
-          "dim",
-          "Brief auto-refreshes · ↑↓ / Enter pick control · Esc stays here",
-        ),
+      const helpText = (paused: boolean) =>
+        paused
+          ? "Paused · Esc returns to chat · resume later: /matt-auto resume"
+          : "Brief auto-refreshes · ↑↓ / Enter pick control · Esc stays here";
+      let help = new Text(
+        theme.fg("dim", helpText(panel.pipelinePaused)),
         1,
         0,
       );
@@ -204,9 +222,19 @@ export async function presentLiveWaitControls(
           const nowPaused = panel.pipelinePaused === true;
           if (nowPaused !== wasPaused) {
             wasPaused = nowPaused;
-            selectList = makeSelectList(panel, theme, (action) => {
-              finish({ action });
-            });
+            selectList = makeSelectList(
+              panel,
+              theme,
+              (action) => {
+                finish({ action });
+              },
+              dismissIfPaused,
+            );
+            help = new Text(
+              theme.fg("dim", helpText(nowPaused)),
+              1,
+              0,
+            );
           }
 
           // Outer wait loop is blocked on this custom() — drive title/OSC here.
@@ -279,4 +307,8 @@ export function canPresentLiveWaitControls(
   return typeof ui.custom === "function";
 }
 
-export const __liveWaitTestables = { isSettled, controlItems };
+export const __liveWaitTestables = {
+  isSettled,
+  controlItems,
+  canDismissPausedLiveWait,
+};

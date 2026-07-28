@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { __workersTestables } from "../src/adapters/workers.js";
 
 // Re-test parsing behavior via a minimal reimplementation of the public contract:
 // message_end with embedded stage-result JSON should be recoverable.
@@ -11,6 +12,22 @@ import { describe, expect, it } from "vitest";
 // strings the prompt requires remain parseable as top-level JSON.
 
 describe("worker stage-result protocol JSON", () => {
+  it("maps Pi turn_start to worker turn telemetry", () => {
+    const event = __workersTestables.parseWorkerProtocolEvent(
+      "implement-42-19-r1",
+      JSON.stringify({
+        type: "turn_start",
+        turnIndex: 3,
+        timestamp: 1_700_000_000_000,
+      }),
+    );
+    expect(event).toEqual({
+      type: "turn-start",
+      workerId: "implement-42-19-r1",
+      timestampMs: 1_700_000_000_000,
+    });
+  });
+
   it("parses completed stage-result as top-level JSON", () => {
     const line = JSON.stringify({
       type: "stage-result",

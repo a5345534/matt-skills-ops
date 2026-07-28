@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { __liveWaitTestables } from "../src/ui/live-run-brief-controls.js";
 import type { WorkflowPanelState } from "../src/types.js";
 
-const { isSettled, controlItems } = __liveWaitTestables;
+const { isSettled, controlItems, canDismissPausedLiveWait } =
+  __liveWaitTestables;
 
 function panel(
   overrides: Partial<WorkflowPanelState> = {},
@@ -39,7 +40,13 @@ describe("live wait helpers", () => {
   it("offers Pause/Terminate while running and Resume when paused", () => {
     const running = controlItems(panel());
     expect(running.map((i) => i.value)).toEqual(["pause", "terminate"]);
-    const paused = controlItems(panel({ pipelinePaused: true }));
-    expect(paused.map((i) => i.value)).toEqual(["resume", "terminate"]);
+    const paused = panel({ pipelinePaused: true });
+    expect(controlItems(paused).map((i) => i.value)).toEqual([
+      "resume",
+      "terminate",
+    ]);
+    // Esc is an exit only after workers were paused; running live waits stay put.
+    expect(canDismissPausedLiveWait(panel())).toBe(false);
+    expect(canDismissPausedLiveWait(paused)).toBe(true);
   });
 });

@@ -240,6 +240,8 @@ function consumePendingWaitControl(): PipelineWaitControlRequest | undefined {
 /** How the run-brief wait loop ended. */
 export type WaitForPipelineWorkersResult =
   | { status: "settled" }
+  /** Paused safely; the live brief was dismissed with Esc. */
+  | { status: "paused" }
   | { status: "terminated"; result: RunTerminationResult }
   | { status: "timeout" };
 
@@ -390,6 +392,8 @@ function panelWorkerSnapshot(panel: WorkflowPanelState | undefined) {
       worktreePath: w.worktreePath,
       transcriptPath: w.transcriptPath,
       branchName: w.branchName,
+      turnCount: w.turnCount,
+      lastTurnStartedAtMs: w.lastTurnStartedAtMs,
       progress: w.progress,
     })) ?? []
   );
@@ -423,6 +427,7 @@ async function applyQueuedWaitControl(
   | { action: "continue" }
   | { action: "paused" }
   | { action: "resumed" }
+  | { action: "dismissed" }
   | { action: "terminated"; result: RunTerminationResult }
   | { action: "unchanged" }
 > {
@@ -608,6 +613,7 @@ async function presentRunBriefControlMenu(
   | { action: "continue" }
   | { action: "paused" }
   | { action: "resumed" }
+  | { action: "dismissed" }
   | { action: "terminated"; result: RunTerminationResult }
   | { action: "unchanged" }
 > {
@@ -623,7 +629,10 @@ async function presentRunBriefControlMenu(
     options,
   );
 
-  if (selected === undefined || selected === CONTINUE_WAITING_ITEM) {
+  if (selected === undefined) {
+    return paused ? { action: "dismissed" } : { action: "continue" };
+  }
+  if (selected === CONTINUE_WAITING_ITEM) {
     return { action: "continue" };
   }
 
@@ -843,6 +852,17 @@ export async function waitForPipelineWorkers(
               activity.tick(activityDetailFromPanel(p));
             },
           });
+          if (live.action === "dismissed") {
+            ui.notify(
+              `Pipeline remains paused for Workflow #${panel.workflowId}. Resume later with /matt-auto resume.`,
+              "info",
+            );
+            log("info", "pipeline:pause-dismissed", {
+              workflowId: panel.workflowId,
+              via: "esc",
+            });
+            return { status: "paused" };
+          }
           if (live.action === "resume") {
             await applyConfirmedResume(controls, ui, panel);
             continue;
@@ -866,6 +886,17 @@ export async function waitForPipelineWorkers(
           notifyRunBrief(ui, latest, "warning");
           ui.notify(formatTerminateNotify(control.result), "warning");
           return { status: "terminated", result: control.result };
+        }
+        if (control.action === "dismissed") {
+          ui.notify(
+            `Pipeline remains paused for Workflow #${panel.workflowId}. Resume later with /matt-auto resume.`,
+            "info",
+          );
+          log("info", "pipeline:pause-dismissed", {
+            workflowId: panel.workflowId,
+            via: "select-cancel",
+          });
+          return { status: "paused" };
         }
         if (control.action === "resumed") {
           continue;
@@ -932,6 +963,8 @@ export async function waitForPipelineWorkers(
           worktreePath: w.worktreePath,
           transcriptPath: w.transcriptPath,
           branchName: w.branchName,
+          turnCount: w.turnCount,
+          lastTurnStartedAtMs: w.lastTurnStartedAtMs,
           progress: w.progress,
         })),
         briefSections: brief.sections.map((s) => s.id),
@@ -1388,6 +1421,7 @@ export function buildMainMenuItems(
 export async function presentMainMenu(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
+  pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
   for (;;) {
     const currentRoot = await coordinator.currentRoot();
@@ -1452,7 +1486,7 @@ export async function presentMainMenu(
     }
 
     if (selected === RUN_PIPELINE_ITEM) {
-      await runPostGrillPipeline(coordinator, ui);
+      await runPostGrillPipeline(coordinator, ui, pipelineOptions);
       continue;
     }
 
@@ -1534,6 +1568,21 @@ export async function handleNextAction(
   return result;
 }
 
+export type RunPostGrillPipelineOptions = {
+  /** Called when a foreground pipeline loop starts or restarts. */
+  onPipelineStarted?: () => void;
+  /** Called when Esc dismisses a paused live brief back to chat. */
+  onPausedDismissed?: () => void;
+};
+
+function handlePausedWaitDismissal(
+  options: RunPostGrillPipelineOptions,
+  step: number,
+): void {
+  options.onPausedDismissed?.();
+  log("info", "pipeline:stop", { reason: "pause-dismissed", step });
+}
+
 /**
  * Post-grill automation entry: drive Create-spec → Create-tickets → implement…
  * Auto-publishes planning drafts and auto-closes implementation dispositions.
@@ -1541,14 +1590,17 @@ export async function handleNextAction(
  * (e.g. several implement tickets) or when workers are still running.
  *
  * Operator Pause / Resume / Terminate are owned by the full-screen run brief
- * wait surface (with confirmation). Terminate exits this loop cleanly.
+ * wait surface (with confirmation). Esc may dismiss a paused surface to chat;
+ * the extension retains the same coordinator for `/matt-auto resume`.
  */
 export async function runPostGrillPipeline(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
+  options: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
   // Clear prior pause / termination so this run can auto-advance.
   coordinator.beginPipelineRun();
+  options.onPipelineStarted?.();
   // Drop any stale stop request from a previous run / shortcut.
   await readAndClearRunControlFile(process.cwd());
   clearPipelineWaitControlQueue();
@@ -1651,6 +1703,10 @@ export async function runPostGrillPipeline(
         };
         return;
       }
+      if (waitResult.status === "paused") {
+        handlePausedWaitDismissal(options, step);
+        return;
+      }
       continue;
     }
 
@@ -1704,6 +1760,10 @@ export async function runPostGrillPipeline(
           });
           return;
         }
+        if (waitResult.status === "paused") {
+          handlePausedWaitDismissal(options, step);
+          return;
+        }
         continue;
       }
       ui.notify(
@@ -1736,6 +1796,10 @@ export async function runPostGrillPipeline(
           body: "Matt Auto run terminated.",
           warning: true,
         };
+        return;
+      }
+      if (waitResult.status === "paused") {
+        handlePausedWaitDismissal(options, step);
         return;
       }
       continue;
@@ -1775,6 +1839,10 @@ export async function runPostGrillPipeline(
                 step,
                 mode: waitResult.result.mode,
               });
+              return;
+            }
+            if (waitResult.status === "paused") {
+              handlePausedWaitDismissal(options, step);
               return;
             }
             continue;

@@ -33,7 +33,7 @@ function runtimeOf(workerId: string, entry: Running): WorkerRuntimeInfo {
   };
 }
 
-function parseStageResultFromLine(
+function parseWorkerProtocolEvent(
   workerId: string,
   line: string,
 ): WorkerProtocolEvent | undefined {
@@ -45,6 +45,21 @@ function parseStageResultFromLine(
   }
   if (!parsed || typeof parsed !== "object") return undefined;
   const obj = parsed as Record<string, unknown>;
+
+  // Pi JSON print mode emits turn_start before every agent turn. Preserve the
+  // source timestamp so the dashboard can distinguish a slow turn from a
+  // worker that is making regular progress.
+  if (obj.type === "turn_start") {
+    const timestamp = obj.timestamp;
+    return {
+      type: "turn-start",
+      workerId,
+      timestampMs:
+        typeof timestamp === "number" && Number.isFinite(timestamp)
+          ? timestamp
+          : Date.now(),
+    };
+  }
 
   // Matt Auto Worker protocol Stage result (structured custom event).
   if (obj.type === "matt-auto.stage-result" || obj.type === "stage-result") {
@@ -150,7 +165,7 @@ function extractEmbeddedStageResult(
         if (!/stage-result/i.test(slice)) continue;
         try {
           const parsed = JSON.parse(slice) as Record<string, unknown>;
-          const synthetic = parseStageResultFromLine(
+          const synthetic = parseWorkerProtocolEvent(
             workerId,
             JSON.stringify(parsed),
           );
@@ -169,6 +184,8 @@ function extractEmbeddedStageResult(
  * Implementation workers run in an Implementation workspace; Conflict resolution
  * workers run in the Integration workspace. Neither receives remote-write authority.
  */
+export const __workersTestables = { parseWorkerProtocolEvent };
+
 export function createWorkersPort(): WorkersPort {
   const running = new Map<string, Running>();
 
@@ -190,7 +207,7 @@ export function createWorkersPort(): WorkersPort {
         let line = entry.buffer.slice(0, newline);
         entry.buffer = entry.buffer.slice(newline + 1);
         if (line.endsWith("\r")) line = line.slice(0, -1);
-        const event = parseStageResultFromLine(workerId, line);
+        const event = parseWorkerProtocolEvent(workerId, line);
         if (event) {
           void deliver(entry, event);
         }
