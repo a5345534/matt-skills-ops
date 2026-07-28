@@ -478,6 +478,8 @@ export function createWorkflowCoordinator(
     string,
     CompletedWorkerTelemetry
   >();
+  /** Transcript attempts already hydrated into the session-local telemetry cache. */
+  const recoveredCompletedWorkerTranscriptKeys = new Set<string>();
 
   function completedWorkerTelemetryKey(input: {
     workflowId: number;
@@ -486,6 +488,23 @@ export function createWorkflowCoordinator(
     kind: CompletedWorkerTelemetry["kind"];
   }): string {
     return `${input.workflowId}:${input.ticketNumber}:${input.attempt}:${input.kind}`;
+  }
+
+  function transcriptAttemptKey(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+  }): string {
+    return `${input.workflowId}:${input.ticketNumber}:${input.attempt}`;
+  }
+
+  function rememberCompletedWorkerTelemetry(
+    telemetry: CompletedWorkerTelemetry,
+  ): boolean {
+    const key = completedWorkerTelemetryKey(telemetry);
+    if (completedWorkerTelemetryByAttempt.has(key)) return false;
+    completedWorkerTelemetryByAttempt.set(key, telemetry);
+    return true;
   }
 
   function recordCompletedWorkerTelemetry(
@@ -497,24 +516,181 @@ export function createWorkflowCoordinator(
       turnCount?: number;
     },
     kind: CompletedWorkerTelemetry["kind"],
-  ): void {
+  ): CompletedWorkerTelemetry | undefined {
     // Historical/recovered workers have no observed turn count; never invent one.
-    if (typeof worker.turnCount !== "number") return;
-    const key = completedWorkerTelemetryKey({
-      workflowId: worker.workflowId,
-      ticketNumber: worker.ticketNumber,
-      attempt: worker.attempt,
-      kind,
-    });
-    if (completedWorkerTelemetryByAttempt.has(key)) return;
-    completedWorkerTelemetryByAttempt.set(key, {
+    if (typeof worker.turnCount !== "number") return undefined;
+    const completedAtMs = Date.now();
+    const telemetry: CompletedWorkerTelemetry = {
       workflowId: worker.workflowId,
       ticketNumber: worker.ticketNumber,
       attempt: worker.attempt,
       kind,
       turnCount: worker.turnCount,
-      runtimeMs: Math.max(0, Date.now() - worker.startedAtMs),
+      startedAtMs: worker.startedAtMs,
+      completedAtMs,
+      runtimeMs: Math.max(0, completedAtMs - worker.startedAtMs),
+    };
+    return rememberCompletedWorkerTelemetry(telemetry) ? telemetry : undefined;
+  }
+
+  async function persistCompletedWorkerTelemetry(
+    bound: RootScopedPorts,
+    transcriptKey: {
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+    },
+    workerId: string,
+    telemetry: CompletedWorkerTelemetry | undefined,
+  ): Promise<void> {
+    if (!telemetry) return;
+    if (
+      typeof telemetry.startedAtMs !== "number" ||
+      typeof telemetry.completedAtMs !== "number" ||
+      typeof telemetry.runtimeMs !== "number"
+    ) {
+      return;
+    }
+    await bound.transcripts.append(transcriptKey, {
+      type: "worker-telemetry-completed",
+      workerId,
+      ...telemetry,
     });
+  }
+
+  function isNonNegativeFiniteNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+  }
+
+  function telemetryFromTranscriptEvent(
+    raw: unknown,
+    expected: {
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+    },
+  ): CompletedWorkerTelemetry | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const event = raw as Record<string, unknown>;
+    if (event.type !== "worker-telemetry-completed") return undefined;
+    if (
+      event.workflowId !== expected.workflowId ||
+      event.ticketNumber !== expected.ticketNumber ||
+      event.attempt !== expected.attempt ||
+      (event.kind !== "implementation" && event.kind !== "conflict-resolution") ||
+      !Number.isInteger(event.turnCount) ||
+      !isNonNegativeFiniteNumber(event.turnCount) ||
+      !isNonNegativeFiniteNumber(event.startedAtMs) ||
+      !isNonNegativeFiniteNumber(event.completedAtMs) ||
+      !isNonNegativeFiniteNumber(event.runtimeMs)
+    ) {
+      return undefined;
+    }
+    if (
+      Math.max(0, event.completedAtMs - event.startedAtMs) !== event.runtimeMs
+    ) {
+      return undefined;
+    }
+    return {
+      workflowId: expected.workflowId,
+      ticketNumber: expected.ticketNumber,
+      attempt: expected.attempt,
+      kind: event.kind,
+      turnCount: event.turnCount,
+      startedAtMs: event.startedAtMs,
+      completedAtMs: event.completedAtMs,
+      runtimeMs: event.runtimeMs,
+    };
+  }
+
+  function legacyImplementationTurnTelemetry(
+    events: readonly unknown[],
+    key: { workflowId: number; ticketNumber: number; attempt: number },
+  ): CompletedWorkerTelemetry | undefined {
+    const history = analyzeImplementationAttemptEvents(events);
+    if (!history.implementCompleted && !history.integrationComplete) {
+      return undefined;
+    }
+
+    const launchEvents = events.filter((raw) => {
+      if (!raw || typeof raw !== "object") return false;
+      const event = raw as Record<string, unknown>;
+      return event.type === "worker-launch" && typeof event.workerId === "string";
+    }) as Array<Record<string, unknown>>;
+    // Multiple launch records make historical per-process attribution ambiguous.
+    if (launchEvents.length !== 1) return undefined;
+    const workerId = launchEvents[0]!.workerId as string;
+    const turnCount = events.filter((raw) => {
+      if (!raw || typeof raw !== "object") return false;
+      const event = raw as Record<string, unknown>;
+      return (
+        event.type === "turn-start" &&
+        event.workerId === workerId &&
+        isNonNegativeFiniteNumber(event.timestampMs)
+      );
+    }).length;
+
+    // Legacy transcripts lack exact launch/completion timestamps: preserve only
+    // the directly observed turn count and leave runtime absent rather than infer it.
+    return {
+      ...key,
+      kind: "implementation",
+      turnCount,
+    };
+  }
+
+  async function recoverCompletedWorkerTelemetryFromTranscripts(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<void> {
+    const ticketNumbers = new Set<number>([
+      ...(active.tickets ?? []),
+      ...(active.integratedTickets ?? []).map((ticket) => ticket.number),
+    ]);
+
+    for (const ticketNumber of ticketNumbers) {
+      let latestAttempt: number;
+      try {
+        latestAttempt = await bound.workspace.latestAttempt(
+          active.workflowId,
+          ticketNumber,
+        );
+      } catch {
+        // Telemetry recovery must not block a workflow when local Git inspection fails.
+        continue;
+      }
+      for (let attempt = 1; attempt <= latestAttempt; attempt += 1) {
+        const key = {
+          workflowId: active.workflowId,
+          ticketNumber,
+          attempt,
+        };
+        const transcriptKey = transcriptAttemptKey(key);
+        if (recoveredCompletedWorkerTranscriptKeys.has(transcriptKey)) continue;
+        let events: readonly unknown[];
+        try {
+          events = await bound.transcripts.read(key);
+        } catch {
+          // A missing/corrupt local transcript is diagnostic-only, never a gate.
+          continue;
+        }
+        recoveredCompletedWorkerTranscriptKeys.add(transcriptKey);
+
+        let hasPersistedImplementationTelemetry = false;
+        for (const event of events) {
+          const telemetry = telemetryFromTranscriptEvent(event, key);
+          if (!telemetry) continue;
+          if (telemetry.kind === "implementation") {
+            hasPersistedImplementationTelemetry = true;
+          }
+          rememberCompletedWorkerTelemetry(telemetry);
+        }
+        if (!hasPersistedImplementationTelemetry) {
+          const legacy = legacyImplementationTurnTelemetry(events, key);
+          if (legacy) rememberCompletedWorkerTelemetry(legacy);
+        }
+      }
+    }
   }
 
   function getCompletedWorkerTelemetry(
@@ -689,6 +865,13 @@ export function createWorkflowCoordinator(
   }
 
   function bindRoot(rootPath: string): void {
+    if (
+      selectedPath &&
+      path.resolve(selectedPath) !== path.resolve(rootPath)
+    ) {
+      completedWorkerTelemetryByAttempt.clear();
+      recoveredCompletedWorkerTranscriptKeys.clear();
+    }
     selectedPath = rootPath;
     scoped = ports.forRoot(rootPath);
   }
@@ -1713,6 +1896,8 @@ export function createWorkflowCoordinator(
       }
       return actions;
     }
+
+    await recoverCompletedWorkerTelemetryFromTranscripts(bound, active);
 
     if (active.stage === "spec-published") {
       return [
@@ -2771,6 +2956,7 @@ export function createWorkflowCoordinator(
     await bound.transcripts.append(transcriptKey, {
       type: "worker-launch",
       workerId,
+      startedAtMs: worker.startedAtMs,
       branchName: workspace.branchName,
       worktreePath: workspace.worktreePath,
       skillCommand: prepared.skillCommand,
@@ -2912,7 +3098,16 @@ export function createWorkflowCoordinator(
         if (event.outcome.summary) {
           worker.summary = event.outcome.summary;
         }
-        recordCompletedWorkerTelemetry(worker, "implementation");
+        const telemetry = recordCompletedWorkerTelemetry(
+          worker,
+          "implementation",
+        );
+        await persistCompletedWorkerTelemetry(
+          bound,
+          transcriptKey,
+          worker.workerId,
+          telemetry,
+        );
         settleCompletedImplementationWorker(worker);
         return;
       }
@@ -2946,7 +3141,16 @@ export function createWorkflowCoordinator(
         });
         if (ahead.ahead) {
           worker.receivedStageResult = true;
-          recordCompletedWorkerTelemetry(worker, "implementation");
+          const telemetry = recordCompletedWorkerTelemetry(
+            worker,
+            "implementation",
+          );
+          await persistCompletedWorkerTelemetry(
+            bound,
+            transcriptKey,
+            worker.workerId,
+            telemetry,
+          );
           worker.summary =
             worker.progress ??
             `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
@@ -3013,7 +3217,16 @@ export function createWorkflowCoordinator(
     if (event.type === "stage-result") {
       worker.receivedStageResult = true;
       if (event.outcome.status === "completed") {
-        recordCompletedWorkerTelemetry(worker, "conflict-resolution");
+        const telemetry = recordCompletedWorkerTelemetry(
+          worker,
+          "conflict-resolution",
+        );
+        await persistCompletedWorkerTelemetry(
+          bound,
+          transcriptKey,
+          worker.workerId,
+          telemetry,
+        );
         worker.status = "completed";
         activeConflictWorker = undefined;
 
@@ -3525,6 +3738,7 @@ export function createWorkflowCoordinator(
     await bound.transcripts.append(transcriptKey, {
       type: "conflict-resolution-launch",
       workerId,
+      startedAtMs: worker.startedAtMs,
       skillCommand: prepared.skillCommand,
       integrationBranch: conflict.integrationBranch,
       integrationWorktreePath: conflict.integrationWorktreePath,
@@ -4398,6 +4612,8 @@ export function createWorkflowCoordinator(
           "Workflow cleanup runs after the Workflow PR merges. Merge the Workflow PR first.",
       };
     }
+
+    await recoverCompletedWorkerTelemetryFromTranscripts(bound, active);
 
     const branches = await bound.workspace.listWorkflowBranches(
       active.workflowId,
@@ -5400,6 +5616,8 @@ export function createWorkflowCoordinator(
     }
     if (!active) return undefined;
 
+    await recoverCompletedWorkerTelemetryFromTranscripts(bound, active);
+
     let progress: TicketProgressSummary | undefined;
     if (
       mode === "local" &&
@@ -5483,6 +5701,7 @@ export function createWorkflowCoordinator(
             ]
           : [];
 
+    const completedWorkerRuns = getCompletedWorkerTelemetry(active.workflowId);
     const lines = panelLines(
       active.workflowId,
       progress,
@@ -5495,6 +5714,9 @@ export function createWorkflowCoordinator(
       workers,
       pipelinePaused,
     };
+    if (completedWorkerRuns.length > 0) {
+      state.completedWorkerRuns = completedWorkerRuns;
+    }
     if (typeof pipelineRunStartedAtMs === "number") {
       state.runStartedAtMs = pipelineRunStartedAtMs;
       const endMs =

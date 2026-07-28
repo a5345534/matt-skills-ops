@@ -2748,6 +2748,7 @@ function ticketsPublishedFixture(
   const coordinator = createWorkflowCoordinator(ports);
   return {
     coordinator,
+    ports,
     tracker,
     workspace,
     workers,
@@ -2975,7 +2976,8 @@ describe("Workflow coordinator single Implementation worker path", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date("2026-07-28T08:00:00.000Z"));
-      const { coordinator, workers } = ticketsPublishedFixture();
+      const { coordinator, workers, ports } = ticketsPublishedFixture();
+      const startedAtMs = Date.now();
 
       coordinator.beginPipelineRun();
       await coordinator.runNextAction(implementTicketActionId(43));
@@ -3007,13 +3009,108 @@ describe("Workflow coordinator single Implementation worker path", () => {
         runtimeMs: 12_345,
       });
 
+      const transcript = await coordinator.getWorkerTranscript({
+        workflowId: 42,
+        ticketNumber: 43,
+        attempt: 1,
+      });
+      expect(transcript).toContainEqual({
+        type: "worker-telemetry-completed",
+        workerId: "implement-42-43-r1",
+        workflowId: 42,
+        ticketNumber: 43,
+        attempt: 1,
+        kind: "implementation",
+        turnCount: 2,
+        startedAtMs,
+        completedAtMs: startedAtMs + 12_345,
+        runtimeMs: 12_345,
+      });
+
       vi.advanceTimersByTime(60_000);
       expect(coordinator.getCompletedWorkerTelemetry(42)[0]?.runtimeMs).toBe(
         12_345,
       );
+
+      await coordinator.confirmDisposition("leave-open");
+      const panel = await coordinator.getPanelState();
+      expect(panel?.workers).toEqual([]);
+      expect(panel?.completedWorkerRuns).toMatchObject([
+        {
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          kind: "implementation",
+          turnCount: 2,
+          runtimeMs: 12_345,
+        },
+      ]);
+
+      const reloaded = createWorkflowCoordinator(ports);
+      const reloadedPanel = await reloaded.getPanelState();
+      expect(reloadedPanel?.completedWorkerRuns).toMatchObject([
+        {
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          kind: "implementation",
+          turnCount: 2,
+          startedAtMs,
+          completedAtMs: startedAtMs + 12_345,
+          runtimeMs: 12_345,
+        },
+      ]);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("recovers exact legacy turns without inventing runtime", async () => {
+    const { coordinator, workers, transcripts, ports } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "turn-start",
+      workerId: "implement-42-43-r1",
+      timestampMs: 1_700_000_000_000,
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "turn-start",
+      workerId: "implement-42-43-r1",
+      timestampMs: 1_700_000_010_000,
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: { status: "completed" },
+    });
+
+    const key = "42:43:r1";
+    transcripts.state.set(
+      key,
+      (transcripts.state.get(key) ?? []).filter(
+        (event) =>
+          !(
+            typeof event === "object" &&
+            event !== null &&
+            (event as { type?: string }).type === "worker-telemetry-completed"
+          ),
+      ),
+    );
+
+    const reloaded = createWorkflowCoordinator(ports);
+    const panel = await reloaded.getPanelState();
+    const legacy = panel?.completedWorkerRuns?.find(
+      (run) => run.ticketNumber === 43 && run.kind === "implementation",
+    );
+
+    expect(legacy).toMatchObject({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+      turnCount: 2,
+    });
+    expect(legacy?.runtimeMs).toBeUndefined();
   });
 
   it("supports Leave open and Investigate dispositions without remote writes", async () => {

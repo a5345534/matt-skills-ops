@@ -52,6 +52,10 @@ export type RunBriefViewModel = {
 
 type PanelWorker = WorkflowPanelState["workers"][number];
 
+type CompletedWorkerRun = NonNullable<
+  WorkflowPanelState["completedWorkerRuns"]
+>[number];
+
 /** Exact Pi model selector that was passed when a worker was launched. */
 export function formatWorkerModel(
   profile: PanelWorker["workerProfile"],
@@ -407,20 +411,21 @@ function workflowPrSection(
   };
 }
 
-/** Column widths for monospaced ticket table (S1 by #, five columns). */
+/** Column widths for monospaced ticket table (S1 by #, six columns). */
 const COL = {
   num: 6,
   ready: 18,
   runtime: 8,
+  turns: 8,
   status: 16,
-  title: 36,
+  title: 32,
 } as const;
 
 /**
  * List every workflow issue as an aligned table:
- * # | READY/BLOCK | RUNTIME | STATUS | TITLE
+ * # | READY/BLOCK | RUNTIME | TURNS | STATUS | TITLE
  * Sort: issue number ascending (S1).
- * RUNTIME: R1 current attempt elapsed (from panel worker.runtimeMs).
+ * Runtime/turns prefer a live worker, then the latest successful Implementation attempt.
  */
 function ticketsSection(
   panel: WorkflowPanelState,
@@ -476,6 +481,7 @@ export function formatTicketTableHeader(): string {
     padCell("#", COL.num),
     padCell("READY/BLOCK", COL.ready),
     padCell("RUNTIME", COL.runtime),
+    padCell("TURNS", COL.turns),
     padCell("STATUS", COL.status),
     padCell("TITLE", COL.title),
   ].join(" ");
@@ -486,6 +492,7 @@ export function formatTicketTableRule(): string {
     "-".repeat(COL.num),
     "-".repeat(COL.ready),
     "-".repeat(COL.runtime),
+    "-".repeat(COL.turns),
     "-".repeat(COL.status),
     "-".repeat(COL.title),
   ].join(" ");
@@ -525,6 +532,18 @@ function synthesizeItemsFromBuckets(
   return items.sort((a, b) => a.number - b.number);
 }
 
+function latestCompletedImplementationRun(
+  panel: WorkflowPanelState,
+  ticketNumber: number,
+): CompletedWorkerRun | undefined {
+  return (panel.completedWorkerRuns ?? [])
+    .filter(
+      (run) =>
+        run.ticketNumber === ticketNumber && run.kind === "implementation",
+    )
+    .sort((a, b) => b.attempt - a.attempt)[0];
+}
+
 export function formatTicketTableRow(
   item: NonNullable<
     WorkflowPanelState["ticketProgress"]
@@ -537,6 +556,9 @@ export function formatTicketTableRow(
       ? panel.integration
       : undefined;
   const ci = panel.ci?.find((c) => c.ticketNumber === item.number);
+  const completedRun = latestCompletedImplementationRun(panel, item.number);
+  const liveWorker = worker?.status === "running" ? worker : undefined;
+  const telemetry = liveWorker ?? completedRun ?? worker;
 
   // READY/BLOCK: tracker frontier only (not covered by running).
   let readyBlock = "—";
@@ -549,13 +571,15 @@ export function formatTicketTableRow(
     readyBlock = "ready"; // integrated open tickets were ready to implement
   }
 
-  // RUNTIME: R1 current attempt only.
-  const runtime = formatRuntimeMs(worker?.runtimeMs);
+  const runtime = formatRuntimeMs(telemetry?.runtimeMs);
+  const turns =
+    typeof telemetry?.turnCount === "number" ? String(telemetry.turnCount) : "—";
+  const attempt = telemetry?.attempt;
 
   // STATUS: lifecycle / live overlay.
   let status: string = item.status;
   if (item.status === "closed" || item.state === "CLOSED") {
-    status = "closed";
+    status = attempt === undefined ? "closed" : `closed r${attempt}`;
   } else if (worker) {
     if (worker.status === "needs-disposition") {
       status = `needs-disp r${worker.attempt}`;
@@ -583,6 +607,7 @@ export function formatTicketTableRow(
     padCell(`#${item.number}`, COL.num),
     padCell(readyBlock, COL.ready),
     padCell(runtime, COL.runtime),
+    padCell(turns, COL.turns),
     padCell(status, COL.status),
     padCell(title, COL.title),
   ].join(" ");

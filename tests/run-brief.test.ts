@@ -69,6 +69,16 @@ describe("buildRunBriefViewModel", () => {
           url: "https://example.test/ci/40",
         },
       ],
+      completedWorkerRuns: [
+        {
+          workflowId: 42,
+          ticketNumber: 40,
+          attempt: 1,
+          kind: "implementation",
+          turnCount: 7,
+          runtimeMs: 125_000,
+        },
+      ],
       workflowPr: {
         number: 99,
         status: "open",
@@ -150,11 +160,14 @@ describe("buildRunBriefViewModel", () => {
       "Summary: 1 ready / 3 open / 1 closed (total 4)",
     );
     expect(byId.tickets?.lines[1]).toMatch(/^#\s+READY\/BLOCK/);
+    expect(byId.tickets?.lines[1]).toContain("TURNS");
     expect(byId.tickets?.lines[2]).toMatch(/^-+/);
-    // Aligned table rows (S1 by number; R1 runtime only when worker present).
+    // Aligned table rows (S1 by number; completed attempts retain runtime/turns).
     const ticketBody = byId.tickets?.lines.slice(3).join("\n") ?? "";
     expect(ticketBody).toContain("#40");
-    expect(ticketBody).toContain("closed");
+    expect(ticketBody).toContain("2m05s");
+    expect(ticketBody).toContain("7");
+    expect(ticketBody).toContain("closed r1");
     expect(ticketBody).toContain("Closed ticket");
     expect(ticketBody).toContain("#41");
     expect(ticketBody).toMatch(/awaiting-ci|ci:awaiting/);
@@ -172,6 +185,45 @@ describe("buildRunBriefViewModel", () => {
     expect(brief.lines).toEqual(formatRunBriefLines(brief));
     expect(brief.lines.join("\n")).toContain("Workflow #42: Ship run brief");
     expect(brief.lines.join("\n")).not.toMatch(/\[x\]|click|button/i);
+  });
+
+  it("shows legacy transcript turns without inventing runtime", () => {
+    const brief = buildRunBriefViewModel(
+      basePanel({
+        completedWorkerRuns: [
+          {
+            workflowId: 42,
+            ticketNumber: 43,
+            attempt: 1,
+            kind: "implementation",
+            turnCount: 56,
+          },
+        ],
+        ticketProgress: {
+          workflowId: 42,
+          total: 1,
+          open: 0,
+          closed: 1,
+          ready: [],
+          blocked: [],
+          awaitingCi: [],
+          items: [
+            {
+              number: 43,
+              title: "Closed ticket",
+              state: "CLOSED",
+              status: "closed",
+            },
+          ],
+        },
+      }),
+    );
+
+    const row = brief.sections.find((section) => section.id === "tickets")?.lines[3];
+    expect(row).toContain("#43");
+    expect(row).toContain("56");
+    expect(row).toContain("closed r1");
+    expect(row).toContain("—");
   });
 
   it("omits optional rows gracefully when fields are missing", () => {

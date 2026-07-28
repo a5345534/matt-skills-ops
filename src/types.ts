@@ -284,6 +284,12 @@ export type WorkflowPanelState = {
      */
     runtimeMs?: number;
   }[];
+  /**
+   * Successful worker runs retained after they leave `workers`.
+   * Exact completion facts are local transcript-backed; legacy transcripts may
+   * contribute only directly observed turn counts and omit runtime.
+   */
+  completedWorkerRuns?: readonly CompletedWorkerTelemetry[];
   ticketProgress?: TicketProgressSummary;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */
   integration?: {
@@ -363,7 +369,8 @@ export type RunTerminationResult = {
 
 /**
  * Exact telemetry captured when a session-owned worker reports successful completion.
- * It is session-local: recovered historical attempts are never inferred.
+ * It is persisted locally in the attempt transcript and restored after reload.
+ * Legacy transcripts may supply only their directly observed turn count.
  */
 export type CompletedWorkerTelemetry = {
   workflowId: number;
@@ -372,8 +379,12 @@ export type CompletedWorkerTelemetry = {
   kind: "implementation" | "conflict-resolution";
   /** Native Pi `turn_start` events observed for this worker. */
   turnCount: number;
+  /** Exact launch time when retained by the completion transcript event. */
+  startedAtMs?: number;
+  /** Exact successful Stage-result time when retained by the transcript event. */
+  completedAtMs?: number;
   /** Frozen elapsed time from launch until the successful Stage result. */
-  runtimeMs: number;
+  runtimeMs?: number;
 };
 
 /**
