@@ -83,7 +83,10 @@ export function formatLastTurnStartedAt(
 }
 
 /** Per-worker Pi turn telemetry; never sums concurrent worker conversations. */
-export function formatWorkerTurnSummary(worker: PanelWorker): string | undefined {
+export function formatWorkerTurnSummary(
+  worker: PanelWorker,
+  nowMs = Date.now(),
+): string | undefined {
   if (
     typeof worker.turnCount !== "number" &&
     typeof worker.lastTurnStartedAtMs !== "number"
@@ -94,7 +97,7 @@ export function formatWorkerTurnSummary(worker: PanelWorker): string | undefined
     typeof worker.turnCount === "number" && worker.turnCount >= 0
       ? String(worker.turnCount)
       : "—";
-  return `turns: ${turns} · last turn: ${formatLastTurnStartedAt(worker.lastTurnStartedAtMs)}`;
+  return `turns: ${turns} · last turn: ${formatLastTurnStartedAt(worker.lastTurnStartedAtMs, nowMs)}`;
 }
 
 export type BuildRunBriefOptions = {
