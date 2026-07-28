@@ -955,8 +955,10 @@ export type WorkflowCoordinator = {
   /** Remove the Workflow-root Worker profile override (global default remains). */
   clearRootWorkerProfile(): Promise<void>;
   /**
-   * Effective Worker concurrency after Workflow-root → global → default (2) precedence.
-   * Always a positive integer; never writes to GitHub.
+   * Local effective Worker concurrency after Workflow-root → global → default
+   * (2) precedence. It seeds a repository worker-capacity policy once for a
+   * coordination-aware workflow; thereafter Implementation launch capacity is
+   * the GitHub-backed repository policy, not this per-checkout value.
    */
   getEffectiveWorkerConcurrency(): Promise<number>;
   /** Configured global default Worker concurrency (no root override). */

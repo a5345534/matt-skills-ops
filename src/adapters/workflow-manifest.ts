@@ -1,5 +1,7 @@
 import {
+  canonicalRepositoryIdentityKey,
   canonicalTargetIdentitiesEqual,
+  isCanonicalRepositoryIdentity,
   isCanonicalTargetIdentity,
   targetBranchFromRef,
   targetRefFromBranch,
@@ -10,6 +12,7 @@ import {
 } from "../constants.js";
 import type {
   ActiveWorkflow,
+  CanonicalRepositoryIdentity,
   CanonicalTargetIdentity,
   CoordinationWorkflowManifest,
   LegacyWorkflowManifest,
@@ -527,6 +530,43 @@ export function activeWorkflowsFromIssues(
       manifest.workflowId !== issue.number ||
       manifest.stage === "completed" ||
       !workflowManifestMatchesTarget(manifest, target)
+    ) {
+      continue;
+    }
+    active.set(
+      manifest.workflowId,
+      activeWorkflowFromManifest(manifest, issue.title),
+    );
+  }
+  return [...active.values()].sort(
+    (left, right) => left.workflowId - right.workflowId,
+  );
+}
+
+/**
+ * Reconstruct every coordination-aware Active workflow for a repository across
+ * Target branches. Version-one manifests intentionally remain out of this
+ * result: they use legacy local concurrency and cannot participate in remote
+ * repository worker-slot scheduling.
+ */
+export function coordinatedActiveWorkflowsFromIssues(
+  repository: CanonicalRepositoryIdentity,
+  issues: readonly WorkflowManifestIssue[],
+): ActiveWorkflow[] {
+  if (!isCanonicalRepositoryIdentity(repository)) return [];
+  const wanted = canonicalRepositoryIdentityKey(repository);
+  const active = new Map<number, ActiveWorkflow>();
+  for (const issue of issues) {
+    if (!isPositiveInteger(issue.number)) continue;
+    if (issue.state && issue.state.toUpperCase() !== "OPEN") continue;
+    const manifest = latestManifestFromComments(issue.comments);
+    if (
+      !manifest ||
+      manifest.version !== 2 ||
+      manifest.workflowId !== issue.number ||
+      manifest.stage === "completed" ||
+      canonicalRepositoryIdentityKey(manifest.coordination.target.repository) !==
+        wanted
     ) {
       continue;
     }

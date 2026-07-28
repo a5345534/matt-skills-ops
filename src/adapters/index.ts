@@ -47,6 +47,7 @@ export {
 export {
   activeWorkflowFromManifest,
   activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
   createTrackerPort,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
