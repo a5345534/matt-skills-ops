@@ -96,8 +96,8 @@ Example preferences:
 When Workflow preflight passes and there is no Active workflow, Next actions include **Create spec** (also the start of `/matt-auto run`):
 
 1. Matt Auto sends `/skill:to-spec` in **this Workflow home session** so the prior grill conversation stays in context.
-2. The skill is instructed **not** to publish to GitHub; it must emit a Matt Auto draft marker block.
-3. Empty / placeholder drafts are rejected (Compatibility recovery).
+2. The skill is instructed **not** to publish to GitHub; it returns one plain Markdown PRD (H1 title plus required H2 sections), never Matt Auto protocol markers.
+3. A fail-closed quality gate rejects empty / placeholder drafts, missing or thin required sections, fewer than three numbered User Stories, code fences, and any model-emitted protocol marker. Nothing is published on failure.
 4. **Manual menu**: Stage confirmation Publish / Revise / Cancel.
 5. **`/matt-auto run`**: auto-Publishes (no human Publish click).
 6. Publish creates a GitHub spec issue (Workflow ID) + Workflow manifest comment.

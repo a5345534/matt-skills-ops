@@ -10,6 +10,22 @@ const PLACEHOLDER_TITLES = new Set([
   "title from to-spec synthesis",
 ]);
 
+const REQUIRED_CREATE_SPEC_SECTIONS = [
+  "Problem Statement",
+  "Solution",
+  "User Stories",
+  "Implementation Decisions",
+  "Testing Decisions",
+  "Out of Scope",
+  "Further Notes",
+] as const;
+const MIN_USER_STORIES = 3;
+const MIN_SECTION_SUBSTANTIVE_CHARACTERS = 24;
+
+export type CreateSpecDraftValidation =
+  | { ok: true; draft: SpecDraft }
+  | { ok: false; issues: readonly string[] };
+
 /** True when a Create-spec draft is non-empty and not the Matt Auto editor placeholder. */
 export function isPublishableSpecDraft(draft: SpecDraft): boolean {
   const title = draft.title.trim();
@@ -25,6 +41,125 @@ export function isPublishableSpecDraft(draft: SpecDraft): boolean {
     .trim();
   if (withoutHeadings.length < 40) return false;
   return true;
+}
+
+/**
+ * Validate the plain Markdown response requested from `/skill:to-spec`.
+ *
+ * The model owns PRD content. Matt Auto owns validation and intentionally
+ * rejects model-emitted protocol markers rather than repairing their spelling.
+ */
+export function validateLatestCreateSpecMarkdown(
+  texts: readonly string[],
+): CreateSpecDraftValidation {
+  const latest = [...texts].reverse().find((text) => text.trim().length > 0);
+  return validateCreateSpecMarkdown(latest ?? "");
+}
+
+export function validateCreateSpecMarkdown(
+  text: string,
+): CreateSpecDraftValidation {
+  const trimmed = text.trim();
+  const issues: string[] = [];
+  if (containsSpecProtocolMarker(text)) {
+    issues.push("Model output must not contain Matt Auto protocol markers.");
+  }
+  if (/^\s*```/m.test(text)) {
+    issues.push("Model output must not contain fenced code blocks.");
+  }
+  if (!trimmed) {
+    return { ok: false, issues: [...issues, "Response is empty."] };
+  }
+
+  const lines = trimmed.split(/\r?\n/);
+  const firstContentIndex = lines.findIndex((line) => line.trim().length > 0);
+  const firstContent = lines[firstContentIndex]?.trim() ?? "";
+  const titleMatch = /^#(?!#)\s+(.+?)\s*#*\s*$/.exec(firstContent);
+  if (!titleMatch?.[1]) {
+    issues.push("First non-empty line must be one Markdown H1 title.");
+  }
+  const title = titleMatch?.[1]?.trim() ?? "";
+  const body =
+    firstContentIndex >= 0
+      ? lines.slice(firstContentIndex + 1).join("\n").trim()
+      : "";
+
+  const additionalH1 = lines
+    .slice(Math.max(firstContentIndex + 1, 0))
+    .some((line) => /^#(?!#)(?:\s|$)/.test(line.trim()));
+  if (additionalH1) {
+    issues.push("Response must contain exactly one Markdown H1 title.");
+  }
+
+  const sections = markdownH2Sections(lines);
+  for (const heading of REQUIRED_CREATE_SPEC_SECTIONS) {
+    const matches = sections.filter((section) => section.heading === heading);
+    if (matches.length === 0) {
+      issues.push(`Missing required section: ${heading}.`);
+      continue;
+    }
+    if (matches.length > 1) {
+      issues.push(`Required section appears more than once: ${heading}.`);
+      continue;
+    }
+    const content = sectionContent(lines, matches[0]!, sections);
+    if (substantiveCharacterCount(content) < MIN_SECTION_SUBSTANTIVE_CHARACTERS) {
+      issues.push(`Required section needs substantive content: ${heading}.`);
+    }
+    if (heading === "User Stories") {
+      const storyCount = content.filter((line) =>
+        /^\s*\d+\.\s+\S+/.test(line),
+      ).length;
+      if (storyCount < MIN_USER_STORIES) {
+        issues.push(
+          `User Stories must contain at least ${MIN_USER_STORIES} numbered stories.`,
+        );
+      }
+    }
+  }
+
+  const draft = { title, body };
+  if (title && body && !isPublishableSpecDraft(draft)) {
+    issues.push("Title or body is empty, a placeholder, or too short.");
+  }
+  return issues.length > 0 ? { ok: false, issues } : { ok: true, draft };
+}
+
+type MarkdownH2Section = { heading: string; lineIndex: number };
+
+function markdownH2Sections(lines: readonly string[]): MarkdownH2Section[] {
+  const sections: MarkdownH2Section[] = [];
+  for (const [lineIndex, line] of lines.entries()) {
+    const match = /^##\s+(.+?)\s*$/.exec(line.trim());
+    if (match?.[1]) {
+      sections.push({ heading: match[1].trim(), lineIndex });
+    }
+  }
+  return sections;
+}
+
+function sectionContent(
+  lines: readonly string[],
+  section: MarkdownH2Section,
+  sections: readonly MarkdownH2Section[],
+): string[] {
+  const next = sections.find(
+    (candidate) => candidate.lineIndex > section.lineIndex,
+  );
+  return lines.slice(section.lineIndex + 1, next?.lineIndex);
+}
+
+function substantiveCharacterCount(lines: readonly string[]): number {
+  return lines
+    .join("\n")
+    .replace(/^#{1,6}\s+.*$/gm, "")
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/[\s`*_~]/g, "")
+    .length;
+}
+
+function containsSpecProtocolMarker(text: string): boolean {
+  return text.includes("MATT-AUTO-SPEC-DRAFT");
 }
 
 /**
@@ -136,14 +271,18 @@ export function buildCreateSpecSkillPrompt(): string {
     "### Overrides for this Matt Auto run",
     "1. Do **NOT** create GitHub issues, run `gh`, publish, or label anything.",
     "2. Do **NOT** interview the user or wait for seam confirmation — choose the best seams and record them under Implementation Decisions.",
-    "3. Produce a complete PRD-quality body (Problem, Solution, extensive User Stories, Implementation Decisions, Testing Decisions, Out of Scope, Further Notes).",
-    "4. When finished, output **exactly** the following block with **no leading spaces** on marker or field lines (no text after the end marker):",
+    "3. Produce a complete PRD-quality document with Problem Statement, Solution, extensive User Stories, Implementation Decisions, Testing Decisions, Out of Scope, and Further Notes.",
+    "4. Return exactly one plain Markdown document: no preamble, code fence, protocol marker, or closing note.",
+    "5. Its first non-empty line must be the one H1 title, followed by these exact H2 sections with substantive content:",
     "",
-    SPEC_START,
-    "TITLE: <concise spec title>",
-    "BODY:",
-    "<full markdown body>",
-    SPEC_END,
+    "# <concise spec title>",
+    "## Problem Statement",
+    "## Solution",
+    "## User Stories",
+    "## Implementation Decisions",
+    "## Testing Decisions",
+    "## Out of Scope",
+    "## Further Notes",
   ].join("\n");
 }
 

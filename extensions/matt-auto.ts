@@ -28,8 +28,8 @@ import {
   createWorkersPort,
   createWorkspacePort,
   findLatestDraftText,
-  parseMarkedSpecDraftFromTexts,
   parseMarkedTicketsDraftFromTexts,
+  validateLatestCreateSpecMarkdown,
   type MattAutoLogger,
   type SkillsHost,
 } from "../src/adapters/index.js";
@@ -64,7 +64,7 @@ type PlanningSession = {
 };
 
 const PLANNING_TURN_TIMEOUT_MS = 20 * 60 * 1000;
-/** Only reuse marked drafts from recent assistant turns (grill → draft → run). */
+/** Only reuse recent marker-owned ticket drafts from the home session. */
 const RECENT_DRAFT_WINDOW = 12;
 
 function sleep(ms: number): Promise<void> {
@@ -145,6 +145,10 @@ function createSkillsHost(
   getPlanning: () => PlanningSession | undefined,
   getLog: () => MattAutoLogger | undefined,
 ): SkillsHost {
+  // Only the first Create-spec invocation may reuse an intentional plain draft
+  // already in the home session. Revisions always generate a fresh response.
+  let hasInvokedCreateSpec = false;
+
   return {
     async runCreateSpec() {
       const ui = getUi();
@@ -166,24 +170,24 @@ function createSkillsHost(
       log?.info("runCreateSpec:start");
       const started = Date.now();
 
-      // Grill → (optional draft in session) → /matt-auto run: reuse a recent
-      // marked draft so we do not ignore work already in this home session.
       const prior = planning.getAssistantTextsSince(0);
-      const reused = parseMarkedSpecDraftFromTexts(prior, {
-        recentWindow: RECENT_DRAFT_WINDOW,
-      });
-      if (reused) {
-        log?.info("runCreateSpec:reused-session-draft", {
-          title: reused.title,
-          bodyChars: reused.body.length,
-          priorTextCount: prior.length,
-          ms: Date.now() - started,
-        });
-        return { ok: true, draft: reused };
+      if (!hasInvokedCreateSpec) {
+        const reused = validateLatestCreateSpecMarkdown(prior);
+        if (reused.ok) {
+          hasInvokedCreateSpec = true;
+          log?.info("runCreateSpec:reused-session-plain-draft", {
+            title: reused.draft.title,
+            bodyChars: reused.draft.body.length,
+            priorTextCount: prior.length,
+            ms: Date.now() - started,
+          });
+          return { ok: true, draft: reused.draft };
+        }
       }
 
-      // No marked draft yet (typical right after grill): run to-spec and wait
-      // for a real agent turn — not a bare waitForIdle while still idle.
+      // Run to-spec and wait for a real agent turn — not a bare waitForIdle
+      // while still idle. New responses must pass the plain-Markdown gate.
+      hasInvokedCreateSpec = true;
       const baseline = planning.markAssistantBaseline();
       planning.sendUserMessage(buildCreateSpecSkillPrompt());
       const texts = await waitForAssistantTextsSince(
@@ -192,27 +196,35 @@ function createSkillsHost(
         log,
         "runCreateSpec",
       );
-      const draft = parseMarkedSpecDraftFromTexts(texts);
+      const response =
+        [...texts].reverse().find((text) => text.trim().length > 0) ?? "";
+      const validation = validateLatestCreateSpecMarkdown(texts);
       log?.debug("runCreateSpec:assistant", {
         textCount: texts.length,
         baseline,
-        hasMarker: Boolean(
-          findLatestDraftText(texts, "---MATT-AUTO-SPEC-DRAFT---"),
-        ),
+        plainMarkdown: response.length > 0,
+        qualityGate: validation.ok ? "passed" : "failed",
+        ...(validation.ok ? {} : { issues: validation.issues }),
         ms: Date.now() - started,
       });
-      if (!draft) {
-        log?.warn("runCreateSpec:parse-failed", {
-          preview: (texts[texts.length - 1] ?? "").slice(0, 300),
+      if (!validation.ok) {
+        log?.warn("runCreateSpec:quality-gate-failed", {
+          issues: validation.issues,
+          preview: response.slice(0, 300),
         });
         return {
           ok: false,
           reason:
             texts.length === 0
               ? "Create-spec did not receive any assistant reply after invoking to-spec (turn wait timed out or never started). Retry Create-spec or /matt-auto run. Nothing was published to GitHub."
-              : "Create-spec finished but Matt Auto could not parse a publishable ---MATT-AUTO-SPEC-DRAFT--- block (markers required; no marker-less fallback). Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
+              : [
+                  "Create-spec quality gate rejected the assistant Markdown:",
+                  validation.issues.join(" "),
+                  "Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
+                ].join(" "),
         };
       }
+      const draft = validation.draft;
       log?.info("runCreateSpec:ok", {
         title: draft.title,
         bodyChars: draft.body.length,
@@ -686,8 +698,9 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
         : undefined;
 
       // Planning skills run in this Workflow home session so grill context remains.
-      // Marked drafts may be reused from recent turns; new skill turns wait until
-      // assistant text actually appears (not bare waitForIdle while still idle).
+      // A validated plain spec can be reused only before the first invocation;
+      // new skill turns wait until assistant text actually appears (not a bare
+      // waitForIdle while still idle).
       planningSession = {
         sendUserMessage: (text: string) => {
           pi.sendUserMessage(text);

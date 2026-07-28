@@ -17,7 +17,10 @@ export {
   parseMarkedTicketsDraftFromTexts,
   parseSpecDraftFromAssistantText,
   parseTicketsDraftFromAssistantText,
+  validateCreateSpecMarkdown,
+  validateLatestCreateSpecMarkdown,
 } from "./planning-draft.js";
+export type { CreateSpecDraftValidation } from "./planning-draft.js";
 export {
   assertValidWorkerConcurrency,
   createPreferencesPort,
