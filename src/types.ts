@@ -261,6 +261,11 @@ export type WorkflowPanelState = {
     branchName: string;
     /** Stable attempt id (e.g. implement-255-257-r2). */
     workerId?: string;
+    /**
+     * Exact profile passed to this worker's `pi --model` launch argument.
+     * Frozen at launch, so it remains accurate if the configured profile changes.
+     */
+    workerProfile?: WorkerProfile;
     /** OS pid of the `pi --mode json` child when known. */
     pid?: number;
     worktreePath?: string;

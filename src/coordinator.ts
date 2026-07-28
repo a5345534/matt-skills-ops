@@ -321,6 +321,11 @@ type ActiveImplementationWorker = {
   branchName: string;
   worktreePath: string;
   status: ImplementationWorkerStatus;
+  /**
+   * Exact model profile used for this launched attempt.
+   * Absent only for transcript-recovered attempts created before this metadata.
+   */
+  workerProfile?: WorkerProfile;
   progress?: string;
   summary?: string;
   /** OS pid of the `pi --mode json` child when known. */
@@ -343,6 +348,8 @@ type ActiveConflictWorker = {
   integrationBranch: string;
   integrationWorktreePath: string;
   status: ImplementationWorkerStatus;
+  /** Exact model profile used for this launched conflict-resolution attempt. */
+  workerProfile?: WorkerProfile;
   progress?: string;
   /** OS pid of the conflict-resolution child when known. */
   pid?: number;
@@ -2674,6 +2681,7 @@ export function createWorkflowCoordinator(
       branchName: workspace.branchName,
       worktreePath: workspace.worktreePath,
       status: "running",
+      workerProfile: { ...workerProfile.profile },
       startedAtMs: Date.now(),
       receivedStageResult: false,
     };
@@ -3413,6 +3421,7 @@ export function createWorkflowCoordinator(
       integrationBranch: conflict.integrationBranch,
       integrationWorktreePath: conflict.integrationWorktreePath,
       status: "running",
+      workerProfile: { ...workerProfile.profile },
       startedAtMs: Date.now(),
       receivedStageResult: false,
     };
@@ -5201,6 +5210,7 @@ export function createWorkflowCoordinator(
       branchName: string;
       worktreePath: string;
       status: ImplementationWorkerStatus;
+      workerProfile?: WorkerProfile;
       progress?: string;
       pid?: number;
       startedAtMs?: number;
@@ -5228,6 +5238,9 @@ export function createWorkflowCoordinator(
       workerId: worker.workerId,
       worktreePath: worker.worktreePath,
       transcriptPath,
+      ...(worker.workerProfile
+        ? { workerProfile: { ...worker.workerProfile } }
+        : {}),
     };
     if (typeof pid === "number") {
       entry.pid = pid;
@@ -5315,6 +5328,9 @@ export function createWorkflowCoordinator(
                 branchName: worker.branchName,
                 worktreePath: worker.worktreePath,
                 status: worker.status,
+                ...(worker.workerProfile
+                  ? { workerProfile: worker.workerProfile }
+                  : {}),
                 startedAtMs: worker.startedAtMs,
                 ...(worker.progress ? { progress: worker.progress } : {}),
                 ...(typeof worker.pid === "number" ? { pid: worker.pid } : {}),
@@ -5333,6 +5349,9 @@ export function createWorkflowCoordinator(
                   branchName: activeConflictWorker.integrationBranch,
                   worktreePath: activeConflictWorker.integrationWorktreePath,
                   status: activeConflictWorker.status,
+                  ...(activeConflictWorker.workerProfile
+                    ? { workerProfile: activeConflictWorker.workerProfile }
+                    : {}),
                   startedAtMs: activeConflictWorker.startedAtMs,
                   ...(activeConflictWorker.progress
                     ? { progress: activeConflictWorker.progress }

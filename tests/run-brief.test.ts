@@ -36,6 +36,11 @@ describe("buildRunBriefViewModel", () => {
           branchName: "matt-auto/42/ticket-43/r2",
           worktreePath: "/workspaces/42/ticket-43/r2",
           transcriptPath: "/transcripts/42/ticket-43/r2.jsonl",
+          workerProfile: {
+            provider: "openai-codex",
+            modelId: "gpt-5.6-terra",
+            thinkingLevel: "max",
+          },
           progress: "Running tests",
         },
       ],
@@ -118,7 +123,7 @@ describe("buildRunBriefViewModel", () => {
     expect(byId.context?.lines).toEqual(["Implementing #43 r2"]);
     // Ticket table present → Workers is a single progress line (no path dump).
     expect(byId.workers?.lines).toEqual([
-      "#43 r2: running — Running tests",
+      "#43 r2: running · model=openai-codex/gpt-5.6-terra:max — Running tests",
     ]);
     expect(byId.integration?.lines).toEqual([
       "#44 r1: pending-retry",
@@ -174,6 +179,11 @@ describe("buildRunBriefViewModel", () => {
           attempt: 1,
           status: "needs-disposition",
           branchName: "matt-auto/42/ticket-43/r1",
+          workerProfile: {
+            provider: "anthropic",
+            modelId: "claude-sonnet-4",
+            thinkingLevel: "medium",
+          },
           // no workerId, pid, processAlive, worktree, transcript, progress
         },
       ],
@@ -201,6 +211,7 @@ describe("buildRunBriefViewModel", () => {
     ]);
     expect(brief.sections.find((s) => s.id === "workers")?.lines).toEqual([
       "#43 r1: needs-disposition",
+      "  model: anthropic/claude-sonnet-4:medium",
       "  branch: matt-auto/42/ticket-43/r1",
     ]);
     expect(brief.sections.find((s) => s.id === "controls")?.lines.join("\n")).toMatch(

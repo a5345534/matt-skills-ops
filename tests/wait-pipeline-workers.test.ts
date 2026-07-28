@@ -627,25 +627,46 @@ describe("waitForPipelineWorkers", () => {
       () => panels[Math.min(call++, panels.length - 1)]!,
     );
     let customRenders = 0;
-    const ui = mockUi({
-      custom: async (factory) => {
-        customRenders += 1;
-        const tui = { requestRender: () => undefined };
-        const theme = {
-          fg: (_c: unknown, t: string) => t,
-          bold: (t: string) => t,
-        };
-        let doneValue: { action: string } | undefined;
-        const component = factory(tui, theme, {}, (v) => {
-          doneValue = v as { action: string };
-        });
-        // Drive one poll so the live surface refreshes from coordinator.
-        await new Promise((r) => setTimeout(r, 5));
-        component.dispose?.();
-        // Outer loop re-checks panel; settle when needs-disposition appears.
-        return doneValue ?? { action: "settled" };
-      },
-    });
+    const custom: NonNullable<MattAutoUi["custom"]> = async <T,>(
+      factory: (
+        tui: { requestRender: () => void },
+        theme: {
+          fg: (color: unknown, text: string) => string;
+          bold: (text: string) => string;
+        },
+        keybindings: unknown,
+        done: (value: T) => void,
+      ) =>
+        | {
+            render: (width: number) => string[];
+            invalidate?: () => void;
+            handleInput?: (data: string) => void;
+            dispose?: () => void;
+          }
+        | Promise<{
+            render: (width: number) => string[];
+            invalidate?: () => void;
+            handleInput?: (data: string) => void;
+            dispose?: () => void;
+          }>,
+    ) => {
+      customRenders += 1;
+      const tui = { requestRender: () => undefined };
+      const theme = {
+        fg: (_c: unknown, t: string) => t,
+        bold: (t: string) => t,
+      };
+      let doneValue: T | undefined;
+      const component = await factory(tui, theme, {}, (v) => {
+        doneValue = v;
+      });
+      // Drive one poll so the live surface refreshes from coordinator.
+      await new Promise((r) => setTimeout(r, 5));
+      component.dispose?.();
+      // Outer loop re-checks panel; settle when needs-disposition appears.
+      return doneValue ?? ({ action: "settled" } as T);
+    };
+    const ui = mockUi({ custom });
 
     await waitForPipelineWorkers(coordinator, ui, {
       pollIntervalMs: 1,

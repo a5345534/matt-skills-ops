@@ -52,6 +52,18 @@ export type RunBriefViewModel = {
 
 type PanelWorker = WorkflowPanelState["workers"][number];
 
+/** Exact Pi model selector that was passed when a worker was launched. */
+export function formatWorkerModel(
+  profile: PanelWorker["workerProfile"],
+): string | undefined {
+  if (!profile) return undefined;
+  const provider = profile.provider.trim();
+  const modelId = profile.modelId.trim();
+  const thinkingLevel = profile.thinkingLevel.trim();
+  if (!provider || !modelId || !thinkingLevel) return undefined;
+  return `${provider}/${modelId}:${thinkingLevel}`;
+}
+
 export type BuildRunBriefOptions = {
   /**
    * When true, omit the textual Controls section (live custom UI already hosts
@@ -247,14 +259,19 @@ function workersSection(
 
 function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
   const head = `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`;
+  const model = formatWorkerModel(worker.workerProfile);
   if (compact) {
     // Paths/ids live in logs; table already shows status/runtime.
+    const withModel = model ? `${head} · model=${model}` : head;
     if (worker.progress) {
-      return [`${head} — ${worker.progress}`];
+      return [`${withModel} — ${worker.progress}`];
     }
-    return [head];
+    return [withModel];
   }
   const lines = [head];
+  if (model) {
+    lines.push(`  model: ${model}`);
+  }
   if (worker.workerId) {
     lines.push(`  workerId: ${worker.workerId}`);
   }

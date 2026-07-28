@@ -2854,6 +2854,7 @@ describe("Workflow coordinator single Implementation worker path", () => {
         attempt: 1,
         status: "running",
         progress: "Running tests",
+        workerProfile: defaultWorkerProfile,
         branchName: "matt-auto/42/ticket-43/r1",
         workerId: "implement-42-43-r1",
         pid: 4242,
@@ -4102,6 +4103,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
         worktreePath: "/matt-auto-workspaces/42/integration",
         branchName: "matt-auto/42/integration",
         skillCommand: "/resolving-merge-conflicts",
+        workerProfile: defaultWorkerProfile,
         prompt: expect.stringContaining("/resolving-merge-conflicts"),
       }),
     ]);
@@ -4120,6 +4122,7 @@ describe("Workflow coordinator Conflict resolution worker", () => {
       status: "conflict-resolution",
       branchName: "matt-auto/42/integration",
     });
+    expect(panel?.workers[0]?.workerProfile).toEqual(defaultWorkerProfile);
     expect(
       panel?.lines.some((l) => /Conflict resolution #43/.test(l)),
     ).toBe(true);

@@ -1,5 +1,9 @@
 import type { WorkflowPanelState } from "../types.js";
-import { deriveContextLabel, formatRuntimeMs } from "./run-brief.js";
+import {
+  deriveContextLabel,
+  formatRuntimeMs,
+  formatWorkerModel,
+} from "./run-brief.js";
 
 function formatCompactRuntime(ms: number): string {
   return formatRuntimeMs(ms);
@@ -243,6 +247,10 @@ function formatCompactWorkerLine(worker: PanelWorker): string {
   let line = `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`;
   if (typeof worker.processAlive === "boolean") {
     line += worker.processAlive ? " · alive" : " · process gone";
+  }
+  const model = formatWorkerModel(worker.workerProfile);
+  if (model) {
+    line += ` · model=${model}`;
   }
   if (worker.progress?.trim()) {
     line += ` — ${worker.progress.trim()}`;

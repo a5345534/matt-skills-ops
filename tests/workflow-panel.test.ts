@@ -37,6 +37,11 @@ describe("buildCompactWorkflowPanel", () => {
           branchName: "matt-auto/42/ticket-43/r2",
           worktreePath: "/workspaces/42/ticket-43/r2",
           transcriptPath: "/transcripts/42/ticket-43/r2.jsonl",
+          workerProfile: {
+            provider: "openai-codex",
+            modelId: "gpt-5.6-terra",
+            thinkingLevel: "max",
+          },
           progress: "Running tests",
         },
       ],
@@ -46,7 +51,9 @@ describe("buildCompactWorkflowPanel", () => {
     expect(vm.visible).toBe(true);
     expect(vm.lines[0]).toBe("Workflow #42: Ship compact panel");
     expect(vm.lines).toContain("Implementing #43 r2");
-    expect(vm.lines).toContain("#43 r2: running · alive — Running tests");
+    expect(vm.lines).toContain(
+      "#43 r2: running · alive · model=openai-codex/gpt-5.6-terra:max — Running tests",
+    );
     // Does not invent dashboard chrome or re-read GitHub.
     expect(vm.lines.join("\n")).not.toMatch(/\[x\]|click|button|Next actions/i);
     // Ignores coordinator-owned panel.lines — structured DTO is the source.
