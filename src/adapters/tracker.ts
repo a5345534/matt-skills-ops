@@ -4,9 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
-  WORKFLOW_MANIFEST_MARKER,
-  WORKFLOW_MANIFEST_SCHEMA,
-} from "../constants.js";
+  canonicalRepositoryIdentityKey,
+  isCanonicalRepositoryIdentity,
+  isCanonicalTargetIdentity,
+  targetRefFromBranch,
+} from "../coordination.js";
+import { WORKFLOW_MANIFEST_MARKER } from "../constants.js";
 import type { TrackerPort, TrackerTicket } from "../ports.js";
 import {
   buildBatchedListTicketsQuery,
@@ -20,10 +23,23 @@ import {
 } from "./tracker-rate-limit.js";
 import type {
   ActiveWorkflow,
-  WorkerProfile,
-  WorkflowManifest,
-  WorkflowStage,
+  CanonicalRepositoryIdentity,
+  CanonicalTargetIdentity,
 } from "../types.js";
+import {
+  activeWorkflowsFromIssues,
+  formatWorkflowManifestComment,
+  type WorkflowManifestIssue,
+} from "./workflow-manifest.js";
+
+export {
+  activeWorkflowFromManifest,
+  activeWorkflowsFromIssues,
+  formatWorkflowManifestComment,
+  parseWorkflowManifestComment,
+  workflowManifestMatchesTarget,
+} from "./workflow-manifest.js";
+export type { WorkflowManifestIssue } from "./workflow-manifest.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -101,157 +117,9 @@ ${stdout}`;
   }
 }
 
-function isWorkerProfile(value: unknown): value is WorkerProfile {
-  if (!value || typeof value !== "object") return false;
-  const profile = value as WorkerProfile;
-  return (
-    typeof profile.provider === "string" &&
-    profile.provider.length > 0 &&
-    typeof profile.modelId === "string" &&
-    profile.modelId.length > 0 &&
-    typeof profile.thinkingLevel === "string" &&
-    profile.thinkingLevel.length > 0
-  );
-}
-
-function isWorkflowStage(value: unknown): value is WorkflowStage {
-  return (
-    value === "spec-published" ||
-    value === "tickets-published" ||
-    value === "pr-opened" ||
-    value === "merged" ||
-    value === "completed"
-  );
-}
-
-function isWorkflowPrRef(
-  value: unknown,
-): value is NonNullable<WorkflowManifest["workflowPr"]> {
-  if (!value || typeof value !== "object") return false;
-  const pr = value as {
-    number?: unknown;
-    url?: unknown;
-    headBranch?: unknown;
-    baseBranch?: unknown;
-  };
-  return (
-    typeof pr.number === "number" &&
-    Number.isInteger(pr.number) &&
-    pr.number > 0 &&
-    typeof pr.headBranch === "string" &&
-    pr.headBranch.length > 0 &&
-    typeof pr.baseBranch === "string" &&
-    pr.baseBranch.length > 0 &&
-    (pr.url === undefined || typeof pr.url === "string")
-  );
-}
-
-function isTicketNumberList(value: unknown): value is number[] {
-  return (
-    Array.isArray(value) &&
-    value.every((n) => typeof n === "number" && Number.isInteger(n) && n > 0)
-  );
-}
-
-function isIntegratedTicketList(
-  value: unknown,
-): value is NonNullable<WorkflowManifest["integratedTickets"]> {
-  if (!Array.isArray(value)) return false;
-  return value.every((entry) => {
-    if (!entry || typeof entry !== "object") return false;
-    const item = entry as {
-      number?: unknown;
-      attempt?: unknown;
-      branchName?: unknown;
-    };
-    return (
-      typeof item.number === "number" &&
-      Number.isInteger(item.number) &&
-      item.number > 0 &&
-      typeof item.attempt === "number" &&
-      Number.isInteger(item.attempt) &&
-      item.attempt > 0 &&
-      typeof item.branchName === "string" &&
-      item.branchName.length > 0
-    );
-  });
-}
-
-/** Serialize a Workflow manifest into the managed GitHub comment body. */
-export function formatWorkflowManifestComment(
-  manifest: WorkflowManifest,
-): string {
-  return `${WORKFLOW_MANIFEST_MARKER}\n\`\`\`json\n${JSON.stringify(manifest, null, 2)}\n\`\`\`\n`;
-}
-
-/** Parse a managed Workflow manifest from a GitHub comment body, if present. */
-export function parseWorkflowManifestComment(
-  body: string,
-): WorkflowManifest | undefined {
-  if (!body.includes(WORKFLOW_MANIFEST_MARKER)) {
-    return undefined;
-  }
-
-  const jsonMatch = /```json\s*([\s\S]*?)```/i.exec(body);
-  const raw = jsonMatch?.[1]?.trim();
-  if (!raw) return undefined;
-
-  try {
-    const parsed = JSON.parse(raw) as Partial<WorkflowManifest>;
-    if (
-      parsed.schema !== WORKFLOW_MANIFEST_SCHEMA ||
-      parsed.version !== 1 ||
-      typeof parsed.workflowId !== "number" ||
-      typeof parsed.targetBranch !== "string" ||
-      !isWorkflowStage(parsed.stage) ||
-      !isWorkerProfile(parsed.workerProfile)
-    ) {
-      return undefined;
-    }
-    const manifest: WorkflowManifest = {
-      schema: WORKFLOW_MANIFEST_SCHEMA,
-      version: 1,
-      workflowId: parsed.workflowId,
-      targetBranch: parsed.targetBranch,
-      stage: parsed.stage,
-      workerProfile: parsed.workerProfile,
-    };
-    if (isTicketNumberList(parsed.tickets)) {
-      manifest.tickets = parsed.tickets;
-    }
-    if (
-      typeof parsed.integrationBranch === "string" &&
-      parsed.integrationBranch.length > 0
-    ) {
-      manifest.integrationBranch = parsed.integrationBranch;
-    }
-    if (isIntegratedTicketList(parsed.integratedTickets)) {
-      manifest.integratedTickets = [...parsed.integratedTickets];
-    }
-    if (isWorkflowPrRef(parsed.workflowPr)) {
-      manifest.workflowPr = {
-        number: parsed.workflowPr.number,
-        headBranch: parsed.workflowPr.headBranch,
-        baseBranch: parsed.workflowPr.baseBranch,
-        ...(parsed.workflowPr.url ? { url: parsed.workflowPr.url } : {}),
-      };
-    }
-    if (
-      typeof parsed.followUpOf === "number" &&
-      Number.isInteger(parsed.followUpOf) &&
-      parsed.followUpOf > 0
-    ) {
-      manifest.followUpOf = parsed.followUpOf;
-    }
-    return manifest;
-  } catch {
-    return undefined;
-  }
-}
-
 async function resolveRepoFullName(
   cwd: string,
-): Promise<{ owner: string; name: string } | undefined> {
+): Promise<CanonicalRepositoryIdentity | undefined> {
   const result = await run(cwd, "gh", [
     "repo",
     "view",
@@ -261,14 +129,57 @@ async function resolveRepoFullName(
   if (result.code !== 0) return undefined;
   try {
     const parsed = JSON.parse(result.stdout) as { nameWithOwner?: string };
-    const full = parsed.nameWithOwner;
-    if (!full || !full.includes("/")) return undefined;
-    const [owner, name] = full.split("/");
-    if (!owner || !name) return undefined;
-    return { owner, name };
+    const parts = parsed.nameWithOwner?.split("/");
+    if (!parts || parts.length !== 2) return undefined;
+    const [owner, name] = parts;
+    const repository = { owner, name };
+    return isCanonicalRepositoryIdentity(repository) ? repository : undefined;
   } catch {
     return undefined;
   }
+}
+
+function parsePaginatedApiArray(stdout: string): unknown[] | undefined {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
+  } catch {
+    return undefined;
+  }
+}
+
+function repositoryEndpoint(repository: CanonicalRepositoryIdentity): string {
+  return `repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
+}
+
+function repositoriesMatch(
+  left: CanonicalRepositoryIdentity,
+  right: CanonicalRepositoryIdentity,
+): boolean {
+  return (
+    canonicalRepositoryIdentityKey(left) === canonicalRepositoryIdentityKey(right)
+  );
+}
+
+async function mapWithConcurrency<Input, Output>(
+  inputs: readonly Input[],
+  concurrency: number,
+  mapper: (input: Input) => Promise<Output>,
+): Promise<Output[]> {
+  const results: Output[] = [];
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < inputs.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(inputs[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(concurrency, 1), inputs.length) }, worker),
+  );
+  return results;
 }
 
 async function resolveIssueNodeId(
@@ -299,33 +210,178 @@ async function resolveIssueNodeId(
  * Creates issues, native blocked-by edges, sub-issues, and managed manifests.
  */
 export function createTrackerPort(cwd: string): TrackerPort {
-  async function findManagedManifestComment(
+  async function loadIssueComments(
+    repository: CanonicalRepositoryIdentity,
     issueNumber: number,
-  ): Promise<{ id: string } | undefined> {
+  ): Promise<Array<{ id?: unknown; body?: unknown }> | undefined> {
     const viewed = await run(cwd, "gh", [
       "api",
-      `repos/{owner}/{repo}/issues/${issueNumber}/comments`,
       "--paginate",
+      "--slurp",
+      `${repositoryEndpoint(repository)}/issues/${issueNumber}/comments?per_page=100`,
     ]);
     if (viewed.code !== 0) return undefined;
-
-    try {
-      const comments = JSON.parse(viewed.stdout) as Array<{
-        id?: number;
-        body?: string;
-      }>;
-      // Prefer the latest managed manifest comment if several exist.
-      for (let i = comments.length - 1; i >= 0; i -= 1) {
-        const comment = comments[i];
-        if (!comment?.body || typeof comment.id !== "number") continue;
-        if (parseWorkflowManifestComment(comment.body)) {
-          return { id: String(comment.id) };
-        }
+    const entries = parsePaginatedApiArray(viewed.stdout);
+    if (!entries) return undefined;
+    return entries.flatMap((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return [];
       }
+      const comment = entry as { id?: unknown; body?: unknown };
+      return [{ id: comment.id, body: comment.body }];
+    });
+  }
+
+  async function listOpenWorkflowIssues(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<
+    Array<{ number: number; title?: string; state?: string }> | undefined
+  > {
+    const listed = await run(cwd, "gh", [
+      "api",
+      "--paginate",
+      "--slurp",
+      `${repositoryEndpoint(repository)}/issues?state=open&per_page=100`,
+    ]);
+    if (listed.code !== 0) return undefined;
+    const entries = parsePaginatedApiArray(listed.stdout);
+    if (!entries) return undefined;
+
+    const issues = new Map<
+      number,
+      { number: number; title?: string; state?: string }
+    >();
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const issue = entry as {
+        number?: unknown;
+        title?: unknown;
+        state?: unknown;
+      };
+      if (
+        typeof issue.number !== "number" ||
+        !Number.isInteger(issue.number) ||
+        issue.number <= 0
+      ) {
+        continue;
+      }
+      issues.set(issue.number, {
+        number: issue.number,
+        ...(typeof issue.title === "string" ? { title: issue.title } : {}),
+        ...(typeof issue.state === "string" ? { state: issue.state } : {}),
+      });
+    }
+    return [...issues.values()];
+  }
+
+  async function loadOpenWorkflowIssue(
+    repository: CanonicalRepositoryIdentity,
+    issueNumber: number,
+  ): Promise<{ number: number; title?: string; state?: string } | undefined> {
+    const viewed = await run(cwd, "gh", [
+      "api",
+      `${repositoryEndpoint(repository)}/issues/${issueNumber}`,
+    ]);
+    if (viewed.code !== 0) return undefined;
+    try {
+      const issue = JSON.parse(viewed.stdout) as {
+        number?: unknown;
+        title?: unknown;
+        state?: unknown;
+      };
+      if (
+        typeof issue.number !== "number" ||
+        !Number.isInteger(issue.number) ||
+        issue.number <= 0 ||
+        issue.state !== "open"
+      ) {
+        return undefined;
+      }
+      return {
+        number: issue.number,
+        ...(typeof issue.title === "string" ? { title: issue.title } : {}),
+        state: issue.state,
+      };
     } catch {
       return undefined;
     }
+  }
+
+  async function findManagedManifestComment(
+    issueNumber: number,
+  ): Promise<{ id: string } | undefined> {
+    const repository = await resolveRepoFullName(cwd);
+    if (!repository) return undefined;
+    const comments = await loadIssueComments(repository, issueNumber);
+    if (!comments) return undefined;
+
+    // The latest managed comment is authoritative even if malformed, so a write
+    // repairs it instead of creating a second managed manifest comment.
+    for (let i = comments.length - 1; i >= 0; i -= 1) {
+      const comment = comments[i];
+      if (
+        typeof comment?.body !== "string" ||
+        !comment.body.includes(WORKFLOW_MANIFEST_MARKER) ||
+        typeof comment.id !== "number"
+      ) {
+        continue;
+      }
+      return { id: String(comment.id) };
+    }
     return undefined;
+  }
+
+  async function discoverActiveWorkflows(
+    target: CanonicalTargetIdentity,
+  ): Promise<readonly ActiveWorkflow[]> {
+    if (!isCanonicalTargetIdentity(target)) return [];
+    const repository = await resolveRepoFullName(cwd);
+    if (!repository || !repositoriesMatch(repository, target.repository)) {
+      return [];
+    }
+    const issues = await listOpenWorkflowIssues(repository);
+    if (!issues) {
+      throw new Error("Could not paginate open GitHub issues for workflow discovery.");
+    }
+
+    const snapshots = await mapWithConcurrency(issues, 8, async (issue) => {
+      const comments = await loadIssueComments(repository, issue.number);
+      if (!comments) {
+        throw new Error(
+          `Could not paginate managed comments for workflow issue #${issue.number}.`,
+        );
+      }
+      const snapshot: WorkflowManifestIssue = {
+        number: issue.number,
+        ...(issue.title ? { title: issue.title } : {}),
+        ...(issue.state ? { state: issue.state } : {}),
+        comments,
+      };
+      return snapshot;
+    });
+    return activeWorkflowsFromIssues(target, snapshots);
+  }
+
+  async function loadActiveWorkflowById(
+    target: CanonicalTargetIdentity,
+    workflowId: number,
+  ): Promise<ActiveWorkflow | undefined> {
+    const repository = await resolveRepoFullName(cwd);
+    if (!repository || !repositoriesMatch(repository, target.repository)) {
+      return undefined;
+    }
+    const issue = await loadOpenWorkflowIssue(repository, workflowId);
+    if (!issue) return undefined;
+    const comments = await loadIssueComments(repository, workflowId);
+    if (!comments) return undefined;
+    return activeWorkflowsFromIssues(target, [
+      {
+        number: issue.number,
+        ...(issue.title ? { title: issue.title } : {}),
+        ...(issue.state ? { state: issue.state } : {}),
+        comments,
+      },
+    ])[0];
   }
 
   return {
@@ -416,96 +472,31 @@ export function createTrackerPort(cwd: string): TrackerPort {
       }
     },
 
+    async findActiveWorkflows(target) {
+      return discoverActiveWorkflows(target);
+    },
+
     async findActiveWorkflow(targetBranch, hintWorkflowId) {
-      async function loadFromIssue(
-        issueNumber: number,
-        fallbackTitle?: string,
-      ): Promise<ActiveWorkflow | undefined> {
-        const viewed = await run(cwd, "gh", [
-          "issue",
-          "view",
-          String(issueNumber),
-          "--json",
-          "number,title,state,comments",
-        ]);
-        if (viewed.code !== 0) return undefined;
+      const targetRef = targetRefFromBranch(targetBranch);
+      const repository = await resolveRepoFullName(cwd);
+      if (!targetRef || !repository) return undefined;
+      const target: CanonicalTargetIdentity = { repository, targetRef };
 
-        let detail: {
-          number: number;
-          title: string;
-          state?: string;
-          comments?: Array<{ body?: string }>;
-        };
-        try {
-          detail = JSON.parse(viewed.stdout) as typeof detail;
-        } catch {
-          return undefined;
-        }
-
-        let found: WorkflowManifest | undefined;
-        for (const comment of detail.comments ?? []) {
-          const manifest = parseWorkflowManifestComment(comment.body ?? "");
-          if (manifest) found = manifest;
-        }
-        if (!found) return undefined;
-        if (found.targetBranch !== targetBranch) return undefined;
-        if (found.workflowId !== issueNumber) return undefined;
-        if (found.stage === "completed") return undefined;
-
-        const active: ActiveWorkflow = {
-          workflowId: found.workflowId,
-          targetBranch: found.targetBranch,
-          stage: found.stage,
-          workerProfile: found.workerProfile,
-        };
-        if (found.tickets) active.tickets = [...found.tickets];
-        if (found.integrationBranch) {
-          active.integrationBranch = found.integrationBranch;
-        }
-        if (found.integratedTickets) {
-          active.integratedTickets = [...found.integratedTickets];
-        }
-        if (found.workflowPr) active.workflowPr = { ...found.workflowPr };
-        if (found.followUpOf !== undefined) active.followUpOf = found.followUpOf;
-        const title = detail.title ?? fallbackTitle;
-        if (title) active.title = title;
-        return active;
-      }
-
-      // Fast path: local preference points at the Active workflow issue.
+      // A legacy local pointer remains a direct, explicit lookup. It never
+      // causes a parallel workflow to be selected by position in a result list.
       if (typeof hintWorkflowId === "number" && hintWorkflowId > 0) {
-        const hinted = await loadFromIssue(hintWorkflowId);
+        const hinted = await loadActiveWorkflowById(target, hintWorkflowId);
         if (hinted) return hinted;
       }
 
-      // Slow fallback: scan a small window of open issues only (was 50 sequential views).
-      const list = await run(cwd, "gh", [
-        "issue",
-        "list",
-        "--state",
-        "open",
-        "--limit",
-        "10",
-        "--json",
-        "number,title",
-      ]);
-      if (list.code !== 0) return undefined;
-
-      let items: Array<{ number: number; title: string }>;
       try {
-        items = JSON.parse(list.stdout) as Array<{
-          number: number;
-          title: string;
-        }>;
+        const active = await discoverActiveWorkflows(target);
+        // Legacy routing has no explicit binding. Preserve its behavior only
+        // when exactly one workflow exists; do not pick an arbitrary sibling.
+        return active.length === 1 ? active[0] : undefined;
       } catch {
         return undefined;
       }
-
-      // Parallelize the small window instead of serial gh issue view.
-      const loaded = await Promise.all(
-        items.map(async (issue) => loadFromIssue(issue.number, issue.title)),
-      );
-      return loaded.find((active) => active !== undefined);
     },
 
     async listTickets(issueNumbers) {

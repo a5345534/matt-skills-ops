@@ -794,6 +794,34 @@ function createTracker(
       }
       state.manifests.set(issueNumber, manifest);
     },
+    findActiveWorkflows: async (target) => {
+      const targetBranch = target.targetRef.startsWith("refs/heads/")
+        ? target.targetRef.slice("refs/heads/".length)
+        : "";
+      const active: ActiveWorkflow[] = [];
+      for (const manifest of state.manifests.values()) {
+        if (manifest.targetBranch !== targetBranch) continue;
+        if (manifest.stage === "completed") continue;
+        const issue = state.issues.find((i) => i.number === manifest.workflowId);
+        const item: ActiveWorkflow = {
+          workflowId: manifest.workflowId,
+          targetBranch: manifest.targetBranch,
+          stage: manifest.stage,
+          workerProfile: manifest.workerProfile,
+        };
+        if (manifest.tickets) item.tickets = [...manifest.tickets];
+        if (manifest.integrationBranch) item.integrationBranch = manifest.integrationBranch;
+        if (manifest.integratedTickets) {
+          item.integratedTickets = [...manifest.integratedTickets];
+        }
+        if (manifest.workflowPr) item.workflowPr = { ...manifest.workflowPr };
+        if (manifest.version === 2) item.coordination = manifest.coordination;
+        if (manifest.followUpOf !== undefined) item.followUpOf = manifest.followUpOf;
+        if (issue?.title) item.title = issue.title;
+        active.push(item);
+      }
+      return active;
+    },
     findActiveWorkflow: async (targetBranch) => {
       for (const manifest of state.manifests.values()) {
         if (manifest.targetBranch !== targetBranch) continue;

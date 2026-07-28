@@ -45,10 +45,14 @@ export {
   type SkillsHost,
 } from "./skills.js";
 export {
+  activeWorkflowFromManifest,
+  activeWorkflowsFromIssues,
   createTrackerPort,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
+  workflowManifestMatchesTarget,
 } from "./tracker.js";
+export type { WorkflowManifestIssue } from "./tracker.js";
 export { createGitTopologyPort } from "./topology.js";
 export {
   createWorkspacePort,

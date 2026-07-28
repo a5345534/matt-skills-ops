@@ -132,14 +132,96 @@ export type WorkflowPrRef = {
   baseBranch: string;
 };
 
+/** GitHub repository identity, resolved from GitHub owner/name rather than a local remote alias. */
+export type CanonicalRepositoryIdentity = {
+  owner: string;
+  name: string;
+};
+
+/** One repository Target branch, always expressed as a fully qualified Git ref. */
+export type CanonicalTargetIdentity = {
+  repository: CanonicalRepositoryIdentity;
+  /** For example, `refs/heads/main`; never a local path or remote alias. */
+  targetRef: string;
+};
+
+/** GitHub merge methods Matt Auto may record as repository policy. */
+export type WorkflowMergeMethod = "merge" | "squash" | "rebase";
+
+/** Exact PR and Target commit facts required to reason about freshness. */
+export type WorkflowPrFreshness = {
+  /** Exact Workflow PR head object ID observed by the coordinator. */
+  headSha: string;
+  /** Target object ID used for the most recent refresh and local validation, when available. */
+  validatedTargetSha?: string;
+  /** Repository-configured merge method; Matt Auto must not infer one. */
+  mergeMethod: WorkflowMergeMethod;
+};
+
+/** States of one workflow's reconstructed Target-branch queue candidate. */
+export type TargetBranchQueueState =
+  | "awaiting-pr-checks"
+  | "merge-ready"
+  | "refreshing"
+  | "retryable"
+  | "transient-retry"
+  | "merged";
+
+/** A deterministic retryable outcome recorded on the owning workflow manifest. */
+export type WorkflowQueueRetry = {
+  /** Stable, machine-readable failure reason supplied by the coordinator. */
+  reason: string;
+  /** Number of attempts that have produced this outcome. */
+  attempt: number;
+  /** Time at which the retryable outcome was recorded. */
+  failedAt: string;
+};
+
+/** A retry that is bounded and delayed because its cause is transient. */
+export type TransientWorkflowQueueRetry = WorkflowQueueRetry & {
+  /** The retry budget; `attempt` must not exceed this value. */
+  maxAttempts: number;
+  /** Earliest time at which the coordinator may retry. */
+  nextRetryAt: string;
+};
+
 /**
- * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
- * Does not alter the spec body.
+ * Persisted queue facts. The queue itself is reconstructed from Active manifests;
+ * this object never represents a mutable central queue.
  */
-export type WorkflowManifest = {
+export type TargetBranchQueueCandidate =
+  | { state: "awaiting-pr-checks" }
+  | { state: "merge-ready"; mergeReadyAt: string }
+  | { state: "refreshing"; mergeReadyAt?: string }
+  | { state: "retryable"; retry: WorkflowQueueRetry }
+  | { state: "transient-retry"; retry: TransientWorkflowQueueRetry }
+  | { state: "merged" };
+
+/** Lease generations observed by a workflow for diagnostics and fencing context. */
+export type WorkflowLeaseGenerationReferences = {
+  workflowCoordinator?: number;
+  targetBranch?: number;
+  repositoryScheduler?: number;
+  workerSlot?: number;
+};
+
+/** Coordination facts carried only by version 2 workflow manifests. */
+export type WorkflowCoordinationFacts = {
+  /** Canonical GitHub repository plus fully qualified Target ref. */
+  target: CanonicalTargetIdentity;
+  /** PR head, validation base, and merge-method facts when a Workflow PR exists. */
+  prFreshness?: WorkflowPrFreshness;
+  /** Current queue candidate facts, if the workflow has entered delivery. */
+  queueCandidate?: TargetBranchQueueCandidate;
+  /** Non-authoritative lease-generation observations for diagnostics. */
+  observedLeaseGenerations?: WorkflowLeaseGenerationReferences;
+};
+
+/** Shared fields preserved across every Workflow manifest version. */
+type WorkflowManifestBase = {
   schema: "matt-auto/workflow-manifest";
-  version: 1;
   workflowId: number;
+  /** Legacy unqualified branch name retained for backward-compatible workflow behavior. */
   targetBranch: string;
   stage: WorkflowStage;
   workerProfile: WorkerProfile;
@@ -153,6 +235,93 @@ export type WorkflowManifest = {
   workflowPr?: WorkflowPrRef;
   /** When this is a Follow-up workflow, the original completed Workflow ID. */
   followUpOf?: number;
+};
+
+/** Existing single-workflow manifest format. It remains supported without migration. */
+export type LegacyWorkflowManifest = WorkflowManifestBase & {
+  version: 1;
+};
+
+/** Coordination-aware manifest format for independently Active workflows. */
+export type CoordinationWorkflowManifest = WorkflowManifestBase & {
+  version: 2;
+  coordination: WorkflowCoordinationFacts;
+};
+
+/**
+ * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
+ * Does not alter the spec body. Version 1 remains on the legacy single-workflow path.
+ */
+export type WorkflowManifest =
+  | LegacyWorkflowManifest
+  | CoordinationWorkflowManifest;
+
+/** Common fields exposed by every renewable remote coordination lease. */
+type CoordinationLeaseBase = {
+  /** Unique Workflow-home/process identity that currently holds the lease. */
+  holderId: string;
+  /** Monotonically increasing fencing generation. */
+  generation: number;
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+};
+
+/** One workflow's coordinator lease. */
+export type WorkflowCoordinatorLease = CoordinationLeaseBase & {
+  kind: "workflow-coordinator";
+  scope: {
+    repository: CanonicalRepositoryIdentity;
+    target: CanonicalTargetIdentity;
+    workflowId: number;
+  };
+};
+
+/** The serial lease for refresh and merge work on one canonical Target branch. */
+export type TargetBranchLease = CoordinationLeaseBase & {
+  kind: "target-branch";
+  scope: { target: CanonicalTargetIdentity };
+  /** Workflow currently using the delivery lane, when one is assigned. */
+  workflowId?: number;
+};
+
+/** Short-lived lease used to allocate repository-wide Implementation worker slots. */
+export type RepositorySchedulerLease = CoordinationLeaseBase & {
+  kind: "repository-scheduler";
+  scope: { repository: CanonicalRepositoryIdentity };
+};
+
+/** One repository-wide Implementation worker slot lease. */
+export type WorkerSlotLease = CoordinationLeaseBase & {
+  kind: "worker-slot";
+  scope: { repository: CanonicalRepositoryIdentity; slot: number };
+  workflowId: number;
+  ticketNumber?: number;
+};
+
+/** Lease DTO returned by the future CoordinationPort. */
+export type CoordinationLease =
+  | WorkflowCoordinatorLease
+  | TargetBranchLease
+  | RepositorySchedulerLease
+  | WorkerSlotLease;
+
+export type CoordinationLeaseKind = CoordinationLease["kind"];
+/** Alias retained for adapters that explicitly name their boundary DTOs. */
+export type CoordinationLeaseDto = CoordinationLease;
+
+/**
+ * Repository-backed worker capacity policy. It is seeded once from local settings,
+ * then becomes the authoritative cross-checkout capacity record.
+ */
+export type RepositoryWorkerCapacityPolicy = {
+  schema: "matt-auto/repository-worker-capacity-policy";
+  version: 1;
+  repository: CanonicalRepositoryIdentity;
+  workerCapacity: number;
+  generation: number;
+  initializedAt: string;
+  updatedAt: string;
 };
 
 /**
@@ -174,6 +343,8 @@ export type ActiveWorkflow = {
   integratedTickets?: readonly IntegratedTicketRef[];
   /** Single Workflow PR when opened (or after merge, until cleanup). */
   workflowPr?: WorkflowPrRef;
+  /** Coordination facts present only for a version 2 manifest. */
+  coordination?: WorkflowCoordinationFacts;
   /** When this is a Follow-up workflow, the original completed Workflow ID. */
   followUpOf?: number;
 };
