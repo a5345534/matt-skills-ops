@@ -1,5 +1,34 @@
 export { createWorkflowCoordinator } from "./coordinator.js";
 export {
+  buildDashboardActionPromptView,
+  buildDashboardActionResultView,
+  createFallbackWorkflowActionInteraction,
+  dashboardActionResultLines,
+  DashboardWorkflowActionController,
+  DashboardWorkflowActionInteraction,
+  executeWorkflowAction,
+  resolveWorkflowActionResult,
+  workflowActionChoiceLabel,
+} from "./ui/workflow-dashboard-actions.js";
+export type {
+  DashboardActionChoice,
+  DashboardActionControllerOptions,
+  DashboardActionPhase,
+  DashboardActionPromptView,
+  DashboardActionResultTone,
+  DashboardActionResultView,
+  DashboardActionRunOutcome,
+  DashboardActionState,
+  FallbackWorkflowActionUi,
+  ImplementationDispositionPrompt,
+  StageConfirmationPrompt,
+  WorkflowActionCoordinator,
+  WorkflowActionDecision,
+  WorkflowActionExecutionOptions,
+  WorkflowActionInteraction,
+  WorkflowActionPrompt,
+} from "./ui/workflow-dashboard-actions.js";
+export {
   CHECK_CI_ACTION_PREFIX,
   checkCiActionId,
   CI_RECOVERY_ACTION_PREFIX,

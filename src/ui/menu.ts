@@ -12,18 +12,29 @@ import {
 } from "./live-run-brief-controls.js";
 import { signalMattAutoComplete } from "./terminal-notify.js";
 import {
+  createFallbackWorkflowActionInteraction,
+  executeWorkflowAction,
+} from "./workflow-dashboard-actions.js";
+import {
+  canPresentWorkflowDashboard,
+  presentWorkflowDashboard,
+  type WorkflowDashboardScope,
+} from "./workflow-dashboard.js";
+import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
   CLEANUP_WORKFLOW_ACTION,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DISPOSITION_ACTION_PREFIX,
+  IMPLEMENTATION_DISPOSITION_OPTIONS,
   IMPLEMENT_TICKET_ACTION_PREFIX,
   INTEGRATE_TICKET_ACTION_PREFIX,
   MERGE_WORKFLOW_PR_ACTION,
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
   START_FOLLOW_UP_ACTION,
+  STAGE_CONFIRMATION_OPTIONS,
   TICKET_PROGRESS_ACTION,
   WORKER_CONCURRENCY_WARNING_THRESHOLD,
 } from "../constants.js";
@@ -1163,13 +1174,6 @@ const BACK_ITEM = "← Back";
 const CONFIRM_CONCURRENCY_WARNING_ITEM = "Confirm Worker concurrency";
 const DECLINE_CONCURRENCY_WARNING_ITEM = "Cancel";
 
-const PUBLISH_ITEM = "Publish";
-const REVISE_ITEM = "Revise";
-const CANCEL_ITEM = "Cancel";
-
-const DISPOSITION_CLOSE = "Close (start Integration)";
-const DISPOSITION_LEAVE_OPEN = "Leave open";
-const DISPOSITION_INVESTIGATE = "Investigate";
 const PANEL_HEADER = "--- Workflow panel ---";
 
 const CREATE_SPEC_EDITOR_TITLE =
@@ -1237,6 +1241,30 @@ function formatRootStatus(root: WorkflowRoot): string {
 
 function formatProfileShort(profile: WorkerProfile): string {
   return `${profile.provider}/${profile.modelId} (thinking ${profile.thinkingLevel})`;
+}
+
+async function presentDashboardIfAvailable(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  scope?: WorkflowDashboardScope,
+): Promise<boolean> {
+  if (!canPresentWorkflowDashboard(ui)) return false;
+
+  try {
+    await presentWorkflowDashboard(coordinator, ui, {
+      ...(scope ? { scope } : {}),
+    });
+    return true;
+  } catch (error) {
+    // A host can expose a partial/RPC `custom` method that rejects at runtime.
+    // Keep its established blocking-select menu usable rather than stranding
+    // the operator behind a capability probe.
+    log("warn", "dashboard:custom-unavailable-fallback", {
+      scope: scope ?? "all",
+      reason: errorMessage(error),
+    });
+    return false;
+  }
 }
 
 function formatResolvedProfileLine(
@@ -1423,6 +1451,8 @@ export async function presentMainMenu(
   ui: MattAutoUi,
   pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
+  if (await presentDashboardIfAvailable(coordinator, ui)) return;
+
   for (;;) {
     const currentRoot = await coordinator.currentRoot();
     const roots = await coordinator.listRoots();
@@ -1556,8 +1586,39 @@ export async function handleNextAction(
     label: action.label,
     autoAdvance: Boolean(options.autoAdvance),
   });
-  let result = await coordinator.runNextAction(action.id);
-  result = await resolveStageResult(coordinator, ui, result, options);
+  const result = await executeWorkflowAction(coordinator, action, {
+    interaction: createFallbackWorkflowActionInteraction(ui),
+    autoAdvance: options.autoAdvance === true,
+    onAutomaticDecision: (prompt) => {
+      if (prompt.kind === "stage-confirmation") {
+        const title =
+          prompt.stage === "create-spec"
+            ? prompt.draft.title
+            : `${prompt.draft.tickets.length} ticket(s)`;
+        ui.notify(`Auto-publishing ${prompt.stage}: ${title}`, "info");
+        log("info", "stage:auto-publish", {
+          stage: prompt.stage,
+          title,
+        });
+        return;
+      }
+      ui.notify(
+        `Auto-Close #${prompt.ticketNumber} (r${prompt.attempt}) → start Integration.`,
+        "info",
+      );
+    },
+  });
+  if (result.status === "running" && result.stage === "implement") {
+    ui.notify(
+      [
+        `Implementation worker running for #${result.ticketNumber} (r${result.attempt}).`,
+        `Workspace: ${result.worktreePath}`,
+        `Branch: ${result.branchName}`,
+        "Watch the Workflow panel for progress. Disposition appears when the worker completes.",
+      ].join("\n"),
+      "info",
+    );
+  }
   log("info", "handleNextAction:end", {
     id: action.id,
     status: result.status,
@@ -1989,89 +2050,6 @@ export async function runPostGrillPipeline(
   }
 }
 
-async function resolveStageResult(
-  coordinator: WorkflowCoordinator,
-  ui: MattAutoUi,
-  initial: StageResult,
-  options: NextActionOptions = {},
-): Promise<StageResult> {
-  let result = initial;
-
-  while (result.status === "needs-confirmation") {
-    if (options.autoAdvance) {
-      const title =
-        result.stage === "create-spec"
-          ? result.draft.title
-          : `${result.draft.tickets.length} ticket(s)`;
-      ui.notify(
-        `Auto-publishing ${result.stage}: ${title}`,
-        "info",
-      );
-      log("info", "stage:auto-publish", {
-        stage: result.stage,
-        title,
-      });
-      result = await coordinator.confirmStage("publish");
-      continue;
-    }
-
-    const decision =
-      result.stage === "create-spec"
-        ? await presentStageConfirmation(ui, result.draft)
-        : await presentTicketsStageConfirmation(ui, result.draft);
-    if (!decision) {
-      result = await coordinator.confirmStage("cancel");
-      break;
-    }
-    result = await coordinator.confirmStage(decision);
-  }
-
-  if (result.status === "running" && result.stage === "implement") {
-    ui.notify(
-      [
-        `Implementation worker running for #${result.ticketNumber} (r${result.attempt}).`,
-        `Workspace: ${result.worktreePath}`,
-        `Branch: ${result.branchName}`,
-        "Watch the Workflow panel for progress. Disposition appears when the worker completes.",
-      ].join("\n"),
-      "info",
-    );
-    return result;
-  }
-
-  if (result.status === "needs-disposition") {
-    result = await resolveDisposition(coordinator, ui, result, options);
-  }
-
-  return result;
-}
-
-async function resolveDisposition(
-  coordinator: WorkflowCoordinator,
-  ui: MattAutoUi,
-  pending: Extract<StageResult, { status: "needs-disposition" }>,
-  options: NextActionOptions = {},
-): Promise<StageResult> {
-  if (options.autoAdvance) {
-    ui.notify(
-      `Auto-Close #${pending.ticketNumber} (r${pending.attempt}) → start Integration.`,
-      "info",
-    );
-    return coordinator.confirmDisposition("close");
-  }
-
-  const decision = await presentImplementationDisposition(ui, pending);
-  if (!decision) {
-    // Leaving the menu keeps the disposition pending for a later Next action refresh.
-    ui.notify(
-      `Implementation disposition for #${pending.ticketNumber} is still pending (Close / Leave open / Investigate).`,
-      "warning",
-    );
-    return pending;
-  }
-  return coordinator.confirmDisposition(decision);
-}
-
 /** Implementation disposition menu: Close / Leave open / Investigate. */
 export async function presentImplementationDisposition(
   ui: MattAutoUi,
@@ -2082,21 +2060,19 @@ export async function presentImplementationDisposition(
     branchName: string;
   },
 ): Promise<ImplementationDispositionDecision | undefined> {
-  const summary = pending.summary ? `\n${pending.summary}` : "";
-  ui.notify(
-    `Implementation disposition for #${pending.ticketNumber} (r${pending.attempt}) on ${pending.branchName}.${summary}\nClose starts Integration later and does not close the GitHub ticket yet.`,
-    "info",
-  );
-
-  const selected = await ui.select("Implementation disposition", [
-    DISPOSITION_CLOSE,
-    DISPOSITION_LEAVE_OPEN,
-    DISPOSITION_INVESTIGATE,
-  ]);
-  if (selected === DISPOSITION_CLOSE) return "close";
-  if (selected === DISPOSITION_LEAVE_OPEN) return "leave-open";
-  if (selected === DISPOSITION_INVESTIGATE) return "investigate";
-  return undefined;
+  const decision = await createFallbackWorkflowActionInteraction(ui).present({
+    kind: "implementation-disposition",
+    ticketNumber: pending.ticketNumber,
+    attempt: pending.attempt,
+    branchName: pending.branchName,
+    ...(pending.summary ? { summary: pending.summary } : {}),
+    choices: IMPLEMENTATION_DISPOSITION_OPTIONS,
+  });
+  return decision === "close" ||
+    decision === "leave-open" ||
+    decision === "investigate"
+    ? decision
+    : undefined;
 }
 
 /** Stage confirmation menu for Create-spec: Publish / Revise / Cancel. */
@@ -2104,14 +2080,15 @@ export async function presentStageConfirmation(
   ui: MattAutoUi,
   draft: SpecDraft,
 ): Promise<StageConfirmationDecision | undefined> {
-  const preview =
-    draft.body.length > 280 ? `${draft.body.slice(0, 277)}...` : draft.body;
-  ui.notify(
-    `Stage confirmation for Create-spec\nTitle: ${draft.title}\n\n${preview}`,
-    "info",
-  );
-
-  return presentConfirmationChoices(ui);
+  const decision = await createFallbackWorkflowActionInteraction(ui).present({
+    kind: "stage-confirmation",
+    stage: "create-spec",
+    draft,
+    choices: STAGE_CONFIRMATION_OPTIONS,
+  });
+  return decision === "publish" || decision === "revise" || decision === "cancel"
+    ? decision
+    : undefined;
 }
 
 /** Stage confirmation menu for Create-tickets: Publish / Revise / Cancel. */
@@ -2119,34 +2096,15 @@ export async function presentTicketsStageConfirmation(
   ui: MattAutoUi,
   draft: TicketsDraft,
 ): Promise<StageConfirmationDecision | undefined> {
-  const lines = draft.tickets.map((ticket) => {
-    const blockers =
-      ticket.blockedBy.length === 0
-        ? "none"
-        : ticket.blockedBy.join(", ");
-    return `• [${ticket.localId}] ${ticket.title} (blocked by: ${blockers})`;
+  const decision = await createFallbackWorkflowActionInteraction(ui).present({
+    kind: "stage-confirmation",
+    stage: "create-tickets",
+    draft,
+    choices: STAGE_CONFIRMATION_OPTIONS,
   });
-  ui.notify(
-    `Stage confirmation for Create-tickets\n${lines.join("\n")}`,
-    "info",
-  );
-
-  return presentConfirmationChoices(ui);
-}
-
-async function presentConfirmationChoices(
-  ui: MattAutoUi,
-): Promise<StageConfirmationDecision | undefined> {
-  const selected = await ui.select("Stage confirmation", [
-    PUBLISH_ITEM,
-    REVISE_ITEM,
-    CANCEL_ITEM,
-  ]);
-  if (selected === undefined) return undefined;
-  if (selected === PUBLISH_ITEM) return "publish";
-  if (selected === REVISE_ITEM) return "revise";
-  if (selected === CANCEL_ITEM) return "cancel";
-  return undefined;
+  return decision === "publish" || decision === "revise" || decision === "cancel"
+    ? decision
+    : undefined;
 }
 
 function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
@@ -2962,6 +2920,10 @@ export async function presentNextActions(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
 ): Promise<void> {
+  if (await presentDashboardIfAvailable(coordinator, ui, "next-actions")) {
+    return;
+  }
+
   const currentRoot = await coordinator.currentRoot();
   if (currentRoot.status === "unavailable" && currentRoot.unavailableReason) {
     ui.notify(currentRoot.unavailableReason, "warning");
