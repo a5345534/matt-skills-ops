@@ -1,9 +1,17 @@
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import {
+  matchesKey,
+  SelectList,
+  truncateToWidth,
+  type SelectItem,
+} from "@earendil-works/pi-tui";
 import type {
   NextAction,
   PreflightCheckId,
   PreflightResult,
   TicketProgressItem,
   TicketProgressSummary,
+  WorkflowCoordinator,
   WorkflowPanelState,
 } from "../types.js";
 import {
@@ -739,4 +747,417 @@ function formatKnownTimestamp(value: number | undefined): string | undefined {
   }
   const date = new Date(value);
   return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+/** A coordinator snapshot rendered by the persistent dashboard surface. */
+export type WorkflowDashboardSnapshot = WorkflowDashboardInputs;
+
+/**
+ * Coordinator reads owned by the dashboard's snapshot boundary. Full reads run
+ * only when the surface opens or the operator explicitly refreshes it; polling
+ * deliberately uses only `getPanelState({ mode: "local" })`.
+ */
+export type WorkflowDashboardDataSource = Pick<
+  WorkflowCoordinator,
+  "preflight" | "nextActions" | "getTicketProgress" | "getPanelState"
+>;
+
+/** Minimal TUI handle supplied to a Pi custom component. */
+export type WorkflowDashboardTui = {
+  requestRender: () => void;
+};
+
+/** Theme subset used by the dashboard without coupling callers to Pi's unions. */
+export type WorkflowDashboardTheme = {
+  // Accept Pi ThemeColor | string without importing ThemeColor here.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  fg: (color: any, text: string) => string;
+  bold: (text: string) => string;
+};
+
+/** Lifecycle returned when the operator leaves the passive dashboard. */
+export type WorkflowDashboardResult = {
+  status: "dismissed";
+};
+
+/** Pi custom component shape, kept structural for test and partial-host support. */
+export type WorkflowDashboardComponent = {
+  render: (width: number) => string[];
+  invalidate?: () => void;
+  handleInput?: (data: string) => void;
+  dispose?: () => void;
+};
+
+/** Minimal `ctx.ui.custom()` surface needed by the persistent dashboard. */
+export type WorkflowDashboardCustomUi = {
+  custom: <T>(
+    factory: (
+      tui: WorkflowDashboardTui,
+      theme: WorkflowDashboardTheme,
+      keybindings: unknown,
+      done: (value: T) => void,
+    ) => WorkflowDashboardComponent | Promise<WorkflowDashboardComponent>,
+    options?: { overlay?: boolean },
+  ) => Promise<T | undefined>;
+};
+
+/** Presentation-only controls for one dashboard instance. */
+export type WorkflowDashboardOptions = {
+  /** Avoid a second full coordinator read when a caller already has a snapshot. */
+  initialSnapshot?: WorkflowDashboardSnapshot;
+  /** Stable row to retain when reopening or recreating the component. */
+  selectedKey?: WorkflowDashboardRowKey;
+  /** Local worker telemetry polling cadence. Defaults to 500ms. */
+  pollIntervalMs?: number;
+  /** Number of navigable rows visible before SelectList scrolls. Defaults to 8. */
+  maxVisibleRows?: number;
+  /** Forwarded to Pi custom UI for callers that explicitly want an overlay. */
+  overlay?: boolean;
+};
+
+/**
+ * Capture a full coordinator snapshot once. This is intentionally separate
+ * from local polling so tracker-backed preflight, ticket-progress, and action
+ * reads cannot accidentally leak into the interval path.
+ */
+export async function readWorkflowDashboardSnapshot(
+  source: WorkflowDashboardDataSource,
+): Promise<WorkflowDashboardSnapshot> {
+  const [preflight, nextActions, ticketProgress, panel] = await Promise.all([
+    source.preflight(),
+    source.nextActions(),
+    source.getTicketProgress(),
+    source.getPanelState({ mode: "full" }),
+  ]);
+
+  return {
+    preflight,
+    nextActions,
+    ...(ticketProgress ? { ticketProgress } : {}),
+    ...(panel ? { panel } : {}),
+  };
+}
+
+/**
+ * Open the persistent, passive workflow browser. It owns visual selection and
+ * refresh timing only; it never calls `ui.notify()`, mutates coordinator state,
+ * or resolves while a user merely inspects a row.
+ */
+export async function presentWorkflowDashboard(
+  source: WorkflowDashboardDataSource,
+  ui: WorkflowDashboardCustomUi,
+  options: WorkflowDashboardOptions = {},
+): Promise<WorkflowDashboardResult> {
+  const snapshot =
+    options.initialSnapshot ?? (await readWorkflowDashboardSnapshot(source));
+
+  const result = await ui.custom<WorkflowDashboardResult>(
+    (tui, theme, _keybindings, done) =>
+      createWorkflowDashboardComponent(
+        source,
+        tui,
+        theme,
+        done,
+        snapshot,
+        options,
+      ),
+    options.overlay ? { overlay: true } : undefined,
+  );
+
+  return result ?? { status: "dismissed" };
+}
+
+/**
+ * Construct the custom component separately so its local polling and keyboard
+ * behavior stay testable without opening a real Pi TUI.
+ */
+export function createWorkflowDashboardComponent(
+  source: WorkflowDashboardDataSource,
+  tui: WorkflowDashboardTui,
+  theme: WorkflowDashboardTheme,
+  done: (result: WorkflowDashboardResult) => void,
+  initialSnapshot: WorkflowDashboardSnapshot,
+  options: WorkflowDashboardOptions = {},
+): WorkflowDashboardComponent {
+  let snapshot = initialSnapshot;
+  let model = buildDashboardModel(snapshot, options.selectedKey);
+  let selectedKey: WorkflowDashboardRowKey = model.selectedKey;
+  let selectList: SelectList;
+  let finished = false;
+  let localPollInFlight = false;
+  let fullRefreshInFlight = false;
+  let refreshStatus = "Live local telemetry";
+  let interval: ReturnType<typeof setInterval> | undefined;
+
+  const pollIntervalMs = positiveInteger(options.pollIntervalMs, 500);
+  const maxVisibleRows = positiveInteger(options.maxVisibleRows, 8);
+
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    if (interval) clearInterval(interval);
+    done({ status: "dismissed" });
+  };
+
+  const selectRow = (key: WorkflowDashboardRowKey) => {
+    if (!model.rows.some((row) => row.key === key)) return;
+    // This is purely visual state. Do not resolve, notify, or call coordinator.
+    selectedKey = key;
+    tui.requestRender();
+  };
+
+  const rebuild = () => {
+    model = buildDashboardModel(snapshot, selectedKey);
+    selectedKey = model.selectedKey;
+    selectList = makeWorkflowDashboardSelectList(
+      model,
+      selectedKey,
+      theme,
+      maxVisibleRows,
+      selectRow,
+      finish,
+    );
+  };
+
+  const refreshLocal = async () => {
+    if (finished || localPollInFlight || fullRefreshInFlight) return;
+    localPollInFlight = true;
+    refreshStatus = "Refreshing local telemetry…";
+    tui.requestRender();
+    try {
+      // Keep all tracker-derived snapshot fields intact. Local mode only updates
+      // worker/process/progress/turn telemetry and other local panel facts.
+      const panel = await source.getPanelState({ mode: "local" });
+      if (finished) return;
+      snapshot = replaceDashboardPanel(snapshot, panel);
+      rebuild();
+      refreshStatus = panel
+        ? "Live local telemetry"
+        : "No local workflow telemetry";
+    } catch {
+      // Keep the last coherent frame and retry on the next interval; no chat noise.
+      refreshStatus = "Local telemetry refresh failed; retrying…";
+    } finally {
+      localPollInFlight = false;
+      if (!finished) tui.requestRender();
+    }
+  };
+
+  const refreshFull = async () => {
+    if (finished || fullRefreshInFlight) return;
+    fullRefreshInFlight = true;
+    refreshStatus = "Refreshing workflow snapshot…";
+    tui.requestRender();
+    try {
+      snapshot = await readWorkflowDashboardSnapshot(source);
+      if (finished) return;
+      rebuild();
+      refreshStatus = "Workflow snapshot refreshed";
+    } catch {
+      refreshStatus = "Workflow refresh failed; press r to retry";
+    } finally {
+      fullRefreshInFlight = false;
+      if (!finished) tui.requestRender();
+    }
+  };
+
+  rebuild();
+  interval = setInterval(() => {
+    void refreshLocal();
+  }, pollIntervalMs);
+
+  return {
+    render(width: number): string[] {
+      return renderWorkflowDashboard(
+        model,
+        selectedKey,
+        selectList,
+        theme,
+        refreshStatus,
+        width,
+      );
+    },
+    invalidate() {
+      // Every styled line is produced during render; invalidating the SelectList
+      // and requesting a frame lets a changed theme apply without losing focus.
+      selectList.invalidate();
+      tui.requestRender();
+    },
+    handleInput(data: string) {
+      if (matchesKey(data, "r") || matchesKey(data, "ctrl+r")) {
+        void refreshFull();
+        return;
+      }
+      selectList.handleInput(data);
+      if (!finished) tui.requestRender();
+    },
+    dispose() {
+      finished = true;
+      if (interval) clearInterval(interval);
+    },
+  };
+}
+
+/** True when a host can present the persistent dashboard. */
+export function canPresentWorkflowDashboard(
+  ui: { custom?: unknown },
+): ui is WorkflowDashboardCustomUi {
+  return typeof ui.custom === "function";
+}
+
+function buildDashboardModel(
+  snapshot: WorkflowDashboardSnapshot,
+  selectedKey: WorkflowDashboardRowKey | undefined,
+): WorkflowDashboardViewModel {
+  return buildWorkflowDashboardViewModel(
+    snapshot,
+    selectedKey ? { selectedKey } : {},
+  );
+}
+
+function makeWorkflowDashboardSelectList(
+  model: WorkflowDashboardViewModel,
+  selectedKey: WorkflowDashboardRowKey,
+  theme: WorkflowDashboardTheme,
+  maxVisibleRows: number,
+  onSelect: (key: WorkflowDashboardRowKey) => void,
+  onCancel: () => void,
+): SelectList {
+  const items = workflowDashboardSelectItems(model);
+  const list = new SelectList(
+    items,
+    maxVisibleRows,
+    {
+      selectedPrefix: (text) => theme.fg("accent", text),
+      selectedText: (text) => theme.fg("accent", text),
+      description: (text) => theme.fg("muted", text),
+      scrollInfo: (text) => theme.fg("dim", text),
+      noMatch: (text) => theme.fg("warning", text),
+    },
+    {
+      // Preserve useful ticket/action identity on normal terminals while the
+      // SelectList still contracts safely on narrow widths.
+      minPrimaryColumnWidth: 24,
+      maxPrimaryColumnWidth: 64,
+    },
+  );
+  const selectedIndex = items.findIndex((item) => item.value === selectedKey);
+  list.setSelectedIndex(selectedIndex);
+  // Arrow navigation changes the inline detail immediately and stays in this
+  // component. Enter is intentionally another inspection affordance in this
+  // browsing slice; dashboard-native action execution is layered separately.
+  list.onSelectionChange = (item) => onSelect(item.value);
+  list.onSelect = (item) => onSelect(item.value);
+  list.onCancel = onCancel;
+  return list;
+}
+
+function workflowDashboardSelectItems(
+  model: WorkflowDashboardViewModel,
+): SelectItem[] {
+  const sectionTitleByKey = new Map<WorkflowDashboardRowKey, string>();
+  for (const section of model.sections) {
+    for (const row of section.rows) {
+      sectionTitleByKey.set(row.key, section.title);
+    }
+  }
+
+  return model.rows.map((row) => ({
+    value: row.key,
+    label: `${sectionTitleByKey.get(row.key) ?? "Workflow"} · ${row.label}`,
+    ...(row.description ? { description: row.description } : {}),
+  }));
+}
+
+function renderWorkflowDashboard(
+  model: WorkflowDashboardViewModel,
+  selectedKey: WorkflowDashboardRowKey,
+  selectList: SelectList,
+  theme: WorkflowDashboardTheme,
+  refreshStatus: string,
+  width: number,
+): string[] {
+  const renderWidth = usableRenderWidth(width);
+  // SelectList expects enough room for its two-column cursor; render it at a
+  // safe minimum and clip every final line back to the host-supplied width.
+  const componentWidth = Math.max(8, renderWidth);
+  const selected =
+    model.rows.find((row) => row.key === selectedKey) ?? model.selected.row;
+  const workflow =
+    model.rows.find((row) => row.key === WORKFLOW_DASHBOARD_WORKFLOW_ROW_KEY) ??
+    model.selected.row;
+  const lines: string[] = [];
+  const accentBorder = new DynamicBorder((text) => theme.fg("accent", text));
+  const dimBorder = new DynamicBorder((text) => theme.fg("dim", text));
+
+  lines.push(
+    dashboardLine(
+      theme.fg("accent", theme.bold("Matt Auto · Workflow dashboard")),
+      renderWidth,
+    ),
+  );
+  lines.push(...accentBorder.render(componentWidth));
+  lines.push(
+    dashboardLine(
+      theme.fg("accent", theme.bold("Workflow summary")),
+      renderWidth,
+    ),
+  );
+  lines.push(
+    dashboardLine(
+      [workflow.label, workflow.description].filter(Boolean).join(" · "),
+      renderWidth,
+    ),
+  );
+  lines.push(...dimBorder.render(componentWidth));
+  lines.push(
+    dashboardLine(theme.fg("accent", theme.bold("Browse")), renderWidth),
+  );
+  lines.push(...selectList.render(componentWidth));
+  lines.push(...dimBorder.render(componentWidth));
+  lines.push(
+    dashboardLine(
+      theme.fg("accent", theme.bold(`Selected · ${selected.detail.title}`)),
+      renderWidth,
+    ),
+  );
+  for (const detailLine of selected.detail.lines) {
+    lines.push(dashboardLine(`  ${detailLine}`, renderWidth));
+  }
+  lines.push(...dimBorder.render(componentWidth));
+  lines.push(
+    dashboardLine(
+      theme.fg(
+        "dim",
+        `↑↓ browse · Enter inspect · r full refresh · Esc return to chat · ${refreshStatus}`,
+      ),
+      renderWidth,
+    ),
+  );
+  return lines.map((line) => dashboardLine(line, renderWidth));
+}
+
+function replaceDashboardPanel(
+  snapshot: WorkflowDashboardSnapshot,
+  panel: WorkflowPanelState | undefined,
+): WorkflowDashboardSnapshot {
+  const { panel: _previousPanel, ...withoutPanel } = snapshot;
+  return panel ? { ...withoutPanel, panel } : withoutPanel;
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || typeof value !== "number" || value <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(value));
+}
+
+function usableRenderWidth(width: number): number {
+  return Number.isFinite(width) && width > 0
+    ? Math.max(1, Math.floor(width))
+    : 1;
+}
+
+function dashboardLine(text: string, width: number): string {
+  return truncateToWidth(text.replace(/[\r\n]+/g, " "), width, "…");
 }
