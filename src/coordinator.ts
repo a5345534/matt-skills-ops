@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   checkCiActionId,
@@ -6,6 +7,7 @@ import {
   CLEANUP_WORKFLOW_ACTION,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
+  DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TARGET_BRANCH,
   dispositionActionId,
   IMPLEMENTATION_DISPOSITION_OPTIONS,
@@ -22,16 +24,24 @@ import {
   parseImplementTicketActionId,
   parseIntegrateTicketActionId,
   parseReworkTicketActionId,
+  parseResumeWorkflowActionId,
   REQUIRED_MATT_SKILLS,
   reworkTicketActionId,
+  resumeWorkflowActionId,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
   START_FOLLOW_UP_ACTION,
+  START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   TICKET_ISSUE_LABEL,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
+import {
+  canonicalTargetIdentityKey,
+  isCanonicalRepositoryIdentity,
+  targetRefFromBranch,
+} from "./coordination.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
 import { gcMattAutoGitlinkArtifacts } from "./adapters/gitlink-cleanup.js";
 import { ensureSubmoduleGitlinksPublished } from "./adapters/submodule-gate.js";
@@ -61,6 +71,7 @@ import type {
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CanonicalTargetIdentity,
   CompletedWorkerTelemetry,
   CiRecoveryDecision,
   ImplementationDispositionDecision,
@@ -85,6 +96,9 @@ import type {
   WorkerProfile,
   WorkerProtocolEvent,
   WorkflowCoordinator,
+  WorkflowCoordinatorLease,
+  WorkflowHomeBinding,
+  WorkflowHomeLock,
   WorkflowManifest,
   WorkflowPanelState,
   WorkflowRoot,
@@ -105,6 +119,43 @@ type PendingCreateTickets = {
 };
 
 type PendingStage = PendingCreateSpec | PendingCreateTickets;
+
+type WorkflowHomeRoute =
+  | { kind: "legacy"; active?: ActiveWorkflow }
+  | {
+      kind: "bound";
+      active: ActiveWorkflow;
+      target: CanonicalTargetIdentity;
+    }
+  | {
+      kind: "selection-required";
+      target: CanonicalTargetIdentity;
+      candidates: readonly ActiveWorkflow[];
+      staleBinding?: WorkflowHomeBinding;
+    }
+  | {
+      kind: "lease-held";
+      target: CanonicalTargetIdentity;
+      active: ActiveWorkflow;
+      holderId?: string;
+    }
+  | { kind: "unavailable"; reason: string };
+
+type HeldWorkflowCoordinatorLease = {
+  target: CanonicalTargetIdentity;
+  workflowId: number;
+  lease: WorkflowCoordinatorLease;
+  renewedAtMs: number;
+};
+
+type WorkflowCoordinatorLeaseCheck =
+  | { ok: true; lease: WorkflowCoordinatorLease }
+  | { ok: false; reason: string; holderId?: string };
+
+type CoordinationRoutingContext =
+  | { supported: false }
+  | { supported: true; ok: true; target: CanonicalTargetIdentity }
+  | { supported: true; ok: false; reason: string };
 
 /**
  * Settled facts for one Implementation attempt transcript.
@@ -413,6 +464,18 @@ export function createWorkflowCoordinator(
 ): WorkflowCoordinator {
   let selectedPath: string | undefined;
   let scoped: RootScopedPorts | undefined;
+  /** Stable identity for this live Workflow home process/session. */
+  const workflowHomeHolderId = `workflow-home-${process.pid}-${randomUUID()}`;
+  /** Locally acquired checkout guard (when the root supplies one). */
+  let heldWorkflowHomeLock: WorkflowHomeLock | undefined;
+  let lastWorkflowHomeLockHeartbeatAtMs = 0;
+  /** Remote fenced lease for the one coordination-aware Workflow this home owns. */
+  let heldWorkflowCoordinatorLease: HeldWorkflowCoordinatorLease | undefined;
+  let workflowCoordinatorHeartbeatTimer: NodeJS.Timeout | undefined;
+  let workflowCoordinatorHeartbeatUsers = 0;
+  let workflowCoordinatorHeartbeatInFlight = false;
+  /** Serialize conditional lease maintenance from UI, workers, and heartbeats. */
+  let workflowCoordinatorLeaseMutex: Promise<void> = Promise.resolve();
   /** Session-local pending Stage confirmation (never remote until Publish). */
   let pending: PendingStage | undefined;
   /**
@@ -949,6 +1012,11 @@ export function createWorkflowCoordinator(
 
     const current = roots.find((root) => root.path === selectedPath);
     if (!current) {
+      if (scoped && selectedPath && selectedPath !== defaultRoot.path) {
+        await abortWorkers();
+        await releaseWorkflowHome();
+        lastCompletedWorkflow = undefined;
+      }
       bindRoot(defaultRoot.path);
       return defaultRoot;
     }
@@ -1079,11 +1147,11 @@ export function createWorkflowCoordinator(
 
   /** Short TTL for Active workflow / ticket progress (full reads). */
   const TRACKER_READ_TTL_MS = 20_000;
-  let activeWorkflowTtl:
+  let workflowHomeRouteTtl:
     | {
         key: string;
         at: number;
-        value: ActiveWorkflow | undefined;
+        value: WorkflowHomeRoute;
       }
     | undefined;
   let ticketProgressTtl:
@@ -1094,48 +1162,666 @@ export function createWorkflowCoordinator(
       }
     | undefined;
 
+  function copyCanonicalTarget(
+    target: CanonicalTargetIdentity,
+  ): CanonicalTargetIdentity {
+    return {
+      repository: { ...target.repository },
+      targetRef: target.targetRef,
+    };
+  }
+
+  function coordinationRoutingSupported(bound: RootScopedPorts): boolean {
+    return Boolean(
+      bound.coordination &&
+        bound.tracker.getCanonicalRepositoryIdentity &&
+        bound.preferences.getWorkflowHomeBinding &&
+        bound.preferences.setWorkflowHomeBinding &&
+        bound.preferences.clearWorkflowHomeBinding,
+    );
+  }
+
+  async function resolveCoordinationRoutingContext(
+    bound: RootScopedPorts,
+  ): Promise<CoordinationRoutingContext> {
+    if (!coordinationRoutingSupported(bound)) {
+      return { supported: false };
+    }
+    const resolveRepository = bound.tracker.getCanonicalRepositoryIdentity;
+    if (!resolveRepository) {
+      return { supported: true, ok: false, reason: "Canonical repository discovery is unavailable." };
+    }
+    const targetBranch = await resolveTargetBranch(
+      bound.preferences,
+      bound.environment,
+    );
+    const targetRef = targetRefFromBranch(targetBranch);
+    if (!targetRef) {
+      return {
+        supported: true,
+        ok: false,
+        reason: `Target branch "${targetBranch}" cannot be represented as a canonical refs/heads Target ref.`,
+      };
+    }
+    try {
+      const repository = await resolveRepository();
+      if (!repository || !isCanonicalRepositoryIdentity(repository)) {
+        return {
+          supported: true,
+          ok: false,
+          reason: "Could not resolve this Workflow root's canonical GitHub owner/name identity.",
+        };
+      }
+      return {
+        supported: true,
+        ok: true,
+        target: {
+          repository: { owner: repository.owner, name: repository.name },
+          targetRef,
+        },
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        supported: true,
+        ok: false,
+        reason: `Could not resolve this Workflow root's canonical GitHub identity: ${message}`,
+      };
+    }
+  }
+
+  async function ensureWorkflowHomeLock(
+    bound: RootScopedPorts,
+  ): Promise<{ ok: true } | { ok: false; reason: string; holderId?: string }> {
+    const lockPort = bound.workflowHomeLock;
+    if (!lockPort) return { ok: true };
+
+    if (heldWorkflowHomeLock) {
+      try {
+        const renewed = await lockPort.renew(heldWorkflowHomeLock);
+        if (renewed.renewed) {
+          lastWorkflowHomeLockHeartbeatAtMs = Date.now();
+          return { ok: true };
+        }
+      } catch {
+        // Treat a local-lock transport/filesystem failure as lost ownership.
+      }
+      heldWorkflowHomeLock = undefined;
+      lastWorkflowHomeLockHeartbeatAtMs = 0;
+      return {
+        ok: false,
+        reason:
+          "This Workflow home no longer owns the local checkout guard. Open or resume it from a separate checkout.",
+      };
+    }
+
+    try {
+      const acquired = await lockPort.acquire({ holderId: workflowHomeHolderId });
+      if (!acquired.acquired) {
+        return {
+          ok: false,
+          reason:
+            "This checkout is already owned by another Workflow home. Use a separate clone or Git worktree for an independent Workflow home.",
+          ...(acquired.holderId ? { holderId: acquired.holderId } : {}),
+        };
+      }
+      heldWorkflowHomeLock = acquired.lock;
+      lastWorkflowHomeLockHeartbeatAtMs = Date.now();
+      return { ok: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not acquire this checkout's Workflow-home guard: ${message}`,
+      };
+    }
+  }
+
+  async function heartbeatWorkflowHomeLock(
+    bound: RootScopedPorts,
+  ): Promise<void> {
+    const lock = heldWorkflowHomeLock;
+    if (
+      !lock ||
+      !bound.workflowHomeLock ||
+      Date.now() - lastWorkflowHomeLockHeartbeatAtMs <
+        DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS
+    ) {
+      return;
+    }
+    try {
+      const renewed = await bound.workflowHomeLock.renew(lock);
+      if (renewed.renewed) {
+        lastWorkflowHomeLockHeartbeatAtMs = Date.now();
+      } else {
+        heldWorkflowHomeLock = undefined;
+        lastWorkflowHomeLockHeartbeatAtMs = 0;
+      }
+    } catch {
+      heldWorkflowHomeLock = undefined;
+      lastWorkflowHomeLockHeartbeatAtMs = 0;
+    }
+  }
+
+  async function withWorkflowCoordinatorLeaseMutex<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = workflowCoordinatorLeaseMutex;
+    let unlock: (() => void) | undefined;
+    workflowCoordinatorLeaseMutex = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      unlock?.();
+    }
+  }
+
+  async function releaseHeldWorkflowCoordinatorLeaseUnlocked(
+    bound: RootScopedPorts | undefined,
+  ): Promise<void> {
+    stopWorkflowCoordinatorHeartbeat();
+    const held = heldWorkflowCoordinatorLease;
+    heldWorkflowCoordinatorLease = undefined;
+    if (!held || !bound?.coordination) return;
+    try {
+      await bound.coordination.releaseLease(held.lease);
+    } catch {
+      // TTL expiry is the fail-closed recovery path when a release cannot reach
+      // the remote coordination ref.
+    }
+  }
+
+  async function releaseHeldWorkflowCoordinatorLease(
+    bound: RootScopedPorts | undefined,
+  ): Promise<void> {
+    await withWorkflowCoordinatorLeaseMutex(() =>
+      releaseHeldWorkflowCoordinatorLeaseUnlocked(bound),
+    );
+  }
+
+  async function ensureWorkflowCoordinatorLeaseUnlocked(
+    bound: RootScopedPorts,
+    target: CanonicalTargetIdentity,
+    workflowId: number,
+  ): Promise<WorkflowCoordinatorLeaseCheck> {
+    const coordination = bound.coordination;
+    if (!coordination) {
+      return {
+        ok: false,
+        reason:
+          "Remote Workflow coordinator leasing is unavailable for this coordination-aware workflow.",
+      };
+    }
+
+    const local = await ensureWorkflowHomeLock(bound);
+    if (!local.ok) {
+      return {
+        ok: false,
+        reason: local.reason,
+        ...(local.holderId ? { holderId: local.holderId } : {}),
+      };
+    }
+
+    const targetKey = canonicalTargetIdentityKey(target);
+    let lease = heldWorkflowCoordinatorLease;
+    if (
+      lease &&
+      (lease.workflowId !== workflowId ||
+        canonicalTargetIdentityKey(lease.target) !== targetKey)
+    ) {
+      await releaseHeldWorkflowCoordinatorLeaseUnlocked(bound);
+      lease = undefined;
+    }
+
+    try {
+      if (!lease) {
+        const acquired = await coordination.acquireLease({
+          kind: "workflow-coordinator",
+          repository: target.repository,
+          target,
+          workflowId,
+          holderId: workflowHomeHolderId,
+        });
+        if (!acquired.acquired || acquired.lease.kind !== "workflow-coordinator") {
+          return {
+            ok: false,
+            reason: `Workflow #${workflowId} is already operated by another Workflow home. Resume it only after that home releases or its coordinator lease expires.`,
+            ...(!acquired.acquired && acquired.lease
+              ? { holderId: acquired.lease.holderId }
+              : {}),
+          };
+        }
+        lease = {
+          target: copyCanonicalTarget(target),
+          workflowId,
+          lease: acquired.lease,
+          renewedAtMs: Date.now(),
+        };
+        heldWorkflowCoordinatorLease = lease;
+      } else if (
+        Date.now() - lease.renewedAtMs >=
+        DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS
+      ) {
+        const renewed = await coordination.renewLease({ lease: lease.lease });
+        if (!renewed.renewed) {
+          heldWorkflowCoordinatorLease = undefined;
+          return {
+            ok: false,
+            reason: `Workflow #${workflowId} coordinator lease could not be renewed (${renewed.reason}). Remote mutation is blocked until it is explicitly resumed.`,
+            ...(renewed.lease ? { holderId: renewed.lease.holderId } : {}),
+          };
+        }
+        if (renewed.lease.kind !== "workflow-coordinator") {
+          heldWorkflowCoordinatorLease = undefined;
+          return {
+            ok: false,
+            reason: `Workflow #${workflowId} coordinator lease renewal returned an unexpected lease kind. Remote mutation is blocked until it is explicitly resumed.`,
+          };
+        }
+        lease = {
+          ...lease,
+          lease: renewed.lease,
+          renewedAtMs: Date.now(),
+        };
+        heldWorkflowCoordinatorLease = lease;
+      }
+
+      const verified = await coordination.verifyLease(lease.lease);
+      if (!verified.valid) {
+        heldWorkflowCoordinatorLease = undefined;
+        return {
+          ok: false,
+          reason: `Workflow #${workflowId} coordinator lease is no longer valid (${verified.reason}). Remote mutation is blocked until it is explicitly resumed.`,
+          ...(verified.lease ? { holderId: verified.lease.holderId } : {}),
+        };
+      }
+      if (verified.lease.kind !== "workflow-coordinator") {
+        heldWorkflowCoordinatorLease = undefined;
+        return {
+          ok: false,
+          reason: `Workflow #${workflowId} coordinator lease verification returned an unexpected lease kind. Remote mutation is blocked until it is explicitly resumed.`,
+        };
+      }
+      lease = {
+        ...lease,
+        lease: verified.lease,
+      };
+      heldWorkflowCoordinatorLease = lease;
+      return { ok: true, lease: lease.lease };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not verify Workflow #${workflowId} coordinator lease: ${message}`,
+      };
+    }
+  }
+
+  async function ensureWorkflowCoordinatorLease(
+    bound: RootScopedPorts,
+    target: CanonicalTargetIdentity,
+    workflowId: number,
+  ): Promise<WorkflowCoordinatorLeaseCheck> {
+    return withWorkflowCoordinatorLeaseMutex(() =>
+      ensureWorkflowCoordinatorLeaseUnlocked(bound, target, workflowId),
+    );
+  }
+
+  /** Best-effort heartbeat while a live panel or worker event keeps this home active. */
+  async function heartbeatHeldWorkflowCoordinatorLease(
+    bound: RootScopedPorts,
+  ): Promise<void> {
+    const held = heldWorkflowCoordinatorLease;
+    if (!held) return;
+    await heartbeatWorkflowHomeLock(bound);
+    // A shutdown/root switch may have released this lease while awaiting the
+    // local heartbeat. Never reacquire it from a stale timer callback.
+    if (heldWorkflowCoordinatorLease !== held) return;
+    if (
+      Date.now() - held.renewedAtMs <
+      DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS
+    ) {
+      return;
+    }
+    await ensureWorkflowCoordinatorLease(bound, held.target, held.workflowId);
+  }
+
+  function stopWorkflowCoordinatorHeartbeat(): void {
+    if (workflowCoordinatorHeartbeatTimer) {
+      clearInterval(workflowCoordinatorHeartbeatTimer);
+      workflowCoordinatorHeartbeatTimer = undefined;
+    }
+    workflowCoordinatorHeartbeatUsers = 0;
+  }
+
+  /** Keep a held lease alive across one long local operation without pinning Node's event loop. */
+  function startWorkflowCoordinatorHeartbeat(
+    bound: RootScopedPorts,
+  ): () => void {
+    if (!heldWorkflowCoordinatorLease) return () => {};
+    workflowCoordinatorHeartbeatUsers += 1;
+    if (!workflowCoordinatorHeartbeatTimer) {
+      workflowCoordinatorHeartbeatTimer = setInterval(() => {
+        if (workflowCoordinatorHeartbeatInFlight) return;
+        workflowCoordinatorHeartbeatInFlight = true;
+        void heartbeatHeldWorkflowCoordinatorLease(bound).finally(() => {
+          workflowCoordinatorHeartbeatInFlight = false;
+        });
+      }, Math.max(
+        1_000,
+        Math.floor(DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS / 2),
+      ));
+      workflowCoordinatorHeartbeatTimer.unref();
+    }
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      workflowCoordinatorHeartbeatUsers = Math.max(
+        0,
+        workflowCoordinatorHeartbeatUsers - 1,
+      );
+      if (workflowCoordinatorHeartbeatUsers === 0) {
+        stopWorkflowCoordinatorHeartbeat();
+      }
+    };
+  }
+
+  async function ensureActiveWorkflowCoordinatorLease(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<WorkflowCoordinatorLeaseCheck | { ok: true; lease?: undefined }> {
+    if (!active.coordination) return { ok: true };
+    const getBinding = bound.preferences.getWorkflowHomeBinding;
+    if (!getBinding) {
+      return {
+        ok: false,
+        reason:
+          "This Workflow home cannot read its local canonical binding for a coordination-aware workflow.",
+      };
+    }
+    let binding: WorkflowHomeBinding | undefined;
+    try {
+      binding = await getBinding(active.coordination.target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not read this Workflow home's local binding: ${message}`,
+      };
+    }
+    if (
+      !binding ||
+      binding.workflowId !== active.workflowId ||
+      canonicalTargetIdentityKey(binding.target) !==
+        canonicalTargetIdentityKey(active.coordination.target)
+    ) {
+      return {
+        ok: false,
+        reason: `Workflow #${active.workflowId} is not bound to this Workflow home. Choose an explicit Resume action before operating it.`,
+      };
+    }
+    return ensureWorkflowCoordinatorLease(
+      bound,
+      active.coordination.target,
+      active.workflowId,
+    );
+  }
+
+  async function persistWorkflowHomeBinding(
+    bound: RootScopedPorts,
+    target: CanonicalTargetIdentity,
+    workflowId: number,
+  ): Promise<void> {
+    const setBinding = bound.preferences.setWorkflowHomeBinding;
+    if (!setBinding) {
+      throw new Error(
+        "This Workflow home cannot persist canonical local bindings for coordination-aware workflows.",
+      );
+    }
+    await setBinding({ target: copyCanonicalTarget(target), workflowId });
+  }
+
+  async function clearWorkflowHomeBinding(
+    bound: RootScopedPorts,
+    target: CanonicalTargetIdentity,
+  ): Promise<void> {
+    const clearBinding = bound.preferences.clearWorkflowHomeBinding;
+    if (!clearBinding) return;
+    await clearBinding(target);
+  }
+
+  async function loadLegacyWorkflowRoute(
+    bound: RootScopedPorts,
+    targetBranch: string,
+    options: { force?: boolean },
+  ): Promise<WorkflowHomeRoute> {
+    const hint = await bound.preferences.getActiveWorkflowId(targetBranch);
+    const cacheKey = `legacy:${targetBranch}:${hint ?? ""}`;
+    const now = Date.now();
+    if (
+      !options.force &&
+      workflowHomeRouteTtl &&
+      workflowHomeRouteTtl.key === cacheKey &&
+      now - workflowHomeRouteTtl.at < TRACKER_READ_TTL_MS
+    ) {
+      return workflowHomeRouteTtl.value;
+    }
+    // Preserve version-1 behavior during temporary tracker GraphQL backoff.
+    if (
+      !options.force &&
+      isInGraphqlBackoff() &&
+      workflowHomeRouteTtl &&
+      workflowHomeRouteTtl.key === cacheKey
+    ) {
+      return workflowHomeRouteTtl.value;
+    }
+
+    const active = await bound.tracker.findActiveWorkflow(targetBranch, hint);
+    if (active?.coordination) {
+      return {
+        kind: "unavailable",
+        reason:
+          "This coordination-aware workflow requires canonical Workflow-home binding and a remote CoordinationPort; legacy routing will not operate it.",
+      };
+    }
+    if (active) {
+      const local = await ensureWorkflowHomeLock(bound);
+      if (!local.ok) {
+        return { kind: "unavailable", reason: local.reason };
+      }
+      await bound.preferences.setActiveWorkflowId(targetBranch, active.workflowId);
+    } else if (hint !== undefined) {
+      await bound.preferences.clearActiveWorkflowId(targetBranch);
+    }
+    const route: WorkflowHomeRoute = { kind: "legacy", ...(active ? { active } : {}) };
+    workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+    return route;
+  }
+
+  async function loadWorkflowHomeRoute(
+    bound: RootScopedPorts,
+    options: { force?: boolean } = {},
+  ): Promise<WorkflowHomeRoute> {
+    const context = await resolveCoordinationRoutingContext(bound);
+    if (!context.supported) {
+      const targetBranch = await resolveTargetBranch(
+        bound.preferences,
+        bound.environment,
+      );
+      return loadLegacyWorkflowRoute(bound, targetBranch, options);
+    }
+    if (!context.ok) {
+      return { kind: "unavailable", reason: context.reason };
+    }
+
+    const target = context.target;
+    const targetBranch = await resolveTargetBranch(
+      bound.preferences,
+      bound.environment,
+    );
+    const cacheKey = `coordination:${canonicalTargetIdentityKey(target)}`;
+    const now = Date.now();
+    if (
+      !options.force &&
+      workflowHomeRouteTtl &&
+      workflowHomeRouteTtl.key === cacheKey &&
+      now - workflowHomeRouteTtl.at < TRACKER_READ_TTL_MS
+    ) {
+      return workflowHomeRouteTtl.value;
+    }
+
+    let candidates: readonly ActiveWorkflow[];
+    try {
+      candidates = await bound.tracker.findActiveWorkflows(target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "unavailable",
+        reason: `Could not discover Active workflows for this canonical Target: ${message}`,
+      };
+    }
+
+    const getBinding = bound.preferences.getWorkflowHomeBinding;
+    const legacyHint = await bound.preferences.getActiveWorkflowId(targetBranch);
+    let binding: WorkflowHomeBinding | undefined;
+    try {
+      binding = getBinding ? await getBinding(target) : undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "unavailable",
+        reason: `Could not read this Workflow home's local binding: ${message}`,
+      };
+    }
+
+    if (binding) {
+      const active = candidates.find(
+        (candidate) => candidate.workflowId === binding!.workflowId,
+      );
+      if (!active) {
+        try {
+          await clearWorkflowHomeBinding(bound, target);
+        } catch {
+          // The binding is already known stale; selection still fails closed.
+        }
+        const route: WorkflowHomeRoute = {
+          kind: "selection-required",
+          target,
+          candidates,
+          staleBinding: binding,
+        };
+        workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+        return route;
+      }
+      // Version-1 manifests remain on their documented legacy path, while
+      // still taking the local checkout guard before they can be operated.
+      if (!active.coordination) {
+        const local = await ensureWorkflowHomeLock(bound);
+        if (!local.ok) return { kind: "unavailable", reason: local.reason };
+        const route: WorkflowHomeRoute = { kind: "legacy", active };
+        workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+        return route;
+      }
+      const lease = await ensureWorkflowCoordinatorLease(
+        bound,
+        target,
+        active.workflowId,
+      );
+      const route: WorkflowHomeRoute = lease.ok
+        ? { kind: "bound", active, target }
+        : {
+            kind: "lease-held",
+            target,
+            active,
+            ...(lease.holderId ? { holderId: lease.holderId } : {}),
+          };
+      workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+      return route;
+    }
+
+    // Upgrade an existing explicit v1-era local pointer into the new canonical
+    // binding only when it names a concrete coordination-aware manifest. It is
+    // migration, not arbitrary selection by result order.
+    if (legacyHint !== undefined) {
+      const pointed = candidates.find(
+        (candidate) => candidate.workflowId === legacyHint,
+      );
+      if (pointed?.coordination) {
+        const lease = await ensureWorkflowCoordinatorLease(
+          bound,
+          target,
+          pointed.workflowId,
+        );
+        if (lease.ok) {
+          try {
+            await persistWorkflowHomeBinding(bound, target, pointed.workflowId);
+            const route: WorkflowHomeRoute = {
+              kind: "bound",
+              active: pointed,
+              target,
+            };
+            workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+            return route;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              kind: "unavailable",
+              reason: `Could not migrate this Workflow home's legacy pointer to a canonical binding: ${message}`,
+            };
+          }
+        }
+        return {
+          kind: "lease-held",
+          target,
+          active: pointed,
+          ...(lease.holderId ? { holderId: lease.holderId } : {}),
+        };
+      }
+      if (pointed && !pointed.coordination) {
+        const local = await ensureWorkflowHomeLock(bound);
+        if (!local.ok) return { kind: "unavailable", reason: local.reason };
+        const route: WorkflowHomeRoute = { kind: "legacy", active: pointed };
+        workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+        return route;
+      }
+      await bound.preferences.clearActiveWorkflowId(targetBranch);
+    }
+
+    // Existing v1 manifests retain their legacy single-workflow startup path.
+    const onlyCandidate = candidates[0];
+    if (
+      candidates.length === 1 &&
+      onlyCandidate !== undefined &&
+      !onlyCandidate.coordination
+    ) {
+      const local = await ensureWorkflowHomeLock(bound);
+      if (!local.ok) return { kind: "unavailable", reason: local.reason };
+      const route: WorkflowHomeRoute = { kind: "legacy", active: onlyCandidate };
+      workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+      return route;
+    }
+
+    const route: WorkflowHomeRoute = {
+      kind: "selection-required",
+      target,
+      candidates,
+    };
+    workflowHomeRouteTtl = { key: cacheKey, at: now, value: route };
+    return route;
+  }
+
   async function loadActiveWorkflow(
     bound: RootScopedPorts,
     options: { force?: boolean } = {},
   ): Promise<ActiveWorkflow | undefined> {
-    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
-    const hint = await bound.preferences.getActiveWorkflowId(targetBranch);
-    const cacheKey = `${targetBranch}:${hint ?? ""}`;
-    const now = Date.now();
-    if (
-      !options.force &&
-      activeWorkflowTtl &&
-      activeWorkflowTtl.key === cacheKey &&
-      now - activeWorkflowTtl.at < TRACKER_READ_TTL_MS
-    ) {
-      return activeWorkflowTtl.value;
-    }
-
-    // Under GraphQL backoff, prefer last known Active workflow.
-    if (
-      !options.force &&
-      isInGraphqlBackoff() &&
-      activeWorkflowTtl &&
-      activeWorkflowTtl.key === cacheKey
-    ) {
-      return activeWorkflowTtl.value;
-    }
-
-    const active = await bound.tracker.findActiveWorkflow(
-      targetBranch,
-      hint,
-    );
-    // Keep / refresh the rebuildable local pointer for fast subsequent opens.
-    if (active) {
-      await bound.preferences.setActiveWorkflowId(
-        targetBranch,
-        active.workflowId,
-      );
-    } else if (hint !== undefined) {
-      await bound.preferences.clearActiveWorkflowId(targetBranch);
-    }
-    activeWorkflowTtl = { key: cacheKey, at: now, value: active };
-    return active;
+    const route = await loadWorkflowHomeRoute(bound, options);
+    return route.kind === "legacy" || route.kind === "bound"
+      ? route.active
+      : undefined;
   }
 
   /**
@@ -1449,14 +2135,43 @@ export function createWorkflowCoordinator(
     active: ActiveWorkflow,
     overrides: Partial<WorkflowManifest> = {},
   ): WorkflowManifest {
-    const manifest: WorkflowManifest = {
-      schema: WORKFLOW_MANIFEST_SCHEMA,
-      version: 1,
-      workflowId: active.workflowId,
-      targetBranch: active.targetBranch,
-      stage: overrides.stage ?? active.stage,
-      workerProfile: active.workerProfile,
-    };
+    const manifest: WorkflowManifest = active.coordination
+      ? {
+          schema: WORKFLOW_MANIFEST_SCHEMA,
+          version: 2,
+          workflowId: active.workflowId,
+          targetBranch: active.targetBranch,
+          stage: overrides.stage ?? active.stage,
+          workerProfile: active.workerProfile,
+          coordination: {
+            target: copyCanonicalTarget(active.coordination.target),
+            ...(active.coordination.prFreshness
+              ? { prFreshness: { ...active.coordination.prFreshness } }
+              : {}),
+            ...(active.coordination.queueCandidate
+              ? {
+                  queueCandidate: structuredClone(
+                    active.coordination.queueCandidate,
+                  ),
+                }
+              : {}),
+            ...(active.coordination.observedLeaseGenerations
+              ? {
+                  observedLeaseGenerations: {
+                    ...active.coordination.observedLeaseGenerations,
+                  },
+                }
+              : {}),
+          },
+        }
+      : {
+          schema: WORKFLOW_MANIFEST_SCHEMA,
+          version: 1,
+          workflowId: active.workflowId,
+          targetBranch: active.targetBranch,
+          stage: overrides.stage ?? active.stage,
+          workerProfile: active.workerProfile,
+        };
     const tickets = overrides.tickets ?? active.tickets;
     if (tickets) {
       manifest.tickets = [...tickets];
@@ -1486,6 +2201,24 @@ export function createWorkflowCoordinator(
       manifest.followUpOf = followUpOf;
     }
     return manifest;
+  }
+
+  function manifestWithCoordinatorLeaseGeneration(
+    manifest: WorkflowManifest,
+    lease: WorkflowCoordinatorLease | undefined,
+  ): WorkflowManifest {
+    if (!lease || manifest.version !== 2) return manifest;
+    return {
+      ...manifest,
+      coordination: {
+        ...manifest.coordination,
+        target: copyCanonicalTarget(manifest.coordination.target),
+        observedLeaseGenerations: {
+          ...manifest.coordination.observedLeaseGenerations,
+          workflowCoordinator: lease.generation,
+        },
+      },
+    };
   }
 
   async function loadTicketProgress(
@@ -1686,10 +2419,16 @@ export function createWorkflowCoordinator(
     workflowId: number,
     workflowTitle?: string,
   ): Promise<StageResult> {
-    const outcome = await bound.skills.runCreateTickets({
-      workflowId,
-      ...(workflowTitle ? { title: workflowTitle } : {}),
-    });
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
+    let outcome;
+    try {
+      outcome = await bound.skills.runCreateTickets({
+        workflowId,
+        ...(workflowTitle ? { title: workflowTitle } : {}),
+      });
+    } finally {
+      stopHeartbeat();
+    }
     if (!outcome.ok) {
       pending = undefined;
       return {
@@ -1866,6 +2605,55 @@ export function createWorkflowCoordinator(
     return result;
   }
 
+  function workflowRoutingActions(route: WorkflowHomeRoute): NextAction[] {
+    if (route.kind === "selection-required") {
+      const resume = route.candidates.map((candidate) => ({
+        id: resumeWorkflowActionId(candidate.workflowId),
+        label: `Resume Workflow #${candidate.workflowId}`,
+        description: [
+          candidate.title ? candidate.title : `Active workflow at ${candidate.stage}`,
+          "Bind this checkout explicitly and acquire its Workflow coordinator lease.",
+          route.staleBinding
+            ? `Previous binding #${route.staleBinding.workflowId} is no longer Active.`
+            : undefined,
+        ]
+          .filter((line): line is string => Boolean(line))
+          .join(" "),
+      }));
+      const actions: NextAction[] = [
+        ...resume,
+        {
+          id: START_NEW_INDEPENDENT_WORKFLOW_ACTION.id,
+          label: START_NEW_INDEPENDENT_WORKFLOW_ACTION.label,
+          description: START_NEW_INDEPENDENT_WORKFLOW_ACTION.description,
+        },
+      ];
+      if (
+        route.candidates.length === 0 &&
+        lastCompletedWorkflow &&
+        targetRefFromBranch(lastCompletedWorkflow.targetBranch) ===
+          route.target.targetRef
+      ) {
+        actions.push({
+          id: START_FOLLOW_UP_ACTION.id,
+          label: START_FOLLOW_UP_ACTION.label,
+          description: `${START_FOLLOW_UP_ACTION.description} References completed Workflow #${lastCompletedWorkflow.workflowId}.`,
+        });
+      }
+      return actions;
+    }
+    if (route.kind === "lease-held") {
+      return [
+        {
+          id: resumeWorkflowActionId(route.active.workflowId),
+          label: `Resume Workflow #${route.active.workflowId}`,
+          description: `Workflow coordinator lease is held${route.holderId ? ` by ${route.holderId}` : " by another Workflow home"}. Retry only after that home releases or the lease expires.`,
+        },
+      ];
+    }
+    return [];
+  }
+
   async function nextActions(): Promise<NextAction[]> {
     const result = await preflight();
     if (!result.ok) {
@@ -1873,7 +2661,17 @@ export function createWorkflowCoordinator(
     }
 
     const bound = await requireScoped();
-    const active = await loadActiveWorkflow(bound);
+    const route = await loadWorkflowHomeRoute(bound);
+    if (
+      route.kind === "selection-required" ||
+      route.kind === "lease-held"
+    ) {
+      return workflowRoutingActions(route);
+    }
+    if (route.kind === "unavailable") {
+      return [];
+    }
+    const active = route.active;
 
     if (!active) {
       const actions: NextAction[] = [
@@ -2110,6 +2908,15 @@ export function createWorkflowCoordinator(
       return startCreateSpec();
     }
 
+    if (actionId === START_NEW_INDEPENDENT_WORKFLOW_ACTION.id) {
+      return startCreateSpec({ independent: true });
+    }
+
+    const resumeWorkflowId = parseResumeWorkflowActionId(actionId);
+    if (resumeWorkflowId !== undefined) {
+      return resumeWorkflow(resumeWorkflowId);
+    }
+
     if (actionId === CREATE_TICKETS_ACTION.id) {
       return startCreateTickets();
     }
@@ -2201,7 +3008,109 @@ export function createWorkflowCoordinator(
     return result;
   }
 
-  async function startCreateSpec(): Promise<StageResult> {
+  async function resumeWorkflow(workflowId: number): Promise<StageResult> {
+    const bound = await requireScoped();
+    const context = await resolveCoordinationRoutingContext(bound);
+    if (!context.supported) {
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason:
+          "Explicit Workflow-home resume is unavailable while this root is using legacy workflow routing.",
+        workflowId,
+      };
+    }
+    if (!context.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason: context.reason,
+        workflowId,
+      };
+    }
+
+    let candidates: readonly ActiveWorkflow[];
+    try {
+      candidates = await bound.tracker.findActiveWorkflows(context.target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason: `Could not discover Workflow #${workflowId} for resume: ${message}`,
+        workflowId,
+      };
+    }
+    const active = candidates.find((candidate) => candidate.workflowId === workflowId);
+    if (!active) {
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason: `Workflow #${workflowId} is not an Active workflow for this canonical Target. It was not bound.`,
+        workflowId,
+      };
+    }
+
+    if (!active.coordination) {
+      // Existing v1 workflows retain their single-workflow path. Persist only
+      // the legacy routing hint rather than pretending their manifest has a
+      // remote coordinator lease it cannot validate.
+      const local = await ensureWorkflowHomeLock(bound);
+      if (!local.ok) {
+        return {
+          status: "failed",
+          stage: "workflow-routing",
+          reason: local.reason,
+          workflowId,
+        };
+      }
+      await bound.preferences.setActiveWorkflowId(active.targetBranch, workflowId);
+      invalidatePanelCaches();
+      return {
+        status: "completed",
+        stage: "workflow-routing",
+        workflowId,
+        targetBranch: active.targetBranch,
+      };
+    }
+
+    const lease = await ensureWorkflowCoordinatorLease(
+      bound,
+      context.target,
+      workflowId,
+    );
+    if (!lease.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason: lease.reason,
+        workflowId,
+      };
+    }
+    try {
+      await persistWorkflowHomeBinding(bound, context.target, workflowId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await releaseHeldWorkflowCoordinatorLease(bound);
+      return {
+        status: "failed",
+        stage: "workflow-routing",
+        reason: `Workflow #${workflowId} acquired its coordinator lease but could not persist this checkout's binding: ${message}`,
+        workflowId,
+      };
+    }
+    invalidatePanelCaches();
+    return {
+      status: "completed",
+      stage: "workflow-routing",
+      workflowId,
+      targetBranch: active.targetBranch,
+    };
+  }
+
+  async function startCreateSpec(
+    options: { independent?: boolean } = {},
+  ): Promise<StageResult> {
     const bound = await requireScoped();
     const preflightResult = await preflight();
     if (!preflightResult.ok) {
@@ -2213,12 +3122,48 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const active = await loadActiveWorkflow(bound);
-    if (active) {
+    const route = await loadWorkflowHomeRoute(bound, { force: true });
+    if (route.kind === "legacy" || route.kind === "bound") {
+      const active = route.active;
+      if (active) {
+        return {
+          status: "failed",
+          stage: "create-spec",
+          reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Create-spec is unavailable until that workflow completes.`,
+        };
+      }
+    }
+    if (route.kind === "lease-held") {
       return {
         status: "failed",
         stage: "create-spec",
-        reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Create-spec is unavailable until that workflow completes.`,
+        reason: `Workflow #${route.active.workflowId} remains bound to this checkout, but its coordinator lease is held by another Workflow home. Resume it explicitly after that lease is released.`,
+        workflowId: route.active.workflowId,
+      };
+    }
+    if (route.kind === "unavailable") {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: route.reason,
+      };
+    }
+    if (route.kind === "selection-required" && !options.independent) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason:
+          "This checkout has no valid Workflow-home binding. Choose Resume Workflow or Start new independent workflow explicitly.",
+      };
+    }
+    // A fresh legacy home and an explicit coordinated Start-new choice both
+    // acquire the same local checkout guard before Planning begins.
+    const local = await ensureWorkflowHomeLock(bound);
+    if (!local.ok) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: local.reason,
       };
     }
 
@@ -2363,7 +3308,24 @@ export function createWorkflowCoordinator(
       };
     }
 
-    // Remote writes only on Publish, owned by the Workflow coordinator.
+    const routing = await resolveCoordinationRoutingContext(bound);
+    if (routing.supported && !routing.ok) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: routing.reason,
+      };
+    }
+    if (routing.supported) {
+      const local = await ensureWorkflowHomeLock(bound);
+      if (!local.ok) {
+        return { status: "failed", stage: "create-spec", reason: local.reason };
+      }
+    }
+
+    // A newly-created issue has no Workflow ID until GitHub returns it, so its
+    // remote coordinator lease is acquired immediately afterward and before
+    // the first managed manifest write.
     let issueNumber: number;
     try {
       const created = await bound.tracker.createIssue({
@@ -2381,32 +3343,73 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const manifest: WorkflowManifest = {
-      schema: WORKFLOW_MANIFEST_SCHEMA,
-      version: 1,
-      workflowId: issueNumber,
-      targetBranch,
-      stage: "spec-published",
-      workerProfile: workerProfile.profile,
-    };
+    let coordinatorLease: WorkflowCoordinatorLease | undefined;
+    if (routing.supported && routing.ok) {
+      const lease = await ensureWorkflowCoordinatorLease(
+        bound,
+        routing.target,
+        issueNumber,
+      );
+      if (!lease.ok) {
+        pending = undefined;
+        return {
+          status: "failed",
+          stage: "create-spec",
+          workflowId: issueNumber,
+          reason: `Spec issue #${issueNumber} was created, but its Workflow coordinator lease could not be acquired: ${lease.reason}`,
+        };
+      }
+      coordinatorLease = lease.lease;
+    }
+
+    const manifest: WorkflowManifest =
+      routing.supported && routing.ok && coordinatorLease
+        ? {
+            schema: WORKFLOW_MANIFEST_SCHEMA,
+            version: 2,
+            workflowId: issueNumber,
+            targetBranch,
+            stage: "spec-published",
+            workerProfile: workerProfile.profile,
+            coordination: {
+              target: copyCanonicalTarget(routing.target),
+              observedLeaseGenerations: {
+                workflowCoordinator: coordinatorLease.generation,
+              },
+            },
+          }
+        : {
+            schema: WORKFLOW_MANIFEST_SCHEMA,
+            version: 1,
+            workflowId: issueNumber,
+            targetBranch,
+            stage: "spec-published",
+            workerProfile: workerProfile.profile,
+          };
 
     try {
       await bound.tracker.writeWorkflowManifest(issueNumber, manifest);
+      if (routing.supported && routing.ok) {
+        await persistWorkflowHomeBinding(bound, routing.target, issueNumber);
+      } else {
+        // Retain the v1 local pointer only for legacy manifests.
+        await bound.preferences.setActiveWorkflowId(targetBranch, issueNumber);
+      }
       invalidatePanelCaches();
     } catch (error) {
       // Issue already exists remotely — drop the session pending draft so a retry
       // cannot create a second spec issue for the same Stage confirmation.
       pending = undefined;
+      if (routing.supported) {
+        await releaseHeldWorkflowCoordinatorLease(bound);
+      }
       const message = error instanceof Error ? error.message : String(error);
       return {
         status: "failed",
         stage: "create-spec",
-        reason: `Spec issue #${issueNumber} was created, but writing the Workflow manifest failed: ${message}. Inspect issue #${issueNumber} and recover the Workflow manifest before continuing.`,
+        reason: `Spec issue #${issueNumber} was created, but writing the Workflow manifest or local binding failed: ${message}. Inspect issue #${issueNumber} and recover it explicitly before continuing.`,
       };
     }
-
-    // Rebuildable local pointer so later /matt-auto opens do not scan every issue.
-    await bound.preferences.setActiveWorkflowId(targetBranch, issueNumber);
 
     pending = undefined;
     return {
@@ -2459,6 +3462,20 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const initialAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!initialAuthority.ok) {
+      pending = undefined;
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: initialAuthority.reason,
+        workflowId: active.workflowId,
+      };
+    }
+
     const ordered = topologicalOrder(current.draft.tickets);
     const localToNumber = new Map<string, number>();
     const localToTitle = new Map(
@@ -2488,6 +3505,14 @@ export function createWorkflowCoordinator(
           blockers,
         );
 
+        const authority = await ensureActiveWorkflowCoordinatorLease(
+          bound,
+          active,
+        );
+        if (!authority.ok) {
+          throw new Error(authority.reason);
+        }
+
         const created = await bound.tracker.createIssue({
           title: ticket.title,
           body,
@@ -2496,9 +3521,19 @@ export function createWorkflowCoordinator(
         localToNumber.set(ticket.localId, created.number);
         createdNumbers.push(created.number);
 
+        const linkAuthority = await ensureActiveWorkflowCoordinatorLease(
+          bound,
+          active,
+        );
+        if (!linkAuthority.ok) throw new Error(linkAuthority.reason);
         await bound.tracker.addSubIssue(current.workflowId, created.number);
 
         for (const blocker of blockers) {
+          const blockerAuthority = await ensureActiveWorkflowCoordinatorLease(
+            bound,
+            active,
+          );
+          if (!blockerAuthority.ok) throw new Error(blockerAuthority.reason);
           await bound.tracker.addBlockedBy(created.number, blocker.number);
         }
       }
@@ -2516,19 +3551,30 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
-    const manifest: WorkflowManifest = {
-      schema: WORKFLOW_MANIFEST_SCHEMA,
-      version: 1,
-      workflowId: current.workflowId,
-      targetBranch,
+    const manifest = manifestFromActive(active, {
       stage: "tickets-published",
-      workerProfile: active.workerProfile,
       tickets: createdNumbers,
-    };
+    });
+
+    const finalAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!finalAuthority.ok) {
+      pending = undefined;
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: finalAuthority.reason,
+        workflowId: active.workflowId,
+      };
+    }
 
     try {
-      await bound.tracker.writeWorkflowManifest(current.workflowId, manifest);
+      await bound.tracker.writeWorkflowManifest(
+        current.workflowId,
+        manifestWithCoordinatorLeaseGeneration(manifest, finalAuthority.lease),
+      );
       invalidatePanelCaches();
     } catch (error) {
       pending = undefined;
@@ -2611,6 +3657,20 @@ export function createWorkflowCoordinator(
         reason:
           "Implementation workers require an Active workflow with published tickets (pre-merge).",
         ticketNumber,
+      };
+    }
+
+    const initialAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!initialAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: initialAuthority.reason,
+        ticketNumber,
+        workflowId: active.workflowId,
       };
     }
 
@@ -2967,6 +4027,26 @@ export function createWorkflowCoordinator(
       onEvent: (event) => handleWorkerEvent(bound, event),
     };
 
+    const launchAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!launchAuthority.ok) {
+      activeImplementationWorkers.delete(workerId);
+      await bound.transcripts.append(transcriptKey, {
+        type: "worker-launch-blocked",
+        reason: launchAuthority.reason,
+      });
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: launchAuthority.reason,
+        ticketNumber,
+        attempt,
+        workflowId: active.workflowId,
+      };
+    }
+
     try {
       const runtime = await bound.workers.launch(
         {
@@ -3064,6 +4144,8 @@ export function createWorkflowCoordinator(
     if (!worker) {
       return;
     }
+
+    await heartbeatHeldWorkflowCoordinatorLease(bound);
 
     const transcriptKey = {
       workflowId: worker.workflowId,
@@ -3193,6 +4275,8 @@ export function createWorkflowCoordinator(
     if (!worker || worker.workerId !== event.workerId) {
       return;
     }
+
+    await heartbeatHeldWorkflowCoordinatorLease(bound);
 
     const transcriptKey = {
       workflowId: worker.workflowId,
@@ -3465,6 +4549,7 @@ export function createWorkflowCoordinator(
       ticketNumber: unit.ticketNumber,
       attempt: unit.attempt,
     };
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
 
     try {
       await bound.transcripts.append(transcriptKey, {
@@ -3487,6 +4572,27 @@ export function createWorkflowCoordinator(
           reason,
           ticketNumber: unit.ticketNumber,
           attempt: unit.attempt,
+        };
+      }
+
+      const integrationAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!integrationAuthority.ok) {
+        unit.lastFailure = integrationAuthority.reason;
+        await bound.transcripts.append(transcriptKey, {
+          type: "integration-unit-failed",
+          reason: integrationAuthority.reason,
+          phase: "coordinator-lease",
+        });
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason: integrationAuthority.reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workflowId: active.workflowId,
         };
       }
 
@@ -3667,6 +4773,7 @@ export function createWorkflowCoordinator(
         integrationWorkspace,
       );
     } finally {
+      stopHeartbeat();
       integrationInProgress = false;
     }
   }
@@ -3688,6 +4795,35 @@ export function createWorkflowCoordinator(
       ticketNumber: unit.ticketNumber,
       attempt: unit.attempt,
     };
+
+    const active = await loadActiveWorkflow(bound, { force: true });
+    if (!active || active.workflowId !== unit.workflowId) {
+      const reason =
+        "No bound Active workflow matches this Conflict resolution worker. Recover Workflow-home routing before retrying.";
+      unit.lastFailure = reason;
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+      };
+    }
+    const conflictAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!conflictAuthority.ok) {
+      unit.lastFailure = conflictAuthority.reason;
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason: conflictAuthority.reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+        workflowId: active.workflowId,
+      };
+    }
 
     const workerProfile = await resolveWorkerProfile(bound);
     if (!workerProfile) {
@@ -3748,6 +4884,27 @@ export function createWorkflowCoordinator(
     const sink: WorkerEventSink = {
       onEvent: (event) => handleWorkerEvent(bound, event),
     };
+
+    const launchAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!launchAuthority.ok) {
+      activeConflictWorker = undefined;
+      unit.lastFailure = launchAuthority.reason;
+      await bound.transcripts.append(transcriptKey, {
+        type: "conflict-resolution-launch-blocked",
+        reason: launchAuthority.reason,
+      });
+      return {
+        status: "failed",
+        stage: "integrate",
+        reason: launchAuthority.reason,
+        ticketNumber: unit.ticketNumber,
+        attempt: unit.attempt,
+        workflowId: active.workflowId,
+      };
+    }
 
     try {
       const runtime = await bound.workers.launch(
@@ -3827,6 +4984,7 @@ export function createWorkflowCoordinator(
       ticketNumber: unit.ticketNumber,
       attempt: unit.attempt,
     };
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
 
     try {
       const active = await loadActiveWorkflow(bound);
@@ -3844,6 +5002,22 @@ export function createWorkflowCoordinator(
           reason,
           ticketNumber: unit.ticketNumber,
           attempt: unit.attempt,
+        };
+      }
+
+      const finishAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!finishAuthority.ok) {
+        unit.lastFailure = finishAuthority.reason;
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason: finishAuthority.reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workflowId: active.workflowId,
         };
       }
 
@@ -3914,6 +5088,21 @@ export function createWorkflowCoordinator(
       });
 
       // Coordinator-only remote writes: push Integration + ticket branches.
+      const pushAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!pushAuthority.ok) {
+        unit.lastFailure = pushAuthority.reason;
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason: pushAuthority.reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workflowId: active.workflowId,
+        };
+      }
       const pushedBranches: string[] = [];
       try {
         await bound.remoteGit.pushBranch(integrationWorkspace.branchName);
@@ -3953,9 +5142,29 @@ export function createWorkflowCoordinator(
         integratedTickets,
       });
 
+      const manifestAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!manifestAuthority.ok) {
+        const reason = manifestAuthority.reason;
+        unit.lastFailure = reason;
+        return {
+          status: "failed",
+          stage: "integrate",
+          reason,
+          ticketNumber: unit.ticketNumber,
+          attempt: unit.attempt,
+          workflowId: active.workflowId,
+        };
+      }
+
       try {
-        await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
-      invalidatePanelCaches();
+        await bound.tracker.writeWorkflowManifest(
+          active.workflowId,
+          manifestWithCoordinatorLeaseGeneration(manifest, manifestAuthority.lease),
+        );
+        invalidatePanelCaches();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const reason = `Pushed ${pushedBranches.join(", ")} but writing the Workflow manifest failed: ${message}. Recover the Workflow manifest on #${active.workflowId} before continuing.`;
@@ -4002,6 +5211,7 @@ export function createWorkflowCoordinator(
         rePush: false,
       });
     } finally {
+      stopHeartbeat();
       if (heldGuard) {
         integrationInProgress = false;
       }
@@ -4030,6 +5240,29 @@ export function createWorkflowCoordinator(
     };
 
     if (input.rePush) {
+      const active = await loadActiveWorkflow(bound, { force: true });
+      if (!active || active.workflowId !== input.workflowId) {
+        return {
+          status: "failed",
+          stage: "ci-gate",
+          reason:
+            "No bound Active workflow matches this CI retry. Recover Workflow-home routing before pushing.",
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          workflowId: input.workflowId,
+        };
+      }
+      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+      if (!authority.ok) {
+        return {
+          status: "failed",
+          stage: "ci-gate",
+          reason: authority.reason,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          workflowId: input.workflowId,
+        };
+      }
       try {
         await bound.remoteGit.pushBranch(input.integrationBranch);
         await bound.transcripts.append(transcriptKey, {
@@ -4083,6 +5316,29 @@ export function createWorkflowCoordinator(
     });
 
     if (ci.status === "success") {
+      const active = await loadActiveWorkflow(bound, { force: true });
+      if (!active || active.workflowId !== input.workflowId) {
+        return {
+          status: "failed",
+          stage: "ci-gate",
+          reason:
+            "No bound Active workflow matches this green CI result. Ticket closure is blocked until Workflow-home routing is recovered.",
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          workflowId: input.workflowId,
+        };
+      }
+      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+      if (!authority.ok) {
+        return {
+          status: "failed",
+          stage: "ci-gate",
+          reason: authority.reason,
+          ticketNumber: input.ticketNumber,
+          attempt: input.attempt,
+          workflowId: input.workflowId,
+        };
+      }
       try {
         await bound.tracker.closeIssue(input.ticketNumber);
       } catch (error) {
@@ -4412,6 +5668,16 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const prAuthority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+    if (!prAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: prAuthority.reason,
+        workflowId: active.workflowId,
+      };
+    }
+
     const head = active.integrationBranch;
     const base = active.targetBranch;
     const title =
@@ -4461,8 +5727,26 @@ export function createWorkflowCoordinator(
       workflowPr,
     });
 
+    const manifestAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!manifestAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: manifestAuthority.reason,
+        workflowId: active.workflowId,
+        workflowPrNumber: pr.number,
+        ...(pr.url ? { workflowPrUrl: pr.url } : {}),
+      };
+    }
+
     try {
-      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      await bound.tracker.writeWorkflowManifest(
+        active.workflowId,
+        manifestWithCoordinatorLeaseGeneration(manifest, manifestAuthority.lease),
+      );
       invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4513,7 +5797,25 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const preMergeAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!preMergeAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: preMergeAuthority.reason,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
+    }
+
     // Dual-root: publish + re-check submodule pointers before merge (#30).
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
     try {
       const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
       const integrationWorkspace =
@@ -4548,6 +5850,25 @@ export function createWorkflowCoordinator(
           ? { workflowPrUrl: active.workflowPr.url }
           : {}),
       };
+    } finally {
+      stopHeartbeat();
+    }
+
+    const mergeAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!mergeAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: mergeAuthority.reason,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
     }
 
     try {
@@ -4569,8 +5890,27 @@ export function createWorkflowCoordinator(
     }
 
     const manifest = manifestFromActive(active, { stage: "merged" });
+    const manifestAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!manifestAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: manifestAuthority.reason,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
+    }
     try {
-      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      await bound.tracker.writeWorkflowManifest(
+        active.workflowId,
+        manifestWithCoordinatorLeaseGeneration(manifest, manifestAuthority.lease),
+      );
       invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4613,6 +5953,19 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const cleanupAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!cleanupAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: cleanupAuthority.reason,
+        workflowId: active.workflowId,
+      };
+    }
+
     await recoverCompletedWorkerTelemetryFromTranscripts(bound, active);
 
     const branches = await bound.workspace.listWorkflowBranches(
@@ -4644,6 +5997,22 @@ export function createWorkflowCoordinator(
         ...(active.integratedTickets ?? []).map((t) => t.branchName),
       ]),
     ].sort();
+
+    const remoteCleanupAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!remoteCleanupAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: remoteCleanupAuthority.reason,
+        workflowId: active.workflowId,
+        removedBranches: remoteBranches,
+        cleanedLocal: true,
+        cleanedRemote: false,
+      };
+    }
 
     try {
       await bound.remoteGit.deleteRemoteBranches(remoteBranches);
@@ -4677,8 +6046,26 @@ export function createWorkflowCoordinator(
 
     // Retain GitHub issue/PR/manifest history — only mark completed.
     const manifest = manifestFromActive(active, { stage: "completed" });
+    const completionAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!completionAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "cleanup",
+        reason: completionAuthority.reason,
+        workflowId: active.workflowId,
+        removedBranches: remoteBranches,
+        cleanedLocal: true,
+        cleanedRemote: true,
+      };
+    }
     try {
-      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      await bound.tracker.writeWorkflowManifest(
+        active.workflowId,
+        manifestWithCoordinatorLeaseGeneration(manifest, completionAuthority.lease),
+      );
       invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4698,7 +6085,11 @@ export function createWorkflowCoordinator(
       targetBranch: active.targetBranch,
       ...(active.title ? { title: active.title } : {}),
     };
-    await bound.preferences.clearActiveWorkflowId(active.targetBranch);
+    // Keep a coordination-aware binding through the parent issue close below:
+    // every remaining remote cleanup mutation must still prove lease ownership.
+    if (!active.coordination) {
+      await bound.preferences.clearActiveWorkflowId(active.targetBranch);
+    }
     invalidatePanelCaches();
 
     // Safe local pull of target branch when worktree allows (FF-only).
@@ -4758,18 +6149,32 @@ export function createWorkflowCoordinator(
           errors: readonly string[];
         }
       | undefined;
-    try {
-      const rootPath = selectedPath ?? ports.startPath;
-      gitlinkGc = await gcMattAutoGitlinkArtifacts(rootPath);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    const gitlinkAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!gitlinkAuthority.ok) {
       gitlinkGc = {
         deletedRemoteRefs: [],
         keptRemoteRefs: [],
         deletedLocalBranches: [],
         worktreePruned: false,
-        errors: [message],
+        errors: [gitlinkAuthority.reason],
       };
+    } else {
+      try {
+        const rootPath = selectedPath ?? ports.startPath;
+        gitlinkGc = await gcMattAutoGitlinkArtifacts(rootPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        gitlinkGc = {
+          deletedRemoteRefs: [],
+          keptRemoteRefs: [],
+          deletedLocalBranches: [],
+          worktreePruned: false,
+          errors: [message],
+        };
+      }
     }
 
     // Close parent Workflow spec (Workflow ID) — part of delivery completion.
@@ -4807,16 +6212,36 @@ export function createWorkflowCoordinator(
       pullLine,
       ...(gcLine ? [gcLine] : []),
     ].join("\n\n");
-    try {
-      await bound.tracker.closeIssue(active.workflowId, {
-        comment: closeComment,
-      });
-      parentSpecClosed = true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    const closeAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!closeAuthority.ok) {
       parentSpecClosed = false;
-      parentSpecCloseWarning = message;
+      parentSpecCloseWarning = closeAuthority.reason;
+    } else {
+      try {
+        await bound.tracker.closeIssue(active.workflowId, {
+          comment: closeComment,
+        });
+        parentSpecClosed = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        parentSpecClosed = false;
+        parentSpecCloseWarning = message;
+      }
     }
+
+    if (active.coordination) {
+      try {
+        await clearWorkflowHomeBinding(bound, active.coordination.target);
+      } catch {
+        // GitHub state is already completed; a stale local pointer routes back
+        // through explicit selection on the next Workflow-home open.
+      }
+    }
+    await releaseHeldWorkflowCoordinatorLease(bound);
+    invalidatePanelCaches();
 
     return {
       status: "completed",
@@ -4848,12 +6273,30 @@ export function createWorkflowCoordinator(
 
   async function startFollowUpWorkflow(): Promise<StageResult> {
     const bound = await requireScoped();
-    const active = await loadActiveWorkflow(bound);
-    if (active) {
+    const route = await loadWorkflowHomeRoute(bound, { force: true });
+    if (route.kind === "legacy" || route.kind === "bound") {
+      const active = route.active;
+      if (active) {
+        return {
+          status: "failed",
+          stage: "follow-up",
+          reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Finish or clean it up before starting a Follow-up workflow.`,
+        };
+      }
+    }
+    if (route.kind === "lease-held") {
       return {
         status: "failed",
         stage: "follow-up",
-        reason: `An Active workflow already exists for Target branch "${active.targetBranch}" (Workflow ID #${active.workflowId}). Finish or clean it up before starting a Follow-up workflow.`,
+        reason: `Workflow #${route.active.workflowId} remains bound to this checkout, but its coordinator lease is held by another Workflow home. Resume it explicitly after that lease is released.`,
+        workflowId: route.active.workflowId,
+      };
+    }
+    if (route.kind === "unavailable") {
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason: route.reason,
       };
     }
 
@@ -4897,6 +6340,27 @@ export function createWorkflowCoordinator(
       "Describe the post-merge rework for this Follow-up workflow.",
     ].join("\n");
 
+    const routing = await resolveCoordinationRoutingContext(bound);
+    if (routing.supported && !routing.ok) {
+      return {
+        status: "failed",
+        stage: "follow-up",
+        reason: routing.reason,
+        followUpOf: original.workflowId,
+      };
+    }
+    if (routing.supported) {
+      const local = await ensureWorkflowHomeLock(bound);
+      if (!local.ok) {
+        return {
+          status: "failed",
+          stage: "follow-up",
+          reason: local.reason,
+          followUpOf: original.workflowId,
+        };
+      }
+    }
+
     let created: { number: number };
     try {
       created = await bound.tracker.createIssue({
@@ -4914,25 +6378,69 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const manifest: WorkflowManifest = {
-      schema: WORKFLOW_MANIFEST_SCHEMA,
-      version: 1,
-      workflowId: created.number,
-      targetBranch,
-      stage: "spec-published",
-      workerProfile: workerProfile.profile,
-      followUpOf: original.workflowId,
-    };
+    let coordinatorLease: WorkflowCoordinatorLease | undefined;
+    if (routing.supported && routing.ok) {
+      const lease = await ensureWorkflowCoordinatorLease(
+        bound,
+        routing.target,
+        created.number,
+      );
+      if (!lease.ok) {
+        return {
+          status: "failed",
+          stage: "follow-up",
+          reason: `Follow-up issue #${created.number} was created, but its Workflow coordinator lease could not be acquired: ${lease.reason}`,
+          workflowId: created.number,
+          followUpOf: original.workflowId,
+        };
+      }
+      coordinatorLease = lease.lease;
+    }
+
+    const manifest: WorkflowManifest =
+      routing.supported && routing.ok && coordinatorLease
+        ? {
+            schema: WORKFLOW_MANIFEST_SCHEMA,
+            version: 2,
+            workflowId: created.number,
+            targetBranch,
+            stage: "spec-published",
+            workerProfile: workerProfile.profile,
+            followUpOf: original.workflowId,
+            coordination: {
+              target: copyCanonicalTarget(routing.target),
+              observedLeaseGenerations: {
+                workflowCoordinator: coordinatorLease.generation,
+              },
+            },
+          }
+        : {
+            schema: WORKFLOW_MANIFEST_SCHEMA,
+            version: 1,
+            workflowId: created.number,
+            targetBranch,
+            stage: "spec-published",
+            workerProfile: workerProfile.profile,
+            followUpOf: original.workflowId,
+          };
 
     try {
       await bound.tracker.writeWorkflowManifest(created.number, manifest);
+      if (routing.supported && routing.ok) {
+        await persistWorkflowHomeBinding(bound, routing.target, created.number);
+      } else {
+        await bound.preferences.setActiveWorkflowId(targetBranch, created.number);
+      }
       invalidatePanelCaches();
     } catch (error) {
+      if (routing.supported) {
+        await releaseHeldWorkflowCoordinatorLease(bound);
+      }
       const message = error instanceof Error ? error.message : String(error);
       return {
         status: "failed",
         stage: "follow-up",
-        reason: `Created Follow-up issue #${created.number} but writing the Workflow manifest failed: ${message}`,
+        reason: `Created Follow-up issue #${created.number} but writing the Workflow manifest or local binding failed: ${message}`,
         workflowId: created.number,
         followUpOf: original.workflowId,
       };
@@ -4983,6 +6491,20 @@ export function createWorkflowCoordinator(
       };
     }
 
+    const reworkAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!reworkAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason: reworkAuthority.reason,
+        ticketNumber,
+        workflowId: active.workflowId,
+      };
+    }
+
     const integrated = (active.integratedTickets ?? []).find(
       (t) => t.number === ticketNumber,
     );
@@ -5007,6 +6529,19 @@ export function createWorkflowCoordinator(
     }
 
     if (ticket.state === "CLOSED") {
+      const reopenAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!reopenAuthority.ok) {
+        return {
+          status: "failed",
+          stage: "rework",
+          reason: reopenAuthority.reason,
+          ticketNumber,
+          workflowId: active.workflowId,
+        };
+      }
       try {
         await bound.tracker.reopenIssue(ticketNumber);
       } catch (error) {
@@ -5030,8 +6565,24 @@ export function createWorkflowCoordinator(
       integratedTickets: remainingIntegrated,
     });
 
+    const manifestAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!manifestAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "rework",
+        reason: manifestAuthority.reason,
+        ticketNumber,
+        workflowId: active.workflowId,
+      };
+    }
     try {
-      await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+      await bound.tracker.writeWorkflowManifest(
+        active.workflowId,
+        manifestWithCoordinatorLeaseGeneration(manifest, manifestAuthority.lease),
+      );
       invalidatePanelCaches();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -5219,6 +6770,21 @@ export function createWorkflowCoordinator(
       setCooldown: true,
       transcriptEvent: { type: "worker-aborted" },
     });
+  }
+
+  async function releaseWorkflowHome(): Promise<void> {
+    const bound = scoped;
+    await releaseHeldWorkflowCoordinatorLease(bound);
+    const lock = heldWorkflowHomeLock;
+    heldWorkflowHomeLock = undefined;
+    lastWorkflowHomeLockHeartbeatAtMs = 0;
+    if (!lock || !bound?.workflowHomeLock) return;
+    try {
+      await bound.workflowHomeLock.release(lock);
+    } catch {
+      // The local lock has a stale-owner recovery path; never turn session
+      // shutdown into a failure because its best-effort release could not run.
+    }
   }
 
   function isPipelinePaused(): boolean {
@@ -5592,7 +7158,7 @@ export function createWorkflowCoordinator(
   function invalidatePanelCaches(): void {
     cachedPanelActive = undefined;
     cachedTicketProgress = undefined;
-    activeWorkflowTtl = undefined;
+    workflowHomeRouteTtl = undefined;
     ticketProgressTtl = undefined;
   }
 
@@ -5600,6 +7166,7 @@ export function createWorkflowCoordinator(
     mode?: "full" | "local";
   }): Promise<WorkflowPanelState | undefined> {
     const bound = await requireScoped();
+    await heartbeatHeldWorkflowCoordinatorLease(bound);
     // Detect zombie running state before snapshotting the panel.
     await reconcileDeadWorkers(bound);
     const mode = options?.mode ?? "full";
@@ -5857,6 +7424,7 @@ export function createWorkflowCoordinator(
     // Session-owned workers abort cleanly on Workflow-root switching.
     if (scoped && selectedPath && path.resolve(selectedPath) !== resolved) {
       await abortWorkers();
+      await releaseWorkflowHome();
       // Follow-up pointer is session-local to the previous Workflow root.
       lastCompletedWorkflow = undefined;
     }
@@ -5984,6 +7552,7 @@ export function createWorkflowCoordinator(
     getPipelineRunElapsedMs,
     confirmDisposition,
     abortWorkers,
+    releaseWorkflowHome,
     pausePipeline,
     resumePipeline,
     terminateRun,

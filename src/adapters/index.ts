@@ -83,6 +83,16 @@ export type {
 } from "./coordination.js";
 export { createCiPort } from "./ci.js";
 export {
+  InMemoryWorkflowHomeLockStore,
+  createInMemoryWorkflowHomeLockPort,
+  createInMemoryWorkflowHomeLockStore,
+  createWorkflowHomeLockPort,
+} from "./workflow-home-lock.js";
+export type {
+  InMemoryWorkflowHomeLockPortOptions,
+  WorkflowHomeLockPortOptions,
+} from "./workflow-home-lock.js";
+export {
   ensureSubmoduleGitlinksPublished,
   gitlinkPublishRef,
   listGitlinksAtHead,

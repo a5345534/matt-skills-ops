@@ -36,7 +36,9 @@ import {
   MERGE_WORKFLOW_PR_ACTION,
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
+  RESUME_WORKFLOW_ACTION_PREFIX,
   START_FOLLOW_UP_ACTION,
+  START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   STAGE_CONFIRMATION_OPTIONS,
   TICKET_PROGRESS_ACTION,
   WORKER_CONCURRENCY_WARNING_THRESHOLD,
@@ -99,6 +101,14 @@ function isReworkNextAction(action: NextAction): boolean {
   return action.id.startsWith(REWORK_TICKET_ACTION_PREFIX);
 }
 
+/** Routing choices must always be chosen by the operator, never auto-picked. */
+function isWorkflowRoutingAction(action: NextAction): boolean {
+  return (
+    action.id === START_NEW_INDEPENDENT_WORKFLOW_ACTION.id ||
+    action.id.startsWith(RESUME_WORKFLOW_ACTION_PREFIX)
+  );
+}
+
 /**
  * Auto-advance picker for `/matt-auto run`.
  *
@@ -116,6 +126,7 @@ export function selectPipelineAction(
     (a) => a.id !== TICKET_PROGRESS_ACTION.id && !isReworkNextAction(a),
   );
   if (actionable.length === 0) return undefined;
+  if (actionable.some(isWorkflowRoutingAction)) return undefined;
   if (actionable.length === 1) return actionable[0];
 
   // Do not auto-start a brand-new workflow when both Create-spec and
@@ -2131,6 +2142,13 @@ export async function presentTicketsStageConfirmation(
 function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
   switch (result.status) {
     case "completed":
+      if (result.stage === "workflow-routing") {
+        ui.notify(
+          `Workflow home is now bound to Workflow #${result.workflowId}${result.targetBranch ? ` for ${result.targetBranch}` : ""}.`,
+          "info",
+        );
+        return;
+      }
       if (result.stage === "create-spec") {
         ui.notify(
           `Published Create-spec as Workflow ID #${result.workflowId}. Workflow manifest written. Next: Create tickets.`,

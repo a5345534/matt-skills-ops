@@ -385,6 +385,10 @@ export function createTrackerPort(cwd: string): TrackerPort {
   }
 
   return {
+    async getCanonicalRepositoryIdentity() {
+      return resolveRepoFullName(cwd);
+    },
+
     async createIssue(input) {
       // Older gh (e.g. 2.45) does not support `gh issue create --json`.
       // Write body via file and parse the issue URL from stdout.

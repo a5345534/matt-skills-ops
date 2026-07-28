@@ -2,16 +2,27 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_WORKER_CONCURRENCY } from "../constants.js";
+import {
+  canonicalTargetIdentitiesEqual,
+  canonicalTargetIdentityKey,
+  isCanonicalTargetIdentity,
+} from "../coordination.js";
 import type { PreferencesPort } from "../ports.js";
-import type { WorkerProfile } from "../types.js";
+import type {
+  CanonicalTargetIdentity,
+  WorkerProfile,
+  WorkflowHomeBinding,
+} from "../types.js";
 
 type PreferencesFile = {
   targetBranch?: string;
   workerProfile?: WorkerProfile;
   /** Optional positive integer Worker concurrency for this prefs layer. */
   workerConcurrency?: number;
-  /** Target branch → Active Workflow ID (rebuildable local cache). */
+  /** Target branch → Active Workflow ID (legacy rebuildable local cache). */
   activeWorkflowIds?: Record<string, number>;
+  /** Canonical Target identity → checkout-local Workflow-home routing binding. */
+  workflowHomeBindings?: Record<string, WorkflowHomeBinding>;
 };
 
 /** True when value is a positive integer (>= 1). */
@@ -103,6 +114,28 @@ function isWorkerProfile(value: unknown): value is WorkerProfile {
     typeof profile.thinkingLevel === "string" &&
     profile.thinkingLevel.length > 0
   );
+}
+
+function isWorkflowHomeBinding(value: unknown): value is WorkflowHomeBinding {
+  if (!value || typeof value !== "object") return false;
+  const binding = value as WorkflowHomeBinding;
+  return (
+    isCanonicalTargetIdentity(binding.target) &&
+    typeof binding.workflowId === "number" &&
+    Number.isInteger(binding.workflowId) &&
+    binding.workflowId > 0
+  );
+}
+
+function copyTarget(target: CanonicalTargetIdentity): CanonicalTargetIdentity {
+  return {
+    repository: { ...target.repository },
+    targetRef: target.targetRef,
+  };
+}
+
+function copyBinding(binding: WorkflowHomeBinding): WorkflowHomeBinding {
+  return { target: copyTarget(binding.target), workflowId: binding.workflowId };
 }
 
 function preferencesPaths(workflowRoot: string): {
@@ -273,6 +306,48 @@ export function createPreferencesPort(workflowRoot: string): PreferencesPort {
         delete next.activeWorkflowIds;
       } else {
         next.activeWorkflowIds = rest;
+      }
+      await writePreferencesFile(rootPrefsPath, next);
+    },
+
+    async getWorkflowHomeBinding(target) {
+      if (!isCanonicalTargetIdentity(target)) return undefined;
+      const root = await readPreferencesFile(rootPrefsPath);
+      const binding = root?.workflowHomeBindings?.[
+        canonicalTargetIdentityKey(target)
+      ];
+      if (!isWorkflowHomeBinding(binding)) return undefined;
+      return canonicalTargetIdentitiesEqual(binding.target, target)
+        ? copyBinding(binding)
+        : undefined;
+    },
+
+    async setWorkflowHomeBinding(binding) {
+      if (!isWorkflowHomeBinding(binding)) {
+        throw new Error("Workflow-home binding requires a canonical Target identity and positive Workflow ID.");
+      }
+      const existing = (await readPreferencesFile(rootPrefsPath)) ?? {};
+      const key = canonicalTargetIdentityKey(binding.target);
+      await writePreferencesFile(rootPrefsPath, {
+        ...existing,
+        workflowHomeBindings: {
+          ...(existing.workflowHomeBindings ?? {}),
+          [key]: copyBinding(binding),
+        },
+      });
+    },
+
+    async clearWorkflowHomeBinding(target) {
+      if (!isCanonicalTargetIdentity(target)) return;
+      const existing = await readPreferencesFile(rootPrefsPath);
+      const key = canonicalTargetIdentityKey(target);
+      if (!existing?.workflowHomeBindings?.[key]) return;
+      const { [key]: _removed, ...rest } = existing.workflowHomeBindings;
+      const next: PreferencesFile = { ...existing };
+      if (Object.keys(rest).length === 0) {
+        delete next.workflowHomeBindings;
+      } else {
+        next.workflowHomeBindings = rest;
       }
       await writePreferencesFile(rootPrefsPath, next);
     },

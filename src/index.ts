@@ -59,12 +59,16 @@ export {
   parseImplementTicketActionId,
   parseIntegrateTicketActionId,
   parseReworkTicketActionId,
+  parseResumeWorkflowActionId,
   REQUIRED_MATT_SKILLS,
+  RESUME_WORKFLOW_ACTION_PREFIX,
   REWORK_TICKET_ACTION_PREFIX,
   reworkTicketActionId,
+  resumeWorkflowActionId,
   SPEC_ISSUE_LABEL,
   STAGE_CONFIRMATION_OPTIONS,
   START_FOLLOW_UP_ACTION,
+  START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   TICKET_ISSUE_LABEL,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
@@ -87,6 +91,16 @@ export type {
   CoordinationPortOptions,
   InMemoryCoordinationPortOptions,
 } from "./adapters/coordination.js";
+export {
+  InMemoryWorkflowHomeLockStore,
+  createInMemoryWorkflowHomeLockPort,
+  createInMemoryWorkflowHomeLockStore,
+  createWorkflowHomeLockPort,
+} from "./adapters/workflow-home-lock.js";
+export type {
+  InMemoryWorkflowHomeLockPortOptions,
+  WorkflowHomeLockPortOptions,
+} from "./adapters/workflow-home-lock.js";
 export {
   canonicalRepositoryIdentityKey,
   canonicalTargetIdentitiesEqual,
@@ -117,6 +131,7 @@ export type { ImplementationLaunchBlockReason } from "./launch-rules.js";
 export type {
   AcquireCoordinationLeaseInput,
   AcquireCoordinationLeaseResult,
+  AcquireWorkflowHomeLockResult,
   CiCheckResult,
   CiPort,
   CoordinationLeaseKey,
@@ -147,6 +162,7 @@ export type {
   VerifyCoordinationLeaseResult,
   WorkerEventSink,
   WorkerLaunchInput,
+  WorkflowHomeLockPort,
   WorkersPort,
   WorkspacePort,
   WorkflowCoordinatorPorts,
@@ -187,6 +203,8 @@ export type {
   WorkflowCoordinationFacts,
   WorkflowLeaseGenerationReferences,
   WorkflowManifest,
+  WorkflowHomeBinding,
+  WorkflowHomeLock,
   WorkflowMergeMethod,
   WorkflowPanelState,
   WorkflowPrFreshness,

@@ -57,6 +57,30 @@ export const CREATE_SPEC_ACTION = {
     "Run the Create-spec Planning stage in Workflow home using the installed to-spec skill.",
 } as const;
 
+/**
+ * Explicit routing choice for a checkout that has no valid Workflow-home
+ * binding. It intentionally does not select any sibling Active workflow.
+ */
+export const START_NEW_INDEPENDENT_WORKFLOW_ACTION = {
+  id: "start-new-independent-workflow",
+  label: "Start new independent workflow",
+  description:
+    "Keep this Workflow home independent and begin Create-spec instead of attaching to another Active workflow.",
+} as const;
+
+/** Prefix for explicit Workflow-home resume choices. */
+export const RESUME_WORKFLOW_ACTION_PREFIX = "resume-workflow:" as const;
+
+export function resumeWorkflowActionId(workflowId: number): string {
+  return `${RESUME_WORKFLOW_ACTION_PREFIX}${workflowId}`;
+}
+
+export function parseResumeWorkflowActionId(actionId: string): number | undefined {
+  if (!actionId.startsWith(RESUME_WORKFLOW_ACTION_PREFIX)) return undefined;
+  const workflowId = Number(actionId.slice(RESUME_WORKFLOW_ACTION_PREFIX.length));
+  return Number.isInteger(workflowId) && workflowId > 0 ? workflowId : undefined;
+}
+
 /** Next action: Create-tickets Planning stage (after a published spec). */
 export const CREATE_TICKETS_ACTION = {
   id: "create-tickets",
