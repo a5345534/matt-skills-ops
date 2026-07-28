@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { implementTicketActionId, TICKET_PROGRESS_ACTION } from "../src/constants.js";
 import type {
   NextAction,
   PreflightResult,
+  StageResult,
   TicketProgressSummary,
   WorkflowPanelState,
 } from "../src/types.js";
@@ -205,14 +207,15 @@ describe("persistent workflow dashboard surface", () => {
     expect(harness.doneValues).toEqual([]);
     expect(notify).not.toHaveBeenCalled();
 
-    // Worker → action. Action rows remain inspectable until the later
-    // dashboard-native action interaction slice owns their execution.
+    // Worker → action. A read-only data source has no coordinator action seam,
+    // so action rows remain safely inspectable in this presentation-only test.
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(
       "Selected · Next action: Implement #43",
     );
 
-    // Enter is still passive in this browsing slice, including on action rows.
+    // Enter remains passive when the caller did not supply an action-capable
+    // coordinator; passive browsing never resolves or writes to chat.
     send(component, "\r");
     expect(harness.doneValues).toEqual([]);
     expect(notify).not.toHaveBeenCalled();
@@ -282,6 +285,153 @@ describe("persistent workflow dashboard surface", () => {
     expect(refreshedFrame).toContain("Progress: Running tests");
     expect(refreshedFrame).toContain("Telemetry: turns: 5 · last turn: —");
     expect(harness.requestRender).toHaveBeenCalled();
+
+    send(component, "\u001b");
+    await expect(opening).resolves.toEqual({ status: "dismissed" });
+  });
+
+  it("runs an explicit action inline, refreshes in place, and follows its Worker attempt", async () => {
+    let currentActions: NextAction[] = [
+      {
+        id: implementTicketActionId(43),
+        label: "Implement #43",
+        description: "Start the ready ticket.",
+      },
+    ];
+    let currentPanel = panel({ workers: [] });
+    const dashboardSource = {
+      preflight: vi.fn(async () => preflight()),
+      nextActions: vi.fn(async () => currentActions),
+      getTicketProgress: vi.fn(async () => progress()),
+      getPanelState: vi.fn(async () => currentPanel),
+      runNextAction: vi.fn(async (): Promise<StageResult> => {
+        currentActions = [];
+        currentPanel = panel({
+          workers: [
+            {
+              ticketNumber: 43,
+              attempt: 1,
+              status: "running",
+              workerId: "implement-42-43-r1",
+              branchName: "matt-auto/42/ticket-43/r1",
+              worktreePath: "/workspaces/42/ticket-43/r1",
+              processAlive: true,
+              progress: "Starting worker",
+            },
+          ],
+        });
+        return {
+          status: "running",
+          stage: "implement",
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          workerId: "implement-42-43-r1",
+          branchName: "matt-auto/42/ticket-43/r1",
+          worktreePath: "/workspaces/42/ticket-43/r1",
+        };
+      }),
+      confirmStage: vi.fn(async () => ({
+        status: "cancelled" as const,
+        stage: "create-spec" as const,
+      })),
+      confirmDisposition: vi.fn(async () => ({
+        status: "cancelled" as const,
+        stage: "implement" as const,
+      })),
+    };
+    const harness = dashboardHarness();
+    const notify = vi.fn();
+    const uiWithNotify = { ...harness.ui, notify };
+    const opening = presentWorkflowDashboard(
+      dashboardSource,
+      uiWithNotify,
+      {
+        initialSnapshot: {
+          panel: currentPanel,
+          ticketProgress: progress(),
+          preflight: preflight(),
+          nextActions: currentActions,
+        },
+        pollIntervalMs: 10_000,
+      },
+    );
+    const component = await capturedComponent(harness);
+
+    // Workflow → ticket → explicit Next action.
+    send(component, "\u001b[B");
+    send(component, "\u001b[B");
+    expect(component.render(120).join("\n")).toContain(
+      "Selected · Next action: Implement #43",
+    );
+
+    send(component, "\r");
+    await vi.waitFor(() => {
+      expect(dashboardSource.runNextAction).toHaveBeenCalledWith(
+        implementTicketActionId(43),
+      );
+      expect(dashboardSource.getPanelState).toHaveBeenCalledWith({ mode: "full" });
+    });
+
+    const frame = component.render(120).join("\n");
+    expect(frame).toContain("Action result");
+    expect(frame).toContain("Implementation running");
+    // The action row disappeared after settlement, so the dashboard follows the
+    // relevant newly-created Worker attempt rather than jumping to Workflow.
+    expect(frame).toContain("Selected · Worker #43 r1");
+    expect(dashboardSource.preflight).toHaveBeenCalledTimes(1);
+    expect(dashboardSource.nextActions).toHaveBeenCalledTimes(1);
+    expect(dashboardSource.getTicketProgress).toHaveBeenCalledTimes(1);
+    expect(harness.doneValues).toEqual([]);
+    expect(notify).not.toHaveBeenCalled();
+
+    send(component, "\u001b");
+    await expect(opening).resolves.toEqual({ status: "dismissed" });
+  });
+
+  it("keeps ticket-progress passive and narrows the Next-actions dashboard", async () => {
+    const runNextAction = vi.fn(async (): Promise<StageResult> => ({
+      status: "cancelled",
+      stage: "create-spec",
+    }));
+    const dashboardSource = {
+      ...source(panel({ workers: [] })),
+      nextActions: vi.fn(async () => [TICKET_PROGRESS_ACTION]),
+      runNextAction,
+      confirmStage: vi.fn(async () => ({
+        status: "cancelled" as const,
+        stage: "create-spec" as const,
+      })),
+      confirmDisposition: vi.fn(async () => ({
+        status: "cancelled" as const,
+        stage: "implement" as const,
+      })),
+    };
+    const harness = dashboardHarness();
+    const opening = presentWorkflowDashboard(dashboardSource, harness.ui, {
+      initialSnapshot: {
+        panel: panel({ workers: [] }),
+        ticketProgress: progress(),
+        preflight: preflight(),
+        nextActions: [TICKET_PROGRESS_ACTION],
+      },
+      scope: "next-actions",
+      pollIntervalMs: 10_000,
+    });
+    const component = await capturedComponent(harness);
+
+    const frame = component.render(120).join("\n");
+    expect(frame).toContain("Matt Auto · Next actions");
+    expect(frame).toContain("Next actions · Ticket progress");
+    expect(frame).not.toContain("Tickets · #43");
+    expect(frame).not.toContain("Preflight ·");
+
+    // Workflow → ticket-progress action. It is informational and must never
+    // invoke the coordinator even though the source supports actions.
+    send(component, "\u001b[B");
+    send(component, "\r");
+    expect(runNextAction).not.toHaveBeenCalled();
+    expect(harness.doneValues).toEqual([]);
 
     send(component, "\u001b");
     await expect(opening).resolves.toEqual({ status: "dismissed" });

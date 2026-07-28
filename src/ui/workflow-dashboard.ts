@@ -5,6 +5,15 @@ import {
   truncateToWidth,
   type SelectItem,
 } from "@earendil-works/pi-tui";
+import {
+  parseCheckCiActionId,
+  parseCiRecoveryActionId,
+  parseDispositionActionId,
+  parseImplementTicketActionId,
+  parseIntegrateTicketActionId,
+  parseReworkTicketActionId,
+  TICKET_PROGRESS_ACTION,
+} from "../constants.js";
 import type {
   NextAction,
   PreflightCheckId,
@@ -23,6 +32,14 @@ import {
   formatWorkerTurnSummary,
 } from "./run-brief.js";
 import { buildCompactWorkflowPanel } from "./workflow-panel.js";
+import {
+  buildDashboardActionPromptView,
+  dashboardActionResultLines,
+  DashboardWorkflowActionController,
+  type DashboardActionState,
+  type WorkflowActionCoordinator,
+  type WorkflowActionDecision,
+} from "./workflow-dashboard-actions.js";
 
 /** Stable identity for the one workflow-summary inspection row. */
 export const WORKFLOW_DASHBOARD_WORKFLOW_ROW_KEY = "workflow";
@@ -88,9 +105,13 @@ export type WorkflowDashboardInputs = {
 };
 
 /** Presentation state supplied by the persistent dashboard owner. */
+export type WorkflowDashboardScope = "all" | "next-actions";
+
 export type BuildWorkflowDashboardOptions = {
   /** The previously selected stable row key, if any. */
   selectedKey?: WorkflowDashboardRowKey;
+  /** Limit navigation to the workflow summary and currently available actions. */
+  scope?: WorkflowDashboardScope;
   /** Injectable clock for deterministic last-turn age formatting. */
   nowMs?: number;
 };
@@ -200,13 +221,13 @@ export function buildWorkflowDashboardViewModel(
   const sections: WorkflowDashboardSection[] = [
     { id: "workflow", title: "Workflow", rows: workflowRows },
   ];
-  if (ticketRows.length > 0) {
+  if (options.scope !== "next-actions" && ticketRows.length > 0) {
     sections.push({ id: "tickets", title: "Tickets", rows: ticketRows });
   }
-  if (workerRows.length > 0) {
+  if (options.scope !== "next-actions" && workerRows.length > 0) {
     sections.push({ id: "workers", title: "Worker attempts", rows: workerRows });
   }
-  if (preflightRows.length > 0) {
+  if (options.scope !== "next-actions" && preflightRows.length > 0) {
     sections.push({ id: "preflight", title: "Preflight", rows: preflightRows });
   }
   if (actionRows.length > 0) {
@@ -807,6 +828,8 @@ export type WorkflowDashboardOptions = {
   initialSnapshot?: WorkflowDashboardSnapshot;
   /** Stable row to retain when reopening or recreating the component. */
   selectedKey?: WorkflowDashboardRowKey;
+  /** `/matt-auto next` limits navigation to the workflow summary and Next actions. */
+  scope?: WorkflowDashboardScope;
   /** Local worker telemetry polling cadence. Defaults to 500ms. */
   pollIntervalMs?: number;
   /** Number of navigable rows visible before SelectList scrolls. Defaults to 8. */
@@ -839,9 +862,9 @@ export async function readWorkflowDashboardSnapshot(
 }
 
 /**
- * Open the persistent, passive workflow browser. It owns visual selection and
- * refresh timing only; it never calls `ui.notify()`, mutates coordinator state,
- * or resolves while a user merely inspects a row.
+ * Open the persistent workflow browser. It owns visual selection, inline
+ * action state, and refresh timing; passive inspection never notifies, mutates
+ * coordinator state, or resolves the surrounding custom surface.
  */
 export async function presentWorkflowDashboard(
   source: WorkflowDashboardDataSource,
@@ -880,20 +903,30 @@ export function createWorkflowDashboardComponent(
   options: WorkflowDashboardOptions = {},
 ): WorkflowDashboardComponent {
   let snapshot = initialSnapshot;
-  let model = buildDashboardModel(snapshot, options.selectedKey);
+  let model = buildDashboardModel(snapshot, options.selectedKey, options.scope);
   let selectedKey: WorkflowDashboardRowKey = model.selectedKey;
   let selectList: SelectList;
   let finished = false;
   let localPollInFlight = false;
   let fullRefreshInFlight = false;
+  let fullRefreshPromise: Promise<void> | undefined;
   let refreshStatus = "Live local telemetry";
   let interval: ReturnType<typeof setInterval> | undefined;
+  let actionController: DashboardWorkflowActionController | undefined;
+  let activeActionTicketNumber: number | undefined;
 
   const pollIntervalMs = positiveInteger(options.pollIntervalMs, 500);
   const maxVisibleRows = positiveInteger(options.maxVisibleRows, 8);
 
   const finish = () => {
     if (finished) return;
+    if (actionController?.getState().inputDisabled) {
+      // Esc never turns a visible confirmation into a coordinator mutation.
+      refreshStatus = "Finish the current action before leaving the dashboard";
+      tui.requestRender();
+      return;
+    }
+    actionController?.dispose();
     finished = true;
     if (interval) clearInterval(interval);
     done({ status: "dismissed" });
@@ -906,8 +939,36 @@ export function createWorkflowDashboardComponent(
     tui.requestRender();
   };
 
-  const rebuild = () => {
-    model = buildDashboardModel(snapshot, selectedKey);
+  const activateRow = (key: WorkflowDashboardRowKey) => {
+    selectRow(key);
+    const action = actionForDashboardRow(snapshot, key);
+    if (!action || isPassiveDashboardAction(action) || !actionController) return;
+
+    activeActionTicketNumber = ticketNumberForDashboardAction(action.id);
+    void actionController.run(action).finally(() => {
+      activeActionTicketNumber = undefined;
+    });
+  };
+
+  const rebuild = (fallbackTicketNumber?: number) => {
+    let nextModel = buildDashboardModel(
+      snapshot,
+      selectedKey,
+      options.scope,
+    );
+    if (
+      fallbackTicketNumber !== undefined &&
+      !nextModel.rows.some((row) => row.key === selectedKey)
+    ) {
+      const fallbackKey = dashboardSelectionForTicket(
+        nextModel,
+        fallbackTicketNumber,
+      );
+      if (fallbackKey) {
+        nextModel = buildDashboardModel(snapshot, fallbackKey, options.scope);
+      }
+    }
+    model = nextModel;
     selectedKey = model.selectedKey;
     selectList = makeWorkflowDashboardSelectList(
       model,
@@ -915,6 +976,7 @@ export function createWorkflowDashboardComponent(
       theme,
       maxVisibleRows,
       selectRow,
+      activateRow,
       finish,
     );
   };
@@ -928,7 +990,9 @@ export function createWorkflowDashboardComponent(
       // Keep all tracker-derived snapshot fields intact. Local mode only updates
       // worker/process/progress/turn telemetry and other local panel facts.
       const panel = await source.getPanelState({ mode: "local" });
-      if (finished) return;
+      // A full snapshot that began while this local request was pending wins;
+      // do not let an older local reply overwrite its panel state or status.
+      if (finished || fullRefreshInFlight) return;
       snapshot = replaceDashboardPanel(snapshot, panel);
       rebuild();
       refreshStatus = panel
@@ -936,30 +1000,69 @@ export function createWorkflowDashboardComponent(
         : "No local workflow telemetry";
     } catch {
       // Keep the last coherent frame and retry on the next interval; no chat noise.
-      refreshStatus = "Local telemetry refresh failed; retrying…";
+      if (!fullRefreshInFlight) {
+        refreshStatus = "Local telemetry refresh failed; retrying…";
+      }
     } finally {
       localPollInFlight = false;
       if (!finished) tui.requestRender();
     }
   };
 
-  const refreshFull = async () => {
-    if (finished || fullRefreshInFlight) return;
+  const refreshFull = (
+    request: {
+      afterAction?: boolean;
+      fallbackTicketNumber?: number;
+    } = {},
+  ): Promise<void> => {
+    if (finished) return Promise.resolve();
+    if (fullRefreshPromise) {
+      if (!request.afterAction) return fullRefreshPromise;
+      // An action must observe a snapshot taken after it settles, even when an
+      // operator Refresh was already in flight as the action began.
+      return fullRefreshPromise
+        .catch(() => undefined)
+        .then(() => refreshFull(request));
+    }
+
     fullRefreshInFlight = true;
     refreshStatus = "Refreshing workflow snapshot…";
     tui.requestRender();
-    try {
-      snapshot = await readWorkflowDashboardSnapshot(source);
-      if (finished) return;
-      rebuild();
-      refreshStatus = "Workflow snapshot refreshed";
-    } catch {
-      refreshStatus = "Workflow refresh failed; press r to retry";
-    } finally {
-      fullRefreshInFlight = false;
-      if (!finished) tui.requestRender();
-    }
+    const refresh = (async () => {
+      try {
+        snapshot = await readWorkflowDashboardSnapshot(source);
+        if (finished) return;
+        rebuild(request.fallbackTicketNumber);
+        refreshStatus = "Workflow snapshot refreshed";
+      } catch (error) {
+        refreshStatus = "Workflow refresh failed; press r to retry";
+        throw error;
+      } finally {
+        fullRefreshInFlight = false;
+        fullRefreshPromise = undefined;
+        if (!finished) tui.requestRender();
+      }
+    })();
+    fullRefreshPromise = refresh;
+    return refresh;
   };
+
+  if (canExecuteDashboardActions(source)) {
+    actionController = new DashboardWorkflowActionController(source, {
+      // The controller serializes action execution; its post-settlement refresh
+      // uses the same full snapshot path as the explicit Refresh key.
+      refresh: () =>
+        refreshFull(
+          activeActionTicketNumber === undefined
+            ? { afterAction: true }
+            : {
+                afterAction: true,
+                fallbackTicketNumber: activeActionTicketNumber,
+              },
+        ),
+      onStateChange: () => tui.requestRender(),
+    });
+  }
 
   rebuild();
   interval = setInterval(() => {
@@ -974,6 +1077,8 @@ export function createWorkflowDashboardComponent(
         selectList,
         theme,
         refreshStatus,
+        options.scope,
+        actionController?.getState(),
         width,
       );
     },
@@ -984,8 +1089,28 @@ export function createWorkflowDashboardComponent(
       tui.requestRender();
     },
     handleInput(data: string) {
+      const actionState = actionController?.getState();
+      if (actionState?.inputDisabled) {
+        const decision = decisionForDashboardInput(data, actionState);
+        if (decision) {
+          actionController?.choose(decision);
+        } else if (matchesKey(data, "x")) {
+          actionController?.cancelPrompt();
+        }
+        if (!finished) tui.requestRender();
+        return;
+      }
+
+      if (
+        actionState?.result &&
+        matchesKey(data, "x") &&
+        actionController?.dismissResult()
+      ) {
+        return;
+      }
       if (matchesKey(data, "r") || matchesKey(data, "ctrl+r")) {
-        void refreshFull();
+        // Explicit operator refresh is the only tracker-backed reread path.
+        void refreshFull().catch(() => undefined);
         return;
       }
       selectList.handleInput(data);
@@ -994,6 +1119,7 @@ export function createWorkflowDashboardComponent(
     dispose() {
       finished = true;
       if (interval) clearInterval(interval);
+      actionController?.dispose();
     },
   };
 }
@@ -1005,14 +1131,81 @@ export function canPresentWorkflowDashboard(
   return typeof ui.custom === "function";
 }
 
+type WorkflowDashboardActionSource = WorkflowDashboardDataSource &
+  WorkflowActionCoordinator;
+
+function canExecuteDashboardActions(
+  source: WorkflowDashboardDataSource,
+): source is WorkflowDashboardActionSource {
+  const candidate = source as Partial<WorkflowActionCoordinator>;
+  return (
+    typeof candidate.runNextAction === "function" &&
+    typeof candidate.confirmStage === "function" &&
+    typeof candidate.confirmDisposition === "function"
+  );
+}
+
+function actionForDashboardRow(
+  snapshot: WorkflowDashboardSnapshot,
+  key: WorkflowDashboardRowKey,
+): NextAction | undefined {
+  return snapshot.nextActions.find(
+    (action) => nextActionRowKey(action.id) === key,
+  );
+}
+
+function isPassiveDashboardAction(action: NextAction): boolean {
+  // Ticket progress is already represented by inline ticket/detail rows. It is
+  // an inspection target, not a coordinator operation from this surface.
+  return action.id === TICKET_PROGRESS_ACTION.id;
+}
+
+function ticketNumberForDashboardAction(actionId: string): number | undefined {
+  return (
+    parseImplementTicketActionId(actionId) ??
+    parseDispositionActionId(actionId) ??
+    parseIntegrateTicketActionId(actionId) ??
+    parseCheckCiActionId(actionId) ??
+    parseCiRecoveryActionId(actionId)?.ticketNumber ??
+    parseReworkTicketActionId(actionId)
+  );
+}
+
+function dashboardSelectionForTicket(
+  model: WorkflowDashboardViewModel,
+  ticketNumber: number,
+): WorkflowDashboardRowKey | undefined {
+  const workerPrefix = `worker:${ticketNumber}:`;
+  const worker = [...model.rows]
+    .reverse()
+    .find(
+      (row) =>
+        row.kind === "worker-attempt" && row.key.startsWith(workerPrefix),
+    );
+  return worker?.key ?? model.rows.find((row) => row.key === ticketRowKey(ticketNumber))?.key;
+}
+
+function decisionForDashboardInput(
+  data: string,
+  state: DashboardActionState,
+): WorkflowActionDecision | undefined {
+  if (!state.prompt) return undefined;
+  const choices = buildDashboardActionPromptView(state.prompt).choices;
+  // Prompt choices are numbered in the rendered surface. Keep this direct
+  // rather than routing a dynamic string through Pi's finite KeyId union.
+  if (!/^\d$/.test(data)) return undefined;
+  return choices[Number(data) - 1]?.value;
+}
+
 function buildDashboardModel(
   snapshot: WorkflowDashboardSnapshot,
   selectedKey: WorkflowDashboardRowKey | undefined,
+  scope: WorkflowDashboardScope | undefined,
 ): WorkflowDashboardViewModel {
-  return buildWorkflowDashboardViewModel(
-    snapshot,
-    selectedKey ? { selectedKey } : {},
-  );
+  return buildWorkflowDashboardViewModel(snapshot, {
+    ...(selectedKey ? { selectedKey } : {}),
+    ...(scope ? { scope } : {}),
+  });
 }
 
 function makeWorkflowDashboardSelectList(
@@ -1020,7 +1213,8 @@ function makeWorkflowDashboardSelectList(
   selectedKey: WorkflowDashboardRowKey,
   theme: WorkflowDashboardTheme,
   maxVisibleRows: number,
-  onSelect: (key: WorkflowDashboardRowKey) => void,
+  onSelectionChange: (key: WorkflowDashboardRowKey) => void,
+  onActivate: (key: WorkflowDashboardRowKey) => void,
   onCancel: () => void,
 ): SelectList {
   const items = workflowDashboardSelectItems(model);
@@ -1043,11 +1237,10 @@ function makeWorkflowDashboardSelectList(
   );
   const selectedIndex = items.findIndex((item) => item.value === selectedKey);
   list.setSelectedIndex(selectedIndex);
-  // Arrow navigation changes the inline detail immediately and stays in this
-  // component. Enter is intentionally another inspection affordance in this
-  // browsing slice; dashboard-native action execution is layered separately.
-  list.onSelectionChange = (item) => onSelect(item.value);
-  list.onSelect = (item) => onSelect(item.value);
+  // Arrow navigation is inspection only. Enter activates only explicit Next
+  // action rows; every passive row remains in the current custom surface.
+  list.onSelectionChange = (item) => onSelectionChange(item.value);
+  list.onSelect = (item) => onActivate(item.value);
   list.onCancel = onCancel;
   return list;
 }
@@ -1075,6 +1268,8 @@ function renderWorkflowDashboard(
   selectList: SelectList,
   theme: WorkflowDashboardTheme,
   refreshStatus: string,
+  scope: WorkflowDashboardScope | undefined,
+  actionState: DashboardActionState | undefined,
   width: number,
 ): string[] {
   const renderWidth = usableRenderWidth(width);
@@ -1092,7 +1287,14 @@ function renderWorkflowDashboard(
 
   lines.push(
     dashboardLine(
-      theme.fg("accent", theme.bold("Matt Auto · Workflow dashboard")),
+      theme.fg(
+        "accent",
+        theme.bold(
+          scope === "next-actions"
+            ? "Matt Auto · Next actions"
+            : "Matt Auto · Workflow dashboard",
+        ),
+      ),
       renderWidth,
     ),
   );
@@ -1124,17 +1326,82 @@ function renderWorkflowDashboard(
   for (const detailLine of selected.detail.lines) {
     lines.push(dashboardLine(`  ${detailLine}`, renderWidth));
   }
+
+  const actionLines = renderDashboardActionState(actionState, theme);
+  if (actionLines.length > 0) {
+    lines.push(...dimBorder.render(componentWidth));
+    lines.push(...actionLines.map((line) => dashboardLine(line, renderWidth)));
+  }
+
   lines.push(...dimBorder.render(componentWidth));
   lines.push(
     dashboardLine(
-      theme.fg(
-        "dim",
-        `↑↓ browse · Enter inspect · r full refresh · Esc return to chat · ${refreshStatus}`,
-      ),
+      theme.fg("dim", dashboardHelp(actionState, refreshStatus)),
       renderWidth,
     ),
   );
   return lines.map((line) => dashboardLine(line, renderWidth));
+}
+
+function renderDashboardActionState(
+  state: DashboardActionState | undefined,
+  theme: WorkflowDashboardTheme,
+): string[] {
+  if (!state) return [];
+
+  if (state.prompt) {
+    const prompt = buildDashboardActionPromptView(state.prompt);
+    return [
+      theme.fg("accent", theme.bold("Action confirmation")),
+      theme.bold(prompt.title),
+      ...prompt.lines.map((line) => `  ${line}`),
+      ...prompt.choices.map((choice, index) => `  [${index + 1}] ${choice.label}`),
+      theme.fg("dim", "  Press a numbered choice · x dismisses this prompt"),
+    ];
+  }
+
+  const lines: string[] = [];
+  if (state.inputDisabled) {
+    lines.push(
+      theme.fg(
+        "accent",
+        theme.bold(
+          state.phase === "refreshing"
+            ? "Refreshing after action…"
+            : `Running action: ${state.busyActionId ?? "workflow operation"}…`,
+        ),
+      ),
+    );
+  }
+  if (state.result) {
+    const color =
+      state.result.tone === "error"
+        ? "error"
+        : state.result.tone === "warning"
+          ? "warning"
+          : "accent";
+    lines.push(theme.fg(color, theme.bold("Action result")));
+    lines.push(...dashboardActionResultLines(state.result).map((line) => `  ${line}`));
+  }
+  if (state.error) {
+    lines.push(theme.fg("error", theme.bold("Action error")));
+    lines.push(`  ${state.error}`);
+  }
+  return lines;
+}
+
+function dashboardHelp(
+  actionState: DashboardActionState | undefined,
+  refreshStatus: string,
+): string {
+  if (actionState?.prompt) {
+    return `numbered choice required · x dismisses prompt · Esc keeps action open · ${refreshStatus}`;
+  }
+  if (actionState?.inputDisabled) {
+    return `action input disabled until it settles · ${refreshStatus}`;
+  }
+  const dismissResult = actionState?.result ? "x dismiss result · " : "";
+  return `↑↓ browse · Enter run action / inspect · ${dismissResult}r full refresh · Esc return to chat · ${refreshStatus}`;
 }
 
 function replaceDashboardPanel(

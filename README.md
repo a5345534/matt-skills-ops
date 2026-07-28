@@ -4,11 +4,11 @@ Stage-gated workflow orchestration for [Pi Coding Agent](https://pi.dev).
 
 Matt Auto is a reusable Pi package. From Workflow home (after grilling), run:
 
-- `/matt-auto` — interactive menu (Workflow preflight + Next actions)
-- `/matt-auto next` — only currently available Next actions
-- `/matt-auto run` — post-grill **auto-advance** pipeline: `/skill:to-spec` → auto-publish → `/skill:to-tickets` → auto-publish → implement… (auto-Close starts Integration). Manual menu actions still prompt.
+- `/matt-auto` — persistent Workflow dashboard on custom TUI hosts (or the blocking menu fallback)
+- `/matt-auto next` — dashboard narrowed to currently available Next actions (or the blocking Next-actions fallback)
+- `/matt-auto run` — post-grill **auto-advance** pipeline: `/skill:to-spec` → auto-publish → `/skill:to-tickets` → auto-publish → implement… (auto-Close starts Integration). It retains its separate live run brief.
 
-V1 is stage-gated and menu-driven. Planning stages invoke the **installed** Matt skills in Workflow home (skill definitions are not modified). Product behavior is owned by the **Workflow coordinator** seam.
+V1 is stage-gated. Planning stages invoke the **installed** Matt skills in Workflow home (skill definitions are not modified). Product behavior is owned by the **Workflow coordinator** seam.
 
 ## Install
 
@@ -29,6 +29,16 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 ```
 
 `/matt-auto run` prints the log path. Useful events: `pipeline:nextActions`, `pipeline:select`, `handleNextAction:*`, `runCreateSpec:*`, `runCreateTickets:*`, timings (`ms`), and stop reasons.
+
+## Manual Workflow dashboard
+
+When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** only to run a selected Next action; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
+
+Press `r` for **Refresh**. Opening the dashboard, Refresh, and an action settlement take a full coordinator snapshot; normal browsing and periodic updates read only local worker/process/turn telemetry. After an action settles, the dashboard refreshes in place and keeps the relevant selected ticket or Worker attempt when it remains available.
+
+`/matt-auto next` uses the same surface but limits its browse rows to the workflow summary and currently available Next actions. On non-TUI, RPC, or partial hosts where `custom()` is unavailable, Matt Auto safely retains the existing blocking `select()` menus and their confirmations.
+
+`/matt-auto run` does **not** open this manual dashboard. Its live run brief remains the primary wait surface, with its own Pause / Resume / Terminate controls; Matt Auto does not stack a dashboard or duplicate compact workflow widget while that auto-run surface owns the wait.
 
 ## Develop
 

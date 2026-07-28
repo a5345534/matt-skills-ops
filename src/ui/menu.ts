@@ -16,6 +16,11 @@ import {
   executeWorkflowAction,
 } from "./workflow-dashboard-actions.js";
 import {
+  canPresentWorkflowDashboard,
+  presentWorkflowDashboard,
+  type WorkflowDashboardScope,
+} from "./workflow-dashboard.js";
+import {
   CHECK_CI_ACTION_PREFIX,
   CI_RECOVERY_ACTION_PREFIX,
   CLEANUP_WORKFLOW_ACTION,
@@ -1238,6 +1243,30 @@ function formatProfileShort(profile: WorkerProfile): string {
   return `${profile.provider}/${profile.modelId} (thinking ${profile.thinkingLevel})`;
 }
 
+async function presentDashboardIfAvailable(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  scope?: WorkflowDashboardScope,
+): Promise<boolean> {
+  if (!canPresentWorkflowDashboard(ui)) return false;
+
+  try {
+    await presentWorkflowDashboard(coordinator, ui, {
+      ...(scope ? { scope } : {}),
+    });
+    return true;
+  } catch (error) {
+    // A host can expose a partial/RPC `custom` method that rejects at runtime.
+    // Keep its established blocking-select menu usable rather than stranding
+    // the operator behind a capability probe.
+    log("warn", "dashboard:custom-unavailable-fallback", {
+      scope: scope ?? "all",
+      reason: errorMessage(error),
+    });
+    return false;
+  }
+}
+
 function formatResolvedProfileLine(
   resolved: ResolvedWorkerProfile | undefined,
 ): string {
@@ -1422,6 +1451,8 @@ export async function presentMainMenu(
   ui: MattAutoUi,
   pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
+  if (await presentDashboardIfAvailable(coordinator, ui)) return;
+
   for (;;) {
     const currentRoot = await coordinator.currentRoot();
     const roots = await coordinator.listRoots();
@@ -2889,6 +2920,10 @@ export async function presentNextActions(
   coordinator: WorkflowCoordinator,
   ui: MattAutoUi,
 ): Promise<void> {
+  if (await presentDashboardIfAvailable(coordinator, ui, "next-actions")) {
+    return;
+  }
+
   const currentRoot = await coordinator.currentRoot();
   if (currentRoot.status === "unavailable" && currentRoot.unavailableReason) {
     ui.notify(currentRoot.unavailableReason, "warning");
