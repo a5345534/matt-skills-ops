@@ -61,6 +61,7 @@ import type {
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CompletedWorkerTelemetry,
   CiRecoveryDecision,
   ImplementationDispositionDecision,
   ImplementationWorkerStatus,
@@ -469,6 +470,71 @@ export function createWorkflowCoordinator(
   let lastStopReason: "pipeline-pause" | "run-termination" | undefined;
   /** T1/T2 mode recorded when lastStopReason is run-termination. */
   let lastTerminationMode: RunTerminationMode | undefined;
+  /**
+   * Successful worker facts outlive the live-worker panel within this session.
+   * They are keyed by attempt/kind so retries and conflict workers stay distinct.
+   */
+  const completedWorkerTelemetryByAttempt = new Map<
+    string,
+    CompletedWorkerTelemetry
+  >();
+
+  function completedWorkerTelemetryKey(input: {
+    workflowId: number;
+    ticketNumber: number;
+    attempt: number;
+    kind: CompletedWorkerTelemetry["kind"];
+  }): string {
+    return `${input.workflowId}:${input.ticketNumber}:${input.attempt}:${input.kind}`;
+  }
+
+  function recordCompletedWorkerTelemetry(
+    worker: {
+      workflowId: number;
+      ticketNumber: number;
+      attempt: number;
+      startedAtMs: number;
+      turnCount?: number;
+    },
+    kind: CompletedWorkerTelemetry["kind"],
+  ): void {
+    // Historical/recovered workers have no observed turn count; never invent one.
+    if (typeof worker.turnCount !== "number") return;
+    const key = completedWorkerTelemetryKey({
+      workflowId: worker.workflowId,
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+      kind,
+    });
+    if (completedWorkerTelemetryByAttempt.has(key)) return;
+    completedWorkerTelemetryByAttempt.set(key, {
+      workflowId: worker.workflowId,
+      ticketNumber: worker.ticketNumber,
+      attempt: worker.attempt,
+      kind,
+      turnCount: worker.turnCount,
+      runtimeMs: Math.max(0, Date.now() - worker.startedAtMs),
+    });
+  }
+
+  function getCompletedWorkerTelemetry(
+    workflowId: number,
+  ): readonly CompletedWorkerTelemetry[] {
+    return [...completedWorkerTelemetryByAttempt.values()]
+      .filter((telemetry) => telemetry.workflowId === workflowId)
+      .sort((a, b) =>
+        a.ticketNumber - b.ticketNumber ||
+        a.attempt - b.attempt ||
+        a.kind.localeCompare(b.kind),
+      )
+      .map((telemetry) => ({ ...telemetry }));
+  }
+
+  function getPipelineRunElapsedMs(): number | undefined {
+    return typeof pipelineRunStartedAtMs === "number"
+      ? Math.max(0, Date.now() - pipelineRunStartedAtMs)
+      : undefined;
+  }
 
   function findImplementationWorker(
     workerId: string,
@@ -2846,6 +2912,7 @@ export function createWorkflowCoordinator(
         if (event.outcome.summary) {
           worker.summary = event.outcome.summary;
         }
+        recordCompletedWorkerTelemetry(worker, "implementation");
         settleCompletedImplementationWorker(worker);
         return;
       }
@@ -2879,6 +2946,7 @@ export function createWorkflowCoordinator(
         });
         if (ahead.ahead) {
           worker.receivedStageResult = true;
+          recordCompletedWorkerTelemetry(worker, "implementation");
           worker.summary =
             worker.progress ??
             `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
@@ -2945,6 +3013,7 @@ export function createWorkflowCoordinator(
     if (event.type === "stage-result") {
       worker.receivedStageResult = true;
       if (event.outcome.status === "completed") {
+        recordCompletedWorkerTelemetry(worker, "conflict-resolution");
         worker.status = "completed";
         activeConflictWorker = undefined;
 
@@ -5689,6 +5758,8 @@ export function createWorkflowCoordinator(
     getHomeModel,
     thinkingLevelsFor,
     getPanelState,
+    getCompletedWorkerTelemetry,
+    getPipelineRunElapsedMs,
     confirmDisposition,
     abortWorkers,
     pausePipeline,

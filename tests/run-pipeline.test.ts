@@ -1,5 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+
+const terminalNotify = vi.hoisted(() => ({
+  signalMattAutoComplete: vi.fn(),
+}));
+
+vi.mock("../src/ui/terminal-notify.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/ui/terminal-notify.js")>();
+  return { ...actual, signalMattAutoComplete: terminalNotify.signalMattAutoComplete };
+});
+
 import {
+  CLEANUP_WORKFLOW_ACTION,
   dispositionActionId,
   implementTicketActionId,
   integrateTicketActionId,
@@ -428,6 +439,45 @@ function createRunLoopFake(options: {
 }
 
 describe("runPostGrillPipeline fill slots then wait", () => {
+  it("includes completed ticket telemetry in the Workflow completion signal", async () => {
+    terminalNotify.signalMattAutoComplete.mockClear();
+    const coordinator = {
+      beginPipelineRun: () => undefined,
+      isRunTerminated: () => false,
+      isPipelinePaused: () => false,
+      isAutoAdvanceBlocked: () => false,
+      preflight: async () => okPreflight,
+      nextActions: async () => [CLEANUP_WORKFLOW_ACTION],
+      runNextAction: async () => ({
+        status: "completed" as const,
+        stage: "cleanup" as const,
+        workflowId: 42,
+      }),
+      getCompletedWorkerTelemetry: () => [
+        {
+          workflowId: 42,
+          ticketNumber: 43,
+          attempt: 1,
+          kind: "implementation" as const,
+          turnCount: 3,
+          runtimeMs: 12_000,
+        },
+      ],
+      getPipelineRunElapsedMs: () => 125_000,
+    } as unknown as WorkflowCoordinator;
+    const ui = mockUi();
+
+    await runPostGrillPipeline(coordinator, ui);
+
+    expect(terminalNotify.signalMattAutoComplete).toHaveBeenCalledWith(
+      ui,
+      expect.objectContaining({
+        body: "Workflow #42 complete (cleanup finished). Ready for next steps.",
+        details: ["Pipeline runtime: 2m05s", "#43 r1 · 3 turns · 12s"],
+      }),
+    );
+  });
+
   it("opens min(N, readyCount) workers without waiting for the first to finish", async () => {
     const { coordinator, state } = createRunLoopFake({
       concurrency: 2,

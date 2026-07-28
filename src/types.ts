@@ -362,6 +362,21 @@ export type RunTerminationResult = {
 };
 
 /**
+ * Exact telemetry captured when a session-owned worker reports successful completion.
+ * It is session-local: recovered historical attempts are never inferred.
+ */
+export type CompletedWorkerTelemetry = {
+  workflowId: number;
+  ticketNumber: number;
+  attempt: number;
+  kind: "implementation" | "conflict-resolution";
+  /** Native Pi `turn_start` events observed for this worker. */
+  turnCount: number;
+  /** Frozen elapsed time from launch until the successful Stage result. */
+  runtimeMs: number;
+};
+
+/**
  * Worker protocol events derived from a worker's Pi JSON event stream.
  * Carries turn telemetry, progress, and Stage results only — no GitHub mutation authority.
  */
@@ -782,6 +797,15 @@ export type WorkflowCoordinator = {
   getPanelState(options?: {
     mode?: "full" | "local";
   }): Promise<WorkflowPanelState | undefined>;
+  /**
+   * Session-local successful worker telemetry retained after workers leave the
+   * live panel, so completion summaries can include already-completed tickets.
+   */
+  getCompletedWorkerTelemetry(
+    workflowId: number,
+  ): readonly CompletedWorkerTelemetry[];
+  /** Wall-clock elapsed time for the current `/matt-auto run`, when known. */
+  getPipelineRunElapsedMs(): number | undefined;
   /**
    * Apply Implementation disposition (Close / Leave open / Investigate)
    * after a successful Implementation worker Stage result.

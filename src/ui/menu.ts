@@ -10,7 +10,10 @@ import {
   canPresentLiveWaitControls,
   presentLiveWaitControls,
 } from "./live-run-brief-controls.js";
-import { signalMattAutoComplete } from "./terminal-notify.js";
+import {
+  formatCompletedWorkerTelemetry,
+  signalMattAutoComplete,
+} from "./terminal-notify.js";
 import {
   createFallbackWorkflowActionInteraction,
   executeWorkflowAction,
@@ -77,6 +80,7 @@ import { getTrackerGhMetrics } from "../adapters/tracker-rate-limit.js";
 import { startGhosttyActivity } from "./ghostty-activity.js";
 import {
   buildRunBriefViewModel,
+  formatRuntimeMs,
   predictRunTerminationMode,
 } from "./run-brief.js";
 import {
@@ -1683,7 +1687,12 @@ export async function runPostGrillPipeline(
   // Set before each return so finally can fire a terminal/title completion signal
   // (pi-notify only hooks agent_end — slash-command runs never get a bell otherwise).
   let endSignal:
-    | { body: string; warning?: boolean; title?: string }
+    | {
+        body: string;
+        details?: readonly string[];
+        warning?: boolean;
+        title?: string;
+      }
     | undefined;
 
   try {
@@ -1997,10 +2006,21 @@ export async function runPostGrillPipeline(
         stage: "cleanup",
         workflowId: wf,
       });
+      const completedWorkers = wf
+        ? coordinator.getCompletedWorkerTelemetry(wf)
+        : [];
+      const pipelineElapsedMs = coordinator.getPipelineRunElapsedMs();
+      const details = [
+        ...(typeof pipelineElapsedMs === "number"
+          ? [`Pipeline runtime: ${formatRuntimeMs(pipelineElapsedMs)}`]
+          : []),
+        ...formatCompletedWorkerTelemetry(completedWorkers),
+      ];
       endSignal = {
         body: wf
           ? `Workflow #${wf} complete (cleanup finished). Ready for next steps.`
           : "Matt Auto workflow complete (cleanup finished).",
+        ...(details.length > 0 ? { details } : {}),
       };
       return;
     }
@@ -2043,6 +2063,7 @@ export async function runPostGrillPipeline(
       signalMattAutoComplete(ui, {
         cwd: process.cwd(),
         body: endSignal.body,
+        ...(endSignal.details ? { details: endSignal.details } : {}),
         ...(endSignal.warning ? { warning: true } : {}),
         ...(endSignal.title ? { title: endSignal.title } : {}),
       });

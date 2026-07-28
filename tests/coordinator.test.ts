@@ -1,5 +1,5 @@
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createWorkflowCoordinator } from "../src/coordinator.js";
 import type {
   CiCheckResult,
@@ -2969,6 +2969,51 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(ticket?.state).toBe("OPEN");
     // Coordinator updates the Workflow manifest after Local verification + push.
     expect(tracker.state.writeManifestCalls).toBe(writesBefore + 1);
+  });
+
+  it("retains exact turns and frozen runtime after an Implementation worker completes", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-07-28T08:00:00.000Z"));
+      const { coordinator, workers } = ticketsPublishedFixture();
+
+      coordinator.beginPipelineRun();
+      await coordinator.runNextAction(implementTicketActionId(43));
+      await workers.emit("implement-42-43-r1", {
+        type: "turn-start",
+        workerId: "implement-42-43-r1",
+        timestampMs: 1_785_225_600_000,
+      });
+      await workers.emit("implement-42-43-r1", {
+        type: "turn-start",
+        workerId: "implement-42-43-r1",
+        timestampMs: 1_785_225_602_000,
+      });
+      vi.advanceTimersByTime(12_345);
+      await workers.emit("implement-42-43-r1", {
+        type: "stage-result",
+        workerId: "implement-42-43-r1",
+        outcome: { status: "completed" },
+      });
+
+      const telemetry = coordinator.getCompletedWorkerTelemetry(42);
+      expect(telemetry).toHaveLength(1);
+      expect(telemetry[0]).toMatchObject({
+        workflowId: 42,
+        ticketNumber: 43,
+        attempt: 1,
+        kind: "implementation",
+        turnCount: 2,
+        runtimeMs: 12_345,
+      });
+
+      vi.advanceTimersByTime(60_000);
+      expect(coordinator.getCompletedWorkerTelemetry(42)[0]?.runtimeMs).toBe(
+        12_345,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("supports Leave open and Investigate dispositions without remote writes", async () => {

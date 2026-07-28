@@ -6,6 +6,8 @@
 
 import { writeFileSync } from "node:fs";
 import path from "node:path";
+import type { CompletedWorkerTelemetry } from "../types.js";
+import { formatRuntimeMs } from "./run-brief.js";
 import {
   buildMattAutoActivityTitle,
   setGhosttyProgress,
@@ -29,8 +31,9 @@ function ttyWrite(seq: string): void {
 
 function wrapForTmux(seq: string): string {
   if (!process.env.TMUX) return seq;
-  // DCS passthrough so the outer terminal sees the OSC
-  return `${ESC}Ptmux;${ESC}${seq}${ST}`;
+  // DCS passthrough; escape every inner ESC, but leave BEL as a BEL event.
+  const escaped = seq.split(ESC).join(`${ESC}${ESC}`);
+  return `${ESC}Ptmux;${escaped}${ST}`;
 }
 
 function notifyOSC9(message: string): void {
@@ -48,6 +51,10 @@ function notifyOSC99(title: string, body: string): void {
   ttyWrite(wrapForTmux(bodySeq));
 }
 
+function isGhostty(): boolean {
+  return (process.env.TERM_PROGRAM ?? "").toLowerCase() === "ghostty";
+}
+
 /** Send a desktop/tab notification via the terminal's OSC protocol. */
 export function sendTerminalNotification(title: string, body: string): void {
   const term = (process.env.TERM_PROGRAM ?? "").toLowerCase();
@@ -55,12 +62,28 @@ export function sendTerminalNotification(title: string, body: string): void {
     notifyOSC99(title, body);
     return;
   }
-  if (term === "ghostty" || term === "iterm.app" || process.env.ITERM_SESSION_ID) {
+  if (isGhostty() || term === "iterm.app" || process.env.ITERM_SESSION_ID) {
     notifyOSC9(`${title}: ${body}`);
     return;
   }
   // WezTerm, rxvt, Windows Terminal (WSL), etc.
   notifyOSC777(title, body);
+}
+
+/** Format retained successful worker facts for a final completion notification. */
+export function formatCompletedWorkerTelemetry(
+  telemetry: readonly CompletedWorkerTelemetry[],
+): readonly string[] {
+  return telemetry.map((entry) => {
+    const kind = entry.kind === "conflict-resolution" ? " conflict" : "";
+    const turns =
+      entry.turnCount === 1 ? "1 turn" : `${entry.turnCount} turns`;
+    return [
+      `#${entry.ticketNumber} r${entry.attempt}${kind}`,
+      turns,
+      formatRuntimeMs(entry.runtimeMs),
+    ].join(" · ");
+  });
 }
 
 export type CompletionNotifyUi = {
@@ -80,11 +103,14 @@ export function signalMattAutoComplete(
     cwd?: string;
     title?: string;
     body: string;
+    /** Retained completed-worker lines shown below the completion body. */
+    details?: readonly string[];
     /** When true, use warning styling in TUI notify. */
     warning?: boolean;
   },
 ): void {
   const title = options.title ?? "Matt Auto";
+  const message = [options.body, ...(options.details ?? [])].join("\n");
   setGhosttyProgress(1, 100);
   ui.setTitle?.(
     buildMattAutoActivityTitle({
@@ -92,10 +118,15 @@ export function signalMattAutoComplete(
       detail: options.warning ? "done (see notice)" : "done",
     }),
   );
-  sendTerminalNotification(title, options.body);
+  sendTerminalNotification(title, message);
+  if (isGhostty()) {
+    // OSC 9's BEL terminator is not a bell event. Ghostty needs a separate
+    // BEL to apply bell-features=title (the temporary 🔔 title indicator).
+    ttyWrite(wrapForTmux(BEL));
+  }
   try {
     ui.notify?.(
-      options.body,
+      message,
       options.warning ? "warning" : "info",
     );
   } catch {
