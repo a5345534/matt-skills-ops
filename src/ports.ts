@@ -1,9 +1,13 @@
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CanonicalRepositoryIdentity,
   CanonicalTargetIdentity,
   CiStatus,
+  CoordinationLease,
+  CoordinationLeaseKind,
   HomeModelSelection,
+  RepositoryWorkerCapacityPolicy,
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
@@ -280,6 +284,155 @@ export type RemoteGitPort = {
    * Optionally updates submodules to recorded gitlinks after a successful pull.
    */
   safePullBranch(branchName: string): Promise<SafePullResult>;
+};
+
+/**
+ * Deterministic identity for one remote coordination lease record.
+ * The remote CoordinationPort derives its reserved ref name from this key.
+ */
+export type CoordinationLeaseKey =
+  | {
+      kind: "workflow-coordinator";
+      repository: CanonicalRepositoryIdentity;
+      target: CanonicalTargetIdentity;
+      workflowId: number;
+    }
+  | {
+      kind: "target-branch";
+      target: CanonicalTargetIdentity;
+    }
+  | {
+      kind: "repository-scheduler";
+      repository: CanonicalRepositoryIdentity;
+    }
+  | {
+      kind: "worker-slot";
+      repository: CanonicalRepositoryIdentity;
+      slot: number;
+    };
+
+/** Lease-acquisition request. `holderId` must identify one live Workflow home/process. */
+export type AcquireCoordinationLeaseInput =
+  | (Extract<CoordinationLeaseKey, { kind: "workflow-coordinator" }> & {
+      holderId: string;
+      /** Optional positive TTL override, primarily useful for deterministic tests. */
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "target-branch" }> & {
+      holderId: string;
+      /** Workflow currently assigned the serial delivery lane, when any. */
+      workflowId?: number;
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "repository-scheduler" }> & {
+      holderId: string;
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "worker-slot" }> & {
+      holderId: string;
+      workflowId: number;
+      ticketNumber?: number;
+      ttlMs?: number;
+    });
+
+/** Result of conditionally acquiring one lease from its observed remote ref state. */
+export type AcquireCoordinationLeaseResult =
+  | { acquired: true; lease: CoordinationLease }
+  | {
+      acquired: false;
+      /** `held` is an observed live holder; `contended` changed during acquisition. */
+      reason: "held" | "contended";
+      lease?: CoordinationLease;
+    };
+
+/** Result of a conditional heartbeat/renewal. */
+export type RenewCoordinationLeaseResult =
+  | { renewed: true; lease: CoordinationLease }
+  | {
+      renewed: false;
+      reason: "not-found" | "lost" | "expired" | "contended";
+      lease?: CoordinationLease;
+    };
+
+/** Result of a conditional release. A stale holder never releases a newer generation. */
+export type ReleaseCoordinationLeaseResult =
+  | { released: true }
+  | { released: false; reason: "not-found" | "lost" | "contended" };
+
+/** Current fencing/expiry check for an already acquired lease. */
+export type VerifyCoordinationLeaseResult =
+  | { valid: true; lease: CoordinationLease }
+  | {
+      valid: false;
+      reason: "not-found" | "lost" | "expired";
+      lease?: CoordinationLease;
+    };
+
+/** Result of atomically seeding the repository-wide worker-capacity policy once. */
+export type EnsureRepositoryWorkerCapacityPolicyResult = {
+  policy: RepositoryWorkerCapacityPolicy;
+  /** True only for the contender whose exact absent-ref create succeeded. */
+  initialized: boolean;
+};
+
+/** Result of a conditional policy generation update. */
+export type UpdateRepositoryWorkerCapacityPolicyResult =
+  | { updated: true; policy: RepositoryWorkerCapacityPolicy }
+  | { updated: false; reason: "not-found" }
+  | {
+      updated: false;
+      reason: "generation-mismatch" | "contended";
+      policy: RepositoryWorkerCapacityPolicy;
+    };
+
+/**
+ * Remote coordination boundary. It owns reserved-ref names, record validation,
+ * exact conditional updates, fencing checks, expiry recovery, and the
+ * repository-wide worker-capacity policy. Workflow coordinators never issue
+ * raw coordination-ref Git commands themselves.
+ */
+export type CoordinationPort = {
+  /** Read a lease record, including expired or conditionally released tombstones a contender may reclaim. */
+  getLease(key: CoordinationLeaseKey): Promise<CoordinationLease | undefined>;
+  /** List valid lease records for one repository; expired and released tombstones are included. */
+  listLeases(input: {
+    repository: CanonicalRepositoryIdentity;
+    kind?: CoordinationLeaseKind;
+  }): Promise<readonly CoordinationLease[]>;
+  /** Conditionally acquire an absent or expired lease with a new fencing generation. */
+  acquireLease(
+    input: AcquireCoordinationLeaseInput,
+  ): Promise<AcquireCoordinationLeaseResult>;
+  /** Conditionally update heartbeat/expiry only when holder and generation still match. */
+  renewLease(input: {
+    lease: CoordinationLease;
+    ttlMs?: number;
+  }): Promise<RenewCoordinationLeaseResult>;
+  /** Conditionally mark only the exact holder/generation released, preserving its fence tombstone. */
+  releaseLease(lease: CoordinationLease): Promise<ReleaseCoordinationLeaseResult>;
+  /** Verify current holder, fencing generation, and TTL before an irreversible action. */
+  verifyLease(lease: CoordinationLease): Promise<VerifyCoordinationLeaseResult>;
+  /** Read the authoritative repository-wide worker-capacity policy. */
+  getWorkerCapacityPolicy(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<RepositoryWorkerCapacityPolicy | undefined>;
+  /**
+   * Seed policy from an existing local concurrency value exactly once. Once a
+   * policy exists, every contender receives that remote authoritative value.
+   */
+  ensureWorkerCapacityPolicy(input: {
+    repository: CanonicalRepositoryIdentity;
+    seedWorkerCapacity: number;
+  }): Promise<EnsureRepositoryWorkerCapacityPolicyResult>;
+  /**
+   * Change capacity only when the caller observed the current policy generation.
+   * This is intentionally separate from first-time initialization.
+   */
+  updateWorkerCapacityPolicy(input: {
+    repository: CanonicalRepositoryIdentity;
+    workerCapacity: number;
+    expectedGeneration: number;
+  }): Promise<UpdateRepositoryWorkerCapacityPolicyResult>;
 };
 
 /** Launch parameters for one session-owned Implementation worker. */

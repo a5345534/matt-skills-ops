@@ -37,6 +37,8 @@ export {
   CLEANUP_WORKFLOW_ACTION,
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
+  DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_COORDINATION_LEASE_TTL_MS,
   DEFAULT_TARGET_BRANCH,
   DEFAULT_WORKER_CONCURRENCY,
   DISPOSITION_ACTION_PREFIX,
@@ -71,6 +73,21 @@ export {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 export {
+  COORDINATION_REF_PREFIX,
+  InMemoryCoordinationStore,
+  assertCoordinationLeaseKey,
+  coordinationLeaseRefName,
+  createCoordinationPort,
+  createFakeCoordinationPort,
+  createInMemoryCoordinationPort,
+  createInMemoryCoordinationStore,
+  workerCapacityPolicyRefName,
+} from "./adapters/coordination.js";
+export type {
+  CoordinationPortOptions,
+  InMemoryCoordinationPortOptions,
+} from "./adapters/coordination.js";
+export {
   canonicalRepositoryIdentityKey,
   canonicalTargetIdentitiesEqual,
   canonicalTargetIdentityKey,
@@ -98,8 +115,13 @@ export {
 } from "./launch-rules.js";
 export type { ImplementationLaunchBlockReason } from "./launch-rules.js";
 export type {
+  AcquireCoordinationLeaseInput,
+  AcquireCoordinationLeaseResult,
   CiCheckResult,
   CiPort,
+  CoordinationLeaseKey,
+  CoordinationPort,
+  EnsureRepositoryWorkerCapacityPolicyResult,
   CreateSpecSkillOutcome,
   CreateTicketsSkillOutcome,
   EnvironmentPort,
@@ -111,14 +133,18 @@ export type {
   PreferencesPort,
   PrepareImplementOutcome,
   PrepareResolveConflictsOutcome,
+  ReleaseCoordinationLeaseResult,
   RemoteGitPort,
+  RenewCoordinationLeaseResult,
   RootScopedPorts,
   SkillsPort,
   TrackerPort,
   TrackerTicket,
   TranscriptKey,
   TranscriptPort,
+  UpdateRepositoryWorkerCapacityPolicyResult,
   VerificationPort,
+  VerifyCoordinationLeaseResult,
   WorkerEventSink,
   WorkerLaunchInput,
   WorkersPort,

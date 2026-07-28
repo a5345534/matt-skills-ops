@@ -265,6 +265,8 @@ type CoordinationLeaseBase = {
   acquiredAt: string;
   heartbeatAt: string;
   expiresAt: string;
+  /** Present after an exact conditional release; tombstones preserve fencing monotonicity. */
+  releasedAt?: string;
 };
 
 /** One workflow's coordinator lease. */
