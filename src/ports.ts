@@ -1,6 +1,7 @@
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CanonicalTargetIdentity,
   CiStatus,
   HomeModelSelection,
   SpecDraft,
@@ -398,9 +399,17 @@ export type TrackerPort = {
     manifest: WorkflowManifest,
   ): Promise<void>;
   /**
-   * Find the Active workflow for a Target branch, if any.
-   * Reads GitHub issues + managed Workflow manifest comments.
-   * When `hintWorkflowId` is set, only that issue is loaded (fast path).
+   * Discover every Active workflow for one canonical GitHub repository and fully
+   * qualified Target ref. Implementations must paginate all candidate issues and
+   * never select an arbitrary first match.
+   */
+  findActiveWorkflows(
+    target: CanonicalTargetIdentity,
+  ): Promise<readonly ActiveWorkflow[]>;
+  /**
+   * Legacy single-workflow lookup used only by version 1 coordinator routing.
+   * When no hint is available, implementations return a workflow only if exactly
+   * one matches; parallel manifests are never collapsed to an arbitrary result.
    */
   findActiveWorkflow(
     targetBranch: string,
