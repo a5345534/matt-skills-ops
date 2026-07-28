@@ -128,6 +128,34 @@ export {
   implementationLaunchBlockReason,
 } from "./launch-rules.js";
 export type { ImplementationLaunchBlockReason } from "./launch-rules.js";
+export {
+  DEFAULT_TARGET_BRANCH_TRANSIENT_RETRY_BASE_BACKOFF_MS,
+  DEFAULT_TARGET_BRANCH_TRANSIENT_RETRY_MAX_ATTEMPTS,
+  DEFAULT_TARGET_BRANCH_TRANSIENT_RETRY_MAX_BACKOFF_MS,
+  createTargetBranchQueueOrchestrator,
+  recordTargetBranchQueueFailure,
+  reconstructTargetBranchQueue,
+  requeueTargetBranchQueueCandidate,
+  targetBranchQueuePosition,
+  transitionTargetBranchQueueForPrChecks,
+} from "./target-branch-queue.js";
+export type {
+  TargetBranchLeasePhase,
+  TargetBranchPrCheckObservation,
+  TargetBranchQueueCommand,
+  TargetBranchQueueEntry,
+  TargetBranchQueueFailureKind,
+  TargetBranchQueueOperationAction,
+  TargetBranchQueueOperationCode,
+  TargetBranchQueueOperationFailure,
+  TargetBranchQueueOperationResult,
+  TargetBranchQueueOperationSuccess,
+  TargetBranchQueueOrchestrator,
+  TargetBranchQueueOrchestratorOptions,
+  TargetBranchQueueRetryPolicy,
+  TargetBranchQueueSnapshot,
+  TargetBranchQueueStore,
+} from "./target-branch-queue.js";
 export type {
   AcquireCoordinationLeaseInput,
   AcquireCoordinationLeaseResult,
