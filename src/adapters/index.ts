@@ -71,6 +71,12 @@ export {
   resolveSubmoduleRemoteUrl,
   verifySubmoduleGitlinksReachable,
 } from "./submodule-gate.js";
+export {
+  gcMattAutoGitlinkArtifacts,
+  parseLsRemoteGitlinkLines,
+  pruneLocalMattAutoArtifacts,
+} from "./gitlink-cleanup.js";
+export type { GitlinkGcResult } from "./gitlink-cleanup.js";
 export type {
   GitlinkEntry,
   SubmoduleEnsureResult,

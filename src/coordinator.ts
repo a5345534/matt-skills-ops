@@ -33,6 +33,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
+import { gcMattAutoGitlinkArtifacts } from "./adapters/gitlink-cleanup.js";
 import { ensureSubmoduleGitlinksPublished } from "./adapters/submodule-gate.js";
 import {
   assertValidWorkerConcurrency,
@@ -4424,6 +4425,31 @@ export function createWorkflowCoordinator(
       };
     }
 
+    // Soft hygiene (issue #31): prune worktrees; delete remote matt-auto/gitlink/*
+    // only when the tip is already on the submodule mainline. Never fails cleanup.
+    let gitlinkGc:
+      | {
+          deletedRemoteRefs: readonly string[];
+          keptRemoteRefs: readonly string[];
+          deletedLocalBranches: readonly string[];
+          worktreePruned: boolean;
+          errors: readonly string[];
+        }
+      | undefined;
+    try {
+      const rootPath = selectedPath ?? ports.startPath;
+      gitlinkGc = await gcMattAutoGitlinkArtifacts(rootPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      gitlinkGc = {
+        deletedRemoteRefs: [],
+        keptRemoteRefs: [],
+        deletedLocalBranches: [],
+        worktreePruned: false,
+        errors: [message],
+      };
+    }
+
     // Close parent Workflow spec (Workflow ID) — part of delivery completion.
     // Soft-fail: artifacts are already gone; do not fail cleanup if close fails.
     let parentSpecClosed = false;
@@ -4433,12 +4459,31 @@ export function createWorkflowCoordinator(
       : localPull?.skipped
         ? `Auto-pull skipped (${localPull.reason ?? "unsafe"}). Please \`git pull\` on the Workflow root and /reload Pi when ready.`
         : "Please `git pull` on the Workflow root and `/reload` Pi so your session picks up the merged work.";
+    const gcLine =
+      gitlinkGc &&
+      (gitlinkGc.deletedRemoteRefs.length > 0 ||
+        gitlinkGc.deletedLocalBranches.length > 0 ||
+        gitlinkGc.keptRemoteRefs.length > 0)
+        ? [
+            `Gitlink hygiene: deleted ${gitlinkGc.deletedRemoteRefs.length} remote matt-auto/gitlink/* ref(s) already on mainline`,
+            gitlinkGc.keptRemoteRefs.length > 0
+              ? `(kept ${gitlinkGc.keptRemoteRefs.length} tip(s) not yet on mainline)`
+              : undefined,
+            gitlinkGc.deletedLocalBranches.length > 0
+              ? `; removed local ${gitlinkGc.deletedLocalBranches.join(", ")}`
+              : undefined,
+            ".",
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : undefined;
     const closeComment = [
       `Workflow #${active.workflowId} cleanup completed.`,
       active.workflowPr
         ? `Workflow PR #${active.workflowPr.number}${active.workflowPr.url ? ` (${active.workflowPr.url})` : ""} merged; local workspaces/transcripts and remote matt-auto branches removed.`
         : `Local workspaces/transcripts and remote matt-auto branches removed.`,
       pullLine,
+      ...(gcLine ? [gcLine] : []),
     ].join("\n\n");
     try {
       await bound.tracker.closeIssue(active.workflowId, {
@@ -4463,6 +4508,7 @@ export function createWorkflowCoordinator(
         ? { parentSpecCloseWarning }
         : {}),
       ...(localPull ? { localPull } : {}),
+      ...(gitlinkGc ? { gitlinkGc } : {}),
       ...(active.workflowPr
         ? {
             workflowPrNumber: active.workflowPr.number,

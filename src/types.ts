@@ -492,6 +492,14 @@ export type StageResult =
         reason?: string;
         submodulesUpdated?: boolean;
       };
+      /** Soft hygiene for dual-root gitlink refs / worktrees (issue #31). */
+      gitlinkGc?: {
+        deletedRemoteRefs: readonly string[];
+        keptRemoteRefs: readonly string[];
+        deletedLocalBranches: readonly string[];
+        worktreePruned: boolean;
+        errors: readonly string[];
+      };
       /** Original Workflow ID when a Follow-up workflow was created. */
       followUpOf?: number;
       /** True when this Stage result is a pre-merge Rework attempt. */
