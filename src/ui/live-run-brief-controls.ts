@@ -139,7 +139,10 @@ export async function presentLiveWaitControls(
       let finished = false;
       let interval: ReturnType<typeof setInterval> | undefined;
       let wasPaused = panel.pipelinePaused === true;
-      let briefLines = [...buildRunBriefViewModel(panel).lines];
+      // omitControls: live surface already owns Pause/Terminate SelectList.
+      let briefLines = [
+        ...buildRunBriefViewModel(panel, { omitControls: true }).lines,
+      ];
 
       const finish = (choice: LiveWaitControlChoice) => {
         if (finished) return;
@@ -185,7 +188,9 @@ export async function presentLiveWaitControls(
             return;
           }
           panel = next;
-          briefLines = [...buildRunBriefViewModel(panel).lines];
+          briefLines = [
+            ...buildRunBriefViewModel(panel, { omitControls: true }).lines,
+          ];
 
           if (panel.runTerminated) {
             finish({ action: "settled" });

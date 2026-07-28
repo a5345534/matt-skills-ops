@@ -467,6 +467,19 @@ function notifyRunBrief(
   return brief;
 }
 
+/**
+ * Status-line only (no chat dump). Used while the live custom brief is open so
+ * the same sections are not stacked in the session transcript on every tick.
+ */
+function touchRunBriefStatus(
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): ReturnType<typeof buildRunBriefViewModel> {
+  const brief = buildRunBriefViewModel(panel, { omitControls: true });
+  publishWorkflowPanel(ui, panel, { mode: "status-only" });
+  return brief;
+}
+
 async function applyConfirmedPause(
   coordinator: RunBriefCoordinator,
   ui: MattAutoUi,
@@ -671,6 +684,8 @@ export async function waitForPipelineWorkers(
   const initialPaused = initialPanel?.pipelinePaused === true;
   const initialP1 = hasP1RunLoopWork(initialPanel);
 
+  const liveWaitAvailable = canPresentLiveWaitControls(ui);
+
   // Already settled (no live runners, or P1 work ready) and not paused — do not block.
   if ((initialRunning.length === 0 || initialP1) && !initialPaused) {
     log("info", "pipeline:workers-settled", {
@@ -685,23 +700,26 @@ export async function waitForPipelineWorkers(
   }
 
   if (initialPanel) {
-    const initialBrief = notifyRunBrief(ui, initialPanel);
+    // Live custom already paints the full brief — chat-notify here would stack
+    // a second copy that never updates while the live surface refreshes.
+    const initialBrief = liveWaitAvailable
+      ? touchRunBriefStatus(ui, initialPanel)
+      : notifyRunBrief(ui, initialPanel);
     log("info", "pipeline:wait-workers", {
       runningCount: initialRunning.length,
       pipelinePaused: initialPaused,
       panelWorkers: panelWorkerSnapshot(initialPanel),
       briefSections: initialBrief.sections.map((s) => s.id),
+      liveWait: liveWaitAvailable,
     });
   }
 
   if (!initialPaused) {
     const controlPath = runControlFilePath(process.cwd());
-    if (canPresentLiveWaitControls(ui)) {
+    if (liveWaitAvailable) {
+      // One short line only — do not dump the brief body into chat.
       ui.notify(
-        [
-          "Live wait: brief refreshes while Pause / Terminate stay selectable (↑↓ Enter).",
-          `Shell fallback: echo terminate-now > ${controlPath}`,
-        ].join("\n"),
+        `Live wait · shell fallback: echo terminate-now > ${controlPath}`,
         "info",
       );
     } else if (offerRunningControls) {
@@ -785,7 +803,11 @@ export async function waitForPipelineWorkers(
       const running = runningWorkers(panel);
 
       if (paused) {
-        notifyRunBrief(ui, panel, "warning");
+        if (liveWaitAvailable) {
+          touchRunBriefStatus(ui, panel);
+        } else {
+          notifyRunBrief(ui, panel, "warning");
+        }
         if (!controls) {
           log("warn", "pipeline:paused-without-controls", {
             workflowId: panel.workflowId,
@@ -814,7 +836,7 @@ export async function waitForPipelineWorkers(
             return { status: "terminated", result };
           }
         }
-        if (canPresentLiveWaitControls(ui)) {
+        if (liveWaitAvailable) {
           const live = await presentLiveWaitControls(ui, controls, panel, {
             pollIntervalMs,
             onTick: (p) => {
@@ -893,7 +915,11 @@ export async function waitForPipelineWorkers(
         }
       }
 
-      const brief = notifyRunBrief(ui, panel);
+      // Live custom owns the full brief frame. Chat-notify only for the select
+      // fallback — otherwise every outer tick stacks a stale full brief above live.
+      const brief = liveWaitAvailable
+        ? touchRunBriefStatus(ui, panel)
+        : notifyRunBrief(ui, panel);
       const tickPayload: Record<string, unknown> = {
         tick: i + 1,
         runningCount: running.length,
@@ -910,6 +936,7 @@ export async function waitForPipelineWorkers(
         })),
         briefSections: brief.sections.map((s) => s.id),
         briefLines: brief.lines,
+        liveWait: liveWaitAvailable,
       };
       // Periodic tracker metrics (every ~30s at 0.5s poll) for rate-limit diagnosis.
       if (i === 0 || (i + 1) % 60 === 0) {
@@ -941,7 +968,7 @@ export async function waitForPipelineWorkers(
           if (control.action === "paused") {
             continue;
           }
-        } else if (canPresentLiveWaitControls(ui)) {
+        } else if (liveWaitAvailable) {
           const live = await presentLiveWaitControls(ui, controls, panel, {
             pollIntervalMs,
             onTick: (p) => {

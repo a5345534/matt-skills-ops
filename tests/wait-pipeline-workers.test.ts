@@ -607,6 +607,68 @@ describe("waitForPipelineWorkers", () => {
     expect(ui.notices.length).toBeGreaterThan(0);
   });
 
+  it("live custom wait does not stack full brief copies into chat notify", async () => {
+    const panels: WorkflowPanelState[] = [
+      basePanel({ workers: [runningWorker()] }),
+      basePanel({ workers: [runningWorker({ progress: "tick" })] }),
+      basePanel({
+        workers: [
+          {
+            ticketNumber: 19,
+            attempt: 1,
+            status: "needs-disposition",
+            branchName: "matt-auto/42/ticket-19/r1",
+          },
+        ],
+      }),
+    ];
+    let call = 0;
+    const coordinator = controlCoordinator(
+      () => panels[Math.min(call++, panels.length - 1)]!,
+    );
+    let customRenders = 0;
+    const ui = mockUi({
+      custom: async (factory) => {
+        customRenders += 1;
+        const tui = { requestRender: () => undefined };
+        const theme = {
+          fg: (_c: unknown, t: string) => t,
+          bold: (t: string) => t,
+        };
+        let doneValue: { action: string } | undefined;
+        const component = factory(tui, theme, {}, (v) => {
+          doneValue = v as { action: string };
+        });
+        // Drive one poll so the live surface refreshes from coordinator.
+        await new Promise((r) => setTimeout(r, 5));
+        component.dispose?.();
+        // Outer loop re-checks panel; settle when needs-disposition appears.
+        return doneValue ?? { action: "settled" };
+      },
+    });
+
+    await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 8,
+      sleep: async () => undefined,
+    });
+
+    expect(customRenders).toBeGreaterThan(0);
+    // Short live-wait hint is fine; full multi-section dumps must not pile up.
+    const fullBriefNotices = ui.notices.filter(
+      (n) => n.includes("Workers") && n.includes("#19 r1"),
+    );
+    // At most the final settle snapshot (and never a stack of running briefs).
+    expect(fullBriefNotices.length).toBeLessThanOrEqual(1);
+    expect(ui.notices.some((n) => n.includes("Live wait"))).toBe(true);
+    // No mid-wait full brief of a still-running worker (progress/processAlive).
+    expect(
+      ui.notices.filter(
+        (n) => n.includes("processAlive: true") || n.includes("progress: tick"),
+      ).length,
+    ).toBe(0);
+  });
+
   it("returns settled status when workers finish without controls", async () => {
     const result = await waitForPipelineWorkers(
       {

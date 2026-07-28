@@ -52,12 +52,21 @@ export type RunBriefViewModel = {
 
 type PanelWorker = WorkflowPanelState["workers"][number];
 
+export type BuildRunBriefOptions = {
+  /**
+   * When true, omit the textual Controls section (live custom UI already hosts
+   * Pause/Terminate SelectList — avoid a second Controls block).
+   */
+  omitControls?: boolean;
+};
+
 /**
  * Map `getPanelState()` DTO → structured run brief sections.
  * Missing optional fields are omitted (never throw, never invent values).
  */
 export function buildRunBriefViewModel(
   panel: WorkflowPanelState,
+  options: BuildRunBriefOptions = {},
 ): RunBriefViewModel {
   const sections: RunBriefSection[] = [];
 
@@ -87,8 +96,10 @@ export function buildRunBriefViewModel(
   const tickets = ticketsSection(panel);
   if (tickets) sections.push(tickets);
 
-  const controls = controlsSection(panel);
-  if (controls) sections.push(controls);
+  if (!options.omitControls) {
+    const controls = controlsSection(panel);
+    if (controls) sections.push(controls);
+  }
 
   const stop = stopSection(panel);
   if (stop) sections.push(stop);

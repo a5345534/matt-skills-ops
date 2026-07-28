@@ -258,6 +258,13 @@ describe("buildRunBriefViewModel", () => {
     ]);
   });
 
+  it("can omit Controls when the live surface owns Pause/Terminate", () => {
+    const withControls = buildRunBriefViewModel(basePanel());
+    expect(withControls.sections.some((s) => s.id === "controls")).toBe(true);
+    const without = buildRunBriefViewModel(basePanel(), { omitControls: true });
+    expect(without.sections.some((s) => s.id === "controls")).toBe(false);
+  });
+
   it("prefers worker inspection over generic paused context", () => {
     const panel = basePanel({
       pipelinePaused: true,
