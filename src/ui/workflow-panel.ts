@@ -57,7 +57,14 @@ export function buildCompactWorkflowPanel(
   const identity = title
     ? `Workflow #${panel.workflowId}: ${title}`
     : `Workflow #${panel.workflowId}`;
-  lines.push(pipelineStatus ? `${identity} · ${pipelineStatus}` : identity);
+  const elapsed =
+    typeof panel.runElapsedMs === "number"
+      ? formatCompactRuntime(panel.runElapsedMs)
+      : undefined;
+  const statusBits = [pipelineStatus, elapsed ? `t=${elapsed}` : undefined]
+    .filter(Boolean)
+    .join(" · ");
+  lines.push(statusBits ? `${identity} · ${statusBits}` : identity);
 
   const context = deriveContextLabel(panel);
   if (context && context !== "Pipeline paused" && context !== "Run terminated") {

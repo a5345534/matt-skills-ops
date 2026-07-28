@@ -306,6 +306,13 @@ export type WorkflowPanelState = {
   pipelinePaused: boolean;
   /** True after Run termination until a new pipeline run begins. */
   runTerminated?: boolean;
+  /**
+   * Wall-clock ms since `/matt-auto run` (or beginPipelineRun) started.
+   * Frozen at pause start while pipeline is paused (same freeze rule as worker R1).
+   */
+  runElapsedMs?: number;
+  /** Epoch ms when the current pipeline run began. */
+  runStartedAtMs?: number;
   /** Last operator stop control that affected the run loop. */
   lastStopReason?: "pipeline-pause" | "run-termination";
   /** T1 stop-only vs T2 discard-unintegrated, when last stop was Run termination. */

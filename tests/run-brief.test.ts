@@ -3,6 +3,7 @@ import {
   buildRunBriefViewModel,
   deriveContextLabel,
   formatRunBriefLines,
+  formatRuntimeMs,
   predictRunTerminationMode,
 } from "../src/ui/run-brief.js";
 import type { WorkflowPanelState } from "../src/types.js";
@@ -113,7 +114,7 @@ describe("buildRunBriefViewModel", () => {
     );
 
     expect(byId.workflow?.lines).toEqual(["Workflow #42: Ship run brief"]);
-    expect(byId.pipeline?.lines).toEqual(["Status: running"]);
+    expect(byId.pipeline?.lines[0]).toBe("Status: running");
     expect(byId.context?.lines).toEqual(["Implementing #43 r2"]);
     // Ticket table present → Workers is a single progress line (no path dump).
     expect(byId.workers?.lines).toEqual([
@@ -192,9 +193,9 @@ describe("buildRunBriefViewModel", () => {
     expect(brief.sections.find((s) => s.id === "workflow")?.lines).toEqual([
       "Workflow #42",
     ]);
-    expect(brief.sections.find((s) => s.id === "pipeline")?.lines).toEqual([
+    expect(brief.sections.find((s) => s.id === "pipeline")?.lines[0]).toBe(
       "Status: running",
-    ]);
+    );
     expect(brief.sections.find((s) => s.id === "context")?.lines).toEqual([
       "Needs disposition #43 r1",
     ]);
@@ -220,9 +221,9 @@ describe("buildRunBriefViewModel", () => {
         lastStopReason: "pipeline-pause",
       }),
     );
-    expect(paused.sections.find((s) => s.id === "pipeline")?.lines).toEqual([
+    expect(paused.sections.find((s) => s.id === "pipeline")?.lines[0]).toBe(
       "Status: paused",
-    ]);
+    );
     expect(paused.sections.find((s) => s.id === "stop")?.lines).toEqual([
       "Last stop: pipeline pause",
     ]);
@@ -238,12 +239,22 @@ describe("buildRunBriefViewModel", () => {
         terminationMode: "discard-unintegrated",
       }),
     );
-    expect(terminated.sections.find((s) => s.id === "pipeline")?.lines).toEqual([
+    expect(terminated.sections.find((s) => s.id === "pipeline")?.lines[0]).toBe(
       "Status: terminated",
-    ]);
+    );
     expect(terminated.sections.find((s) => s.id === "stop")?.lines).toEqual([
       "Last stop: run termination",
       "Termination mode: discard unintegrated attempts",
+    ]);
+  });
+
+  it("shows total run elapsed on the Pipeline section", () => {
+    const brief = buildRunBriefViewModel(
+      basePanel({ runElapsedMs: 125_000 }),
+    );
+    expect(brief.sections.find((s) => s.id === "pipeline")?.lines).toEqual([
+      "Status: running",
+      `Elapsed: ${formatRuntimeMs(125_000)}`,
     ]);
   });
 

@@ -135,10 +135,14 @@ function pipelineSection(panel: WorkflowPanelState): RunBriefSection {
   } else {
     status = "running";
   }
+  const lines = [`Status: ${status}`];
+  if (typeof panel.runElapsedMs === "number") {
+    lines.push(`Elapsed: ${formatRuntimeMs(panel.runElapsedMs)}`);
+  }
   return {
     id: "pipeline",
     title: "Pipeline",
-    lines: [`Status: ${status}`],
+    lines,
   };
 }
 

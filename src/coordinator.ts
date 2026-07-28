@@ -446,6 +446,8 @@ export function createWorkflowCoordinator(
   let pipelinePaused = false;
   /** When set, worker runtime (R1) freezes at this epoch ms while paused. */
   let pipelinePausedAtMs: number | undefined;
+  /** Epoch ms when the current /matt-auto run began (dashboard total elapsed). */
+  let pipelineRunStartedAtMs: number | undefined;
   /** Session-owned Run termination flag until the next explicit pipeline run. */
   let runTerminated = false;
   /** Last operator stop that affected the run loop (panel / brief surface). */
@@ -4914,6 +4916,7 @@ export function createWorkflowCoordinator(
   function beginPipelineRun(): void {
     pipelinePaused = false;
     pipelinePausedAtMs = undefined;
+    pipelineRunStartedAtMs = Date.now();
     runTerminated = false;
     lastStopReason = undefined;
     lastTerminationMode = undefined;
@@ -5355,6 +5358,14 @@ export function createWorkflowCoordinator(
       workers,
       pipelinePaused,
     };
+    if (typeof pipelineRunStartedAtMs === "number") {
+      state.runStartedAtMs = pipelineRunStartedAtMs;
+      const endMs =
+        pipelinePaused && typeof pipelinePausedAtMs === "number"
+          ? pipelinePausedAtMs
+          : Date.now();
+      state.runElapsedMs = Math.max(0, endMs - pipelineRunStartedAtMs);
+    }
     if (active.title?.trim()) {
       state.title = active.title.trim();
     }
