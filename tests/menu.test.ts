@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { WORKER_CONCURRENCY_WARNING_THRESHOLD } from "../src/constants.js";
+import {
+  START_NEW_INDEPENDENT_WORKFLOW_ACTION,
+  WORKER_CONCURRENCY_WARNING_THRESHOLD,
+  resumeWorkflowActionId,
+} from "../src/constants.js";
 import {
   buildMainMenuItems,
   concurrencyWarningMessage,
@@ -735,5 +739,21 @@ describe("selectPipelineAction", () => {
       },
     ]);
     expect(chosen?.id).toBe("create-spec");
+  });
+
+  it("never auto-selects Workflow-home Resume or Start-new routing", () => {
+    expect(
+      selectPipelineAction([
+        {
+          id: resumeWorkflowActionId(41),
+          label: "Resume Workflow #41",
+          description: "Explicit binding required.",
+        },
+        START_NEW_INDEPENDENT_WORKFLOW_ACTION,
+      ]),
+    ).toBeUndefined();
+    expect(
+      selectPipelineAction([START_NEW_INDEPENDENT_WORKFLOW_ACTION]),
+    ).toBeUndefined();
   });
 });

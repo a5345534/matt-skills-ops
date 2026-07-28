@@ -44,7 +44,9 @@ export type StageId =
   | "workflow-pr"
   | "cleanup"
   | "rework"
-  | "follow-up";
+  | "follow-up"
+  /** Explicit local Workflow-home binding / resume routing. */
+  | "workflow-routing";
 
 /** On-demand CI gate status for an Integration branch. Never polled in the background. */
 export type CiStatus = "pending" | "success" | "failure";
@@ -143,6 +145,27 @@ export type CanonicalTargetIdentity = {
   repository: CanonicalRepositoryIdentity;
   /** For example, `refs/heads/main`; never a local path or remote alias. */
   targetRef: string;
+};
+
+/**
+ * Checkout-local routing state for one Workflow home. GitHub manifests remain
+ * authoritative; this only tells a checkout which Workflow ID it intends to
+ * resume for one canonical Target identity.
+ */
+export type WorkflowHomeBinding = {
+  target: CanonicalTargetIdentity;
+  workflowId: number;
+};
+
+/**
+ * A locally held checkout-ownership guard. It rejects two Workflow homes in
+ * one physical checkout; remote coordination leases remain the cross-machine
+ * authority.
+ */
+export type WorkflowHomeLock = {
+  holderId: string;
+  token: string;
+  acquiredAt: string;
 };
 
 /** GitHub merge methods Matt Auto may record as repository policy. */
@@ -886,8 +909,8 @@ export type WorkflowCoordinator = {
    */
   confirmStage(decision: StageConfirmationDecision): Promise<StageResult>;
   /**
-   * Active workflow for the current Target branch, if any.
-   * Recovered from GitHub (Workflow ID + Workflow manifest).
+   * Active workflow bound to this Workflow home, if any. GitHub manifests are
+   * authoritative; an unbound checkout never receives an arbitrary sibling.
    */
   getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
   /**
@@ -1005,6 +1028,12 @@ export type WorkflowCoordinator = {
    * Leaves GitHub state recoverable (tickets remain open / ready).
    */
   abortWorkers(): Promise<void>;
+  /**
+   * Release this checkout's local ownership guard and its held Workflow
+   * coordinator lease. Workflow state remains recoverable on GitHub.
+   * Called when a Workflow home session shuts down or switches roots.
+   */
+  releaseWorkflowHome(): Promise<void>;
   /**
    * Pipeline pause: abort session-owned workers and stop auto-advance.
    * Leaves GitHub issues, labels, manifests, and integrated history untouched.

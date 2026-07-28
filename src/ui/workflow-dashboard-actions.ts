@@ -836,6 +836,8 @@ function stageLabel(stage: StageId): string {
       return "Rework";
     case "follow-up":
       return "Follow-up workflow";
+    case "workflow-routing":
+      return "Workflow-home routing";
   }
 }
 

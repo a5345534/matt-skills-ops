@@ -12,6 +12,8 @@ import type {
   TicketsDraft,
   WorkerProfile,
   WorkerProtocolEvent,
+  WorkflowHomeBinding,
+  WorkflowHomeLock,
   WorkflowManifest,
 } from "./types.js";
 
@@ -435,6 +437,21 @@ export type CoordinationPort = {
   }): Promise<UpdateRepositoryWorkerCapacityPolicyResult>;
 };
 
+/** Result of attempting to own one physical Workflow-home checkout. */
+export type AcquireWorkflowHomeLockResult =
+  | { acquired: true; lock: WorkflowHomeLock }
+  | { acquired: false; holderId?: string };
+
+/**
+ * Checkout-local ownership guard. It rejects two Workflow homes in the same
+ * clone/worktree; CoordinationPort remains the cross-machine authority.
+ */
+export type WorkflowHomeLockPort = {
+  acquire(input: { holderId: string }): Promise<AcquireWorkflowHomeLockResult>;
+  renew(lock: WorkflowHomeLock): Promise<{ renewed: boolean }>;
+  release(lock: WorkflowHomeLock): Promise<{ released: boolean }>;
+};
+
 /** Launch parameters for one session-owned Implementation worker. */
 export type WorkerLaunchInput = {
   workerId: string;
@@ -535,6 +552,11 @@ export type TrackerTicket = {
  * System boundary: `gh` / GitHub remote writes and reads.
  */
 export type TrackerPort = {
+  /**
+   * Resolve the canonical GitHub owner/name identity for this Workflow root.
+   * Optional while legacy version-1 workflow routing remains supported.
+   */
+  getCanonicalRepositoryIdentity?(): Promise<CanonicalRepositoryIdentity | undefined>;
   /**
    * Create a GitHub issue. For Create-spec publish, the issue number becomes the Workflow ID.
    */
@@ -671,8 +693,9 @@ export type PreferencesPort = {
   /** Clear the Workflow-root Worker concurrency override. */
   clearRootWorkerConcurrency(): Promise<void>;
   /**
-   * Rebuildable local pointer to the Active workflow id for a Target branch.
-   * GitHub remains authoritative; this avoids scanning every open issue on each menu open.
+   * Legacy rebuildable local pointer to the Active workflow ID for a bare
+   * Target branch. New coordination-aware homes use WorkflowHomeBinding below;
+   * this remains only for version-1 compatibility and one-time migration.
    */
   getActiveWorkflowId(targetBranch: string): Promise<number | undefined>;
   setActiveWorkflowId(
@@ -680,6 +703,16 @@ export type PreferencesPort = {
     workflowId: number,
   ): Promise<void>;
   clearActiveWorkflowId(targetBranch: string): Promise<void>;
+  /**
+   * Checkout-local Workflow-home binding keyed by canonical repository + fully
+   * qualified Target ref. It is routing state only; GitHub remains authoritative.
+   * Optional while old preference files and legacy v1 routing remain supported.
+   */
+  getWorkflowHomeBinding?(
+    target: CanonicalTargetIdentity,
+  ): Promise<WorkflowHomeBinding | undefined>;
+  setWorkflowHomeBinding?(binding: WorkflowHomeBinding): Promise<void>;
+  clearWorkflowHomeBinding?(target: CanonicalTargetIdentity): Promise<void>;
 };
 
 /**
@@ -742,6 +775,10 @@ export type RootScopedPorts = {
   remoteGit: RemoteGitPort;
   /** On-demand GitHub Actions CI gate (no background polling). */
   ci: CiPort;
+  /** Remote fenced lease records for coordination-aware Workflow manifests. */
+  coordination?: CoordinationPort;
+  /** Local guard against two Workflow homes sharing this exact checkout. */
+  workflowHomeLock?: WorkflowHomeLockPort;
 };
 
 /** Ports injected into the Workflow coordinator. */
