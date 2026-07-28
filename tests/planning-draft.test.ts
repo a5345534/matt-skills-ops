@@ -160,6 +160,9 @@ describe("validateCreateSpecMarkdown", () => {
     expect(prompt).toContain("# <concise spec title>");
     expect(prompt).toContain("## Implementation Decisions");
     expect(prompt).toContain("## Testing Decisions");
+    expect(prompt).toContain(
+      "at least 3 top-level numbered entries (`1. ...`, `2. ...`, `3. ...`)",
+    );
     expect(prompt).not.toContain("MATT-AUTO-SPEC-DRAFT");
   });
 });
