@@ -116,6 +116,19 @@ export function resolveBranchProtectionObservation(
   return "absent";
 }
 
+/**
+ * True when Target-branch policy names required status checks that Matt Auto
+ * must wait on before automatic merge. Empty contexts without strict means
+ * optional/non-blocking CI must not stall delivery.
+ */
+export function policyRequiresStatusChecks(
+  policy: Pick<ProtectedBranchAutomationPolicy, "requiredStatusChecks">,
+): boolean {
+  const checks = policy.requiredStatusChecks;
+  if (!checks) return false;
+  return checks.contexts.length > 0 || checks.strict === true;
+}
+
 /** Merge-time facts checked immediately before automatic Workflow PR merge. */
 export type MergeFreshnessInput = {
   /** Currently held Target-branch lease (must still verify). */
@@ -137,6 +150,11 @@ export type MergeFreshnessInput = {
     headSha: string;
     status: CiStatus;
   };
+  /**
+   * When false, pending/failed CI does not block merge (no required checks on
+   * the Target branch). Defaults to true for fail-closed required-check repos.
+   */
+  requireStatusChecks?: boolean;
 };
 
 export type MergeFreshnessResult =
@@ -406,37 +424,41 @@ export function evaluateMergeFreshness(
     };
   }
 
-  if (!sameGitObjectId(input.requiredChecks.headSha, input.expectedHeadSha)) {
-    return {
-      ok: false,
-      code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksStaleHead,
-      reason:
-        "Required-check observation is not for the expected Workflow PR head; a new check cycle is required.",
-      recovery: "awaiting-pr-checks",
-      failureKind: "deterministic",
-    };
-  }
+  const requireStatusChecks = input.requireStatusChecks !== false;
 
-  if (input.requiredChecks.status === "pending") {
-    return {
-      ok: false,
-      code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksNotGreen,
-      reason:
-        "Required checks are still pending for the expected Workflow PR head; refusing automatic merge.",
-      recovery: "awaiting-pr-checks",
-      failureKind: "transient",
-    };
-  }
+  if (requireStatusChecks) {
+    if (!sameGitObjectId(input.requiredChecks.headSha, input.expectedHeadSha)) {
+      return {
+        ok: false,
+        code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksStaleHead,
+        reason:
+          "Required-check observation is not for the expected Workflow PR head; a new check cycle is required.",
+        recovery: "awaiting-pr-checks",
+        failureKind: "deterministic",
+      };
+    }
 
-  if (input.requiredChecks.status !== "success") {
-    return {
-      ok: false,
-      code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksNotGreen,
-      reason:
-        "Required checks are not green for the expected Workflow PR head; refusing automatic merge.",
-      recovery: "retryable",
-      failureKind: "deterministic",
-    };
+    if (input.requiredChecks.status === "pending") {
+      return {
+        ok: false,
+        code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksNotGreen,
+        reason:
+          "Required checks are still pending for the expected Workflow PR head; refusing automatic merge.",
+        recovery: "awaiting-pr-checks",
+        failureKind: "transient",
+      };
+    }
+
+    if (input.requiredChecks.status !== "success") {
+      return {
+        ok: false,
+        code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksNotGreen,
+        reason:
+          "Required checks are not green for the expected Workflow PR head; refusing automatic merge.",
+        recovery: "retryable",
+        failureKind: "deterministic",
+      };
+    }
   }
 
   return { ok: true };

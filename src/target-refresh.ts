@@ -221,6 +221,8 @@ export async function releaseTargetRefreshForPrChecks(input: {
   queue: TargetBranchQueueOrchestrator;
   workflowCoordinatorLease: WorkflowCoordinatorLease;
   prFreshness: WorkflowPrFreshness;
+  /** When true, re-admit merge-ready (no required PR checks to wait for). */
+  admitMergeReady?: boolean;
 }): Promise<
   | { ok: true }
   | { ok: false; reason: string }
@@ -229,6 +231,7 @@ export async function releaseTargetRefreshForPrChecks(input: {
     kind: "release-for-pr-checks",
     workflowCoordinatorLease: input.workflowCoordinatorLease,
     prFreshness: input.prFreshness,
+    ...(input.admitMergeReady ? { admitMergeReady: true } : {}),
   });
   if (!released.ok) {
     await input.queue.transition({ kind: "release-held-target-lease" });

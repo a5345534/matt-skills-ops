@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import type { MattAutoLogger } from "./adapters/logger.js";
 import {
   checkCiActionId,
   CI_RECOVERY_OPTIONS,
@@ -46,6 +47,7 @@ import {
   canonicalRepositoryIdentityKey,
   canonicalTargetIdentityKey,
   isCanonicalRepositoryIdentity,
+  targetBranchFromRef,
   targetRefFromBranch,
 } from "./coordination.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
@@ -102,6 +104,7 @@ import { buildParallelDeliveryPanelState } from "./parallel-delivery-state.js";
 import {
   evaluateMergeFreshness,
   evaluateProtectedBranchAutomation,
+  policyRequiresStatusChecks,
   type ProtectedBranchAutomationPolicy,
 } from "./workflow-pr-guard.js";
 import type {
@@ -574,6 +577,23 @@ type PendingCiRecovery = {
  * actions, later stages) live here. Adapters are injected as ports and are not
  * part of this interface.
  */
+let coordinatorLogger: MattAutoLogger | undefined;
+
+/** Attach the Workflow-root Matt Auto logger for coordinator diagnostics. */
+export function setCoordinatorLogger(
+  logger: MattAutoLogger | undefined,
+): void {
+  coordinatorLogger = logger;
+}
+
+function clog(
+  level: "debug" | "info" | "warn" | "error",
+  message: string,
+  data?: unknown,
+): void {
+  coordinatorLogger?.[level](message, data);
+}
+
 export function createWorkflowCoordinator(
   ports: WorkflowCoordinatorPorts,
 ): WorkflowCoordinator {
@@ -638,6 +658,10 @@ export function createWorkflowCoordinator(
   let pendingIntegration: PendingIntegration | undefined;
   /** Guard against re-entrant Integration unit execution. */
   let integrationInProgress = false;
+  /** Epoch ms when the current Integration unit (or Target-refresh) entered running. */
+  let integrationUnitStartedAtMs: number | undefined;
+  /** True while Create-tickets publish loop is creating issues / writing manifest. */
+  let createTicketsPublishInProgress = false;
   /**
    * Session-owned Conflict resolution worker for a preserved in-progress merge.
    * Lifetime is bound to Workflow home; never durable across processes.
@@ -1892,11 +1916,13 @@ export function createWorkflowCoordinator(
         attempt,
       );
 
-      // Prefer retrying a failed / conflicted Integration over re-Implementing.
+      // Prefer retrying Integration over re-Implementing when Close already
+      // ran for a completed attempt. Covers failed/conflicted units and also
+      // mid-unit interruption (pause after merge, before completed) where no
+      // integration-unit-failed event was written.
       if (
         history.disposition === "close" &&
         history.implementCompleted &&
-        history.integrationFailedReason &&
         !history.integrationComplete
       ) {
         pendingIntegration = {
@@ -1905,7 +1931,9 @@ export function createWorkflowCoordinator(
           attempt,
           branchName,
           worktreePath,
-          lastFailure: history.integrationFailedReason,
+          lastFailure:
+            history.integrationFailedReason ??
+            "Close disposition is pending Integration for this attempt.",
           ...(history.integrationConflict
             ? { conflict: history.integrationConflict }
             : {}),
@@ -3924,10 +3952,28 @@ export function createWorkflowCoordinator(
           } else if (active.stage === "pr-opened") {
             if (active.coordination) {
               const candidate = active.coordination.queueCandidate;
+              const missingValidatedTarget =
+                !active.coordination.prFreshness?.validatedTargetSha;
+              // Refresh must be available as soon as a Workflow PR is open when
+              // Target freshness is missing — do not hide it behind merge-ready
+              // (which never arrives if PR checks never start).
               const refreshable =
+                missingValidatedTarget ||
                 candidate?.state === "merge-ready" ||
                 candidate?.state === "refreshing" ||
+                candidate?.state === "awaiting-pr-checks" ||
                 pendingTargetRefresh !== undefined;
+              // Offer Merge only when a validated Target SHA is on record so
+              // Merge is never the sole Next action that always fail-closes.
+              const mergeable = !missingValidatedTarget;
+              // unshift order: last unshift is first in the list.
+              if (mergeable) {
+                actions.unshift({
+                  id: MERGE_WORKFLOW_PR_ACTION.id,
+                  label: MERGE_WORKFLOW_PR_ACTION.label,
+                  description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+                });
+              }
               if (refreshable && !targetRefreshInProgress) {
                 actions.unshift({
                   id: REFRESH_FROM_TARGET_ACTION.id,
@@ -3935,12 +3981,13 @@ export function createWorkflowCoordinator(
                   description: `${REFRESH_FROM_TARGET_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
                 });
               }
+            } else {
+              actions.unshift({
+                id: MERGE_WORKFLOW_PR_ACTION.id,
+                label: MERGE_WORKFLOW_PR_ACTION.label,
+                description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+              });
             }
-            actions.unshift({
-              id: MERGE_WORKFLOW_PR_ACTION.id,
-              label: MERGE_WORKFLOW_PR_ACTION.label,
-              description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
-            });
           }
         }
       }
@@ -4121,9 +4168,26 @@ export function createWorkflowCoordinator(
       };
     }
 
-    let candidates: readonly ActiveWorkflow[];
+    // Prefer single-issue discovery for explicit resume. Full open-issue
+    // pagination is expensive and fails closed under GitHub rate limits with a
+    // generic message (Workflow #53 take-over while listing all open issues).
+    const targetBranch = targetBranchFromRef(context.target.targetRef);
+    let active: ActiveWorkflow | undefined;
     try {
-      candidates = await bound.tracker.findActiveWorkflows(context.target);
+      if (targetBranch) {
+        active = await bound.tracker.findActiveWorkflow(
+          targetBranch,
+          workflowId,
+        );
+      }
+      if (!active) {
+        const candidates = await bound.tracker.findActiveWorkflows(
+          context.target,
+        );
+        active = candidates.find(
+          (candidate) => candidate.workflowId === workflowId,
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -4133,7 +4197,6 @@ export function createWorkflowCoordinator(
         workflowId,
       };
     }
-    const active = candidates.find((candidate) => candidate.workflowId === workflowId);
     if (!active) {
       return {
         status: "failed",
@@ -4535,7 +4598,30 @@ export function createWorkflowCoordinator(
     }
 
     // decision === "publish"
-    const active = await loadActiveWorkflow(bound);
+    // Log before any tracker/lease I/O so hangs after auto-publish are localizable.
+    clog("info", "create-tickets:publish-begin", {
+      workflowId: current.workflowId,
+      ticketCount: current.draft.tickets.length,
+    });
+    createTicketsPublishInProgress = true;
+    try {
+    let active: ActiveWorkflow | undefined;
+    try {
+      active = await loadActiveWorkflow(bound);
+    } catch (error) {
+      pending = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-load-active-failed", {
+        workflowId: current.workflowId,
+        reason: message,
+      });
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: `Could not load Active workflow before Create-tickets publish: ${message}`,
+        workflowId: current.workflowId,
+      };
+    }
     if (!active || active.workflowId !== current.workflowId) {
       pending = undefined;
       return {
@@ -4554,17 +4640,24 @@ export function createWorkflowCoordinator(
       };
     }
 
+    // Capture after guards so nested refreshPublishAuthority keeps a definite ActiveWorkflow.
+    const publishWorkflow = active;
+
     const initialAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
-      active,
+      publishWorkflow,
     );
     if (!initialAuthority.ok) {
       pending = undefined;
+      clog("warn", "create-tickets:publish-lease-failed", {
+        workflowId: publishWorkflow.workflowId,
+        reason: initialAuthority.reason,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
         reason: initialAuthority.reason,
-        workflowId: active.workflowId,
+        workflowId: publishWorkflow.workflowId,
       };
     }
 
@@ -4574,9 +4667,52 @@ export function createWorkflowCoordinator(
       current.draft.tickets.map((t) => [t.localId, t.title]),
     );
     const createdNumbers: number[] = [];
+    let lastAuthorityAtMs = Date.now();
+
+    /**
+     * Hold one coordinator lease for the publish batch. Re-ensure only on the
+     * heartbeat interval (or when the in-memory hold was lost) — not before
+     * every createIssue / sub-issue / blockedBy call.
+     */
+    async function refreshPublishAuthority(force = false): Promise<void> {
+      const due =
+        force ||
+        Date.now() - lastAuthorityAtMs >=
+          DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS;
+      if (!due) {
+        await heartbeatHeldWorkflowCoordinatorLease(bound);
+        // Heartbeat may clear a lost remote lease without throwing.
+        if (
+          publishWorkflow.coordination &&
+          !heldWorkflowCoordinatorLease
+        ) {
+          const recovered = await ensureActiveWorkflowCoordinatorLease(
+            bound,
+            publishWorkflow,
+          );
+          if (!recovered.ok) throw new Error(recovered.reason);
+          lastAuthorityAtMs = Date.now();
+        }
+        return;
+      }
+      const authority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        publishWorkflow,
+      );
+      if (!authority.ok) throw new Error(authority.reason);
+      lastAuthorityAtMs = Date.now();
+    }
+
+    clog("info", "create-tickets:publish-start", {
+      workflowId: publishWorkflow.workflowId,
+      ticketCount: ordered.length,
+    });
 
     try {
-      for (const ticket of ordered) {
+      for (let index = 0; index < ordered.length; index += 1) {
+        const ticket = ordered[index]!;
+        await refreshPublishAuthority(index === 0);
+
         const blockers = ticket.blockedBy.map((localId) => {
           const number = localToNumber.get(localId);
           if (number === undefined) {
@@ -4597,13 +4733,13 @@ export function createWorkflowCoordinator(
           blockers,
         );
 
-        const authority = await ensureActiveWorkflowCoordinatorLease(
-          bound,
-          active,
-        );
-        if (!authority.ok) {
-          throw new Error(authority.reason);
-        }
+        clog("info", "create-tickets:publish-ticket", {
+          workflowId: active.workflowId,
+          index: index + 1,
+          total: ordered.length,
+          localId: ticket.localId,
+          title: ticket.title,
+        });
 
         const created = await bound.tracker.createIssue({
           title: ticket.title,
@@ -4613,21 +4749,17 @@ export function createWorkflowCoordinator(
         localToNumber.set(ticket.localId, created.number);
         createdNumbers.push(created.number);
 
-        const linkAuthority = await ensureActiveWorkflowCoordinatorLease(
-          bound,
-          active,
-        );
-        if (!linkAuthority.ok) throw new Error(linkAuthority.reason);
         await bound.tracker.addSubIssue(current.workflowId, created.number);
 
         for (const blocker of blockers) {
-          const blockerAuthority = await ensureActiveWorkflowCoordinatorLease(
-            bound,
-            active,
-          );
-          if (!blockerAuthority.ok) throw new Error(blockerAuthority.reason);
           await bound.tracker.addBlockedBy(created.number, blocker.number);
         }
+
+        clog("info", "create-tickets:publish-ticket-linked", {
+          workflowId: active.workflowId,
+          issueNumber: created.number,
+          blockers: blockers.map((b) => b.number),
+        });
       }
     } catch (error) {
       pending = undefined;
@@ -4636,6 +4768,11 @@ export function createWorkflowCoordinator(
         createdNumbers.length > 0
           ? ` Created ticket issues: ${createdNumbers.map((n) => `#${n}`).join(", ")}.`
           : "";
+      clog("warn", "create-tickets:publish-failed", {
+        workflowId: active.workflowId,
+        createdNumbers,
+        reason: message,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
@@ -4647,6 +4784,24 @@ export function createWorkflowCoordinator(
       stage: "tickets-published",
       tickets: createdNumbers,
     });
+
+    try {
+      await refreshPublishAuthority(true);
+    } catch (error) {
+      pending = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-lease-failed", {
+        workflowId: active.workflowId,
+        phase: "manifest",
+        reason: message,
+      });
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: message,
+        workflowId: active.workflowId,
+      };
+    }
 
     const finalAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
@@ -4662,6 +4817,11 @@ export function createWorkflowCoordinator(
       };
     }
 
+    clog("info", "create-tickets:publish-manifest", {
+      workflowId: active.workflowId,
+      tickets: createdNumbers,
+    });
+
     try {
       await bound.tracker.writeWorkflowManifest(
         current.workflowId,
@@ -4671,6 +4831,11 @@ export function createWorkflowCoordinator(
     } catch (error) {
       pending = undefined;
       const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-manifest-failed", {
+        workflowId: active.workflowId,
+        createdNumbers,
+        reason: message,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
@@ -4684,6 +4849,11 @@ export function createWorkflowCoordinator(
     const listed = await bound.tracker.listTickets(createdNumbers);
     const progress = computeTicketProgress(current.workflowId, listed);
 
+    clog("info", "create-tickets:publish-ok", {
+      workflowId: current.workflowId,
+      tickets: createdNumbers,
+    });
+
     return {
       status: "completed",
       stage: "create-tickets",
@@ -4691,6 +4861,9 @@ export function createWorkflowCoordinator(
       tickets: createdNumbers,
       ticketProgress: progress,
     };
+    } finally {
+      createTicketsPublishInProgress = false;
+    }
   }
 
   async function getActiveWorkflow(): Promise<ActiveWorkflow | undefined> {
@@ -6729,10 +6902,23 @@ export function createWorkflowCoordinator(
         });
       }
 
+      let admitMergeReady = false;
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: pending.targetBranch,
+          });
+          admitMergeReady = !policyRequiresStatusChecks(policy);
+        } catch {
+          admitMergeReady = false;
+        }
+      }
+
       const released = await releaseTargetRefreshForPrChecks({
         queue: queueResult.queue,
         workflowCoordinatorLease: releaseAuthority.lease,
         prFreshness,
+        ...(admitMergeReady ? { admitMergeReady: true } : {}),
       });
       if (!released.ok) {
         return failTargetRefresh(bound, {
@@ -7290,7 +7476,39 @@ export function createWorkflowCoordinator(
     });
 
     if (ci.status === "success") {
-      const active = await loadActiveWorkflow(bound, { force: true });
+      // Do not force-load the Active workflow or re-acquire the coordinator lease
+      // on every green CI: that path hung Workflow #53/#56 after ci-check with no
+      // ticket-closed (lease git thrash) while closeIssue never ran.
+      clog("info", "ci-gate:green", {
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+        summary: ci.summary,
+      });
+
+      let active: ActiveWorkflow | undefined =
+        cachedPanelActive?.workflowId === input.workflowId
+          ? cachedPanelActive
+          : undefined;
+      if (!active) {
+        try {
+          active = await loadActiveWorkflow(bound, { force: false });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          clog("warn", "ci-gate:load-active-failed", {
+            workflowId: input.workflowId,
+            ticketNumber: input.ticketNumber,
+            reason: message,
+          });
+          return {
+            status: "failed",
+            stage: "ci-gate",
+            reason: `CI is green but Active workflow could not be loaded to close #${input.ticketNumber}: ${message}`,
+            ticketNumber: input.ticketNumber,
+            attempt: input.attempt,
+            workflowId: input.workflowId,
+          };
+        }
+      }
       if (!active || active.workflowId !== input.workflowId) {
         return {
           status: "failed",
@@ -7302,22 +7520,75 @@ export function createWorkflowCoordinator(
           workflowId: input.workflowId,
         };
       }
-      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
-      if (!authority.ok) {
-        return {
-          status: "failed",
-          stage: "ci-gate",
-          reason: authority.reason,
-          ticketNumber: input.ticketNumber,
-          attempt: input.attempt,
-          workflowId: input.workflowId,
-        };
+
+      if (active.coordination) {
+        const alreadyHeld =
+          heldWorkflowCoordinatorLease?.workflowId === input.workflowId &&
+          !coordinatorLeaseLost;
+        if (!alreadyHeld) {
+          const authority = await ensureActiveWorkflowCoordinatorLease(
+            bound,
+            active,
+          );
+          if (!authority.ok) {
+            clog("warn", "ci-gate:lease-failed", {
+              workflowId: input.workflowId,
+              ticketNumber: input.ticketNumber,
+              reason: authority.reason,
+            });
+            return {
+              status: "failed",
+              stage: "ci-gate",
+              reason: authority.reason,
+              ticketNumber: input.ticketNumber,
+              attempt: input.attempt,
+              workflowId: input.workflowId,
+            };
+          }
+        } else {
+          // Keep the held lease warm without a full remote re-acquire dance.
+          await heartbeatHeldWorkflowCoordinatorLease(bound);
+          if (
+            coordinatorLeaseLost ||
+            heldWorkflowCoordinatorLease?.workflowId !== input.workflowId
+          ) {
+            const authority = await ensureActiveWorkflowCoordinatorLease(
+              bound,
+              active,
+            );
+            if (!authority.ok) {
+              clog("warn", "ci-gate:lease-failed", {
+                workflowId: input.workflowId,
+                ticketNumber: input.ticketNumber,
+                reason: authority.reason,
+              });
+              return {
+                status: "failed",
+                stage: "ci-gate",
+                reason: authority.reason,
+                ticketNumber: input.ticketNumber,
+                attempt: input.attempt,
+                workflowId: input.workflowId,
+              };
+            }
+          }
+        }
       }
+
+      clog("info", "ci-gate:closing-ticket", {
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+      });
       try {
         await bound.tracker.closeIssue(input.ticketNumber);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const reason = `CI is green but closing #${input.ticketNumber} failed: ${message}`;
+        clog("warn", "ci-gate:close-failed", {
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          reason: message,
+        });
         pendingCiRecovery = {
           workflowId: input.workflowId,
           ticketNumber: input.ticketNumber,
@@ -7353,6 +7624,11 @@ export function createWorkflowCoordinator(
       pendingCiRecovery = undefined;
       await bound.transcripts.append(transcriptKey, {
         type: "ticket-closed",
+        ticketNumber: input.ticketNumber,
+      });
+      invalidatePanelCaches();
+      clog("info", "ci-gate:ticket-closed", {
+        workflowId: input.workflowId,
         ticketNumber: input.ticketNumber,
       });
 
@@ -7758,6 +8034,28 @@ export function createWorkflowCoordinator(
       headSha &&
       manifest.coordination
     ) {
+      // With no required status checks, skip the awaiting-pr-checks stall and
+      // admit refresh/merge eligibility immediately (still require Target refresh
+      // to record validatedTargetSha before Merge).
+      let queueCandidate: { state: "awaiting-pr-checks" } | {
+        state: "merge-ready";
+        mergeReadyAt: string;
+      } = { state: "awaiting-pr-checks" };
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: base,
+          });
+          if (!policyRequiresStatusChecks(policy)) {
+            queueCandidate = {
+              state: "merge-ready",
+              mergeReadyAt: new Date().toISOString(),
+            };
+          }
+        } catch {
+          // Keep awaiting-pr-checks when policy cannot be observed.
+        }
+      }
       manifest = {
         ...manifest,
         coordination: {
@@ -7766,7 +8064,7 @@ export function createWorkflowCoordinator(
             headSha,
             mergeMethod,
           },
-          queueCandidate: { state: "awaiting-pr-checks" },
+          queueCandidate,
         },
       };
     }
@@ -8054,9 +8352,29 @@ export function createWorkflowCoordinator(
         };
       }
 
-      const ci = await bound.ci.checkStatus({
-        branchName: active.workflowPr.headBranch,
-      });
+      // Optional/non-required CI must not stall merge when Target policy has no
+      // required status checks (billing-blocked runners, informational Actions).
+      let requireStatusChecks = true;
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: active.targetBranch,
+          });
+          requireStatusChecks = policyRequiresStatusChecks(policy);
+        } catch {
+          // Fail closed: if policy cannot be observed, keep required-check gate.
+          requireStatusChecks = true;
+        }
+      }
+
+      const ci = requireStatusChecks
+        ? await bound.ci.checkStatus({
+            branchName: active.workflowPr.headBranch,
+          })
+        : {
+            status: "success" as const,
+            summary: "No required status checks on Target branch.",
+          };
 
       const freshness = evaluateMergeFreshness({
         heldLease: heldTargetLease,
@@ -8070,6 +8388,7 @@ export function createWorkflowCoordinator(
           headSha: livePr.headSha,
           status: ci.status,
         },
+        requireStatusChecks,
       });
 
       if (!freshness.ok) {
@@ -9124,9 +9443,10 @@ export function createWorkflowCoordinator(
 
   async function pausePipeline(): Promise<PipelinePauseResult> {
     const bound = scoped ?? (await requireScoped());
-    const active = await loadActiveWorkflow(bound, { force: true });
     const slotsBefore = heldWorkerSlots.size;
 
+    // Abort workers first — never block Pause on tracker discovery while
+    // Create-tickets publish (or other force-load paths) is wedged on gh.
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: false,
       transcriptEvent: {
@@ -9140,9 +9460,14 @@ export function createWorkflowCoordinator(
     // Abort releases per-worker slots; drain any remaining bound capacity.
     const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
     const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    // Best-effort Target lease release from session memory only (no force load).
+    const targetForRelease =
+      cachedPanelActive?.coordination?.target ??
+      heldWorkflowCoordinatorLease?.target ??
+      heldTargetBranchLease?.target;
     const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
       bound,
-      active?.coordination?.target,
+      targetForRelease,
     );
 
     pipelinePaused = true;
@@ -9218,8 +9543,17 @@ export function createWorkflowCoordinator(
 
   async function terminateRun(): Promise<RunTerminationResult> {
     const bound = scoped ?? (await requireScoped());
-    // Need fresh integratedTickets / workflowPr for T1 vs T2 (not a TTL snapshot).
-    const active = await loadActiveWorkflow(bound, { force: true });
+    // Prefer session cache so Terminate cannot hang on tracker force-load while
+    // Create-tickets publish is blocked on the same gh path. Soft load only if
+    // cache is empty; gh timeout still bounds the wait.
+    let active: ActiveWorkflow | undefined = cachedPanelActive;
+    if (!active) {
+      try {
+        active = await loadActiveWorkflow(bound, { force: false });
+      } catch {
+        active = undefined;
+      }
+    }
     const mode = resolveTerminationMode(active);
     const slotsBefore = heldWorkerSlots.size;
 
@@ -9364,10 +9698,10 @@ export function createWorkflowCoordinator(
 
   async function emergencyStop(): Promise<EmergencyStopResult> {
     const bound = scoped ?? (await requireScoped());
-    const active = await loadActiveWorkflow(bound, { force: true });
     const slotsBefore = heldWorkerSlots.size;
     const hadCoordinatorLease = Boolean(heldWorkflowCoordinatorLease);
 
+    // Abort and release from session memory first — do not await force tracker load.
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: true,
       transcriptEvent: {
@@ -9380,9 +9714,13 @@ export function createWorkflowCoordinator(
 
     const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
     const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    const targetForRelease =
+      cachedPanelActive?.coordination?.target ??
+      heldWorkflowCoordinatorLease?.target ??
+      heldTargetBranchLease?.target;
     const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
       bound,
-      active?.coordination?.target,
+      targetForRelease,
     );
     await releaseHeldWorkflowCoordinatorLease(bound);
     coordinatorLeaseLost = false;
@@ -9857,6 +10195,9 @@ export function createWorkflowCoordinator(
       workers,
       pipelinePaused,
     };
+    if (createTicketsPublishInProgress) {
+      state.createTicketsPublishInProgress = true;
+    }
     if (completedWorkerRuns.length > 0) {
       state.completedWorkerRuns = completedWorkerRuns;
     }
@@ -9913,16 +10254,19 @@ export function createWorkflowCoordinator(
             : {}),
       };
     } else if (pendingTargetRefresh && targetRefreshInProgress) {
+      if (integrationUnitStartedAtMs === undefined) {
+        integrationUnitStartedAtMs = Date.now();
+      }
       state.integration = {
         ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
         attempt: pendingTargetRefresh.attempt,
         status: "running",
         branchName: pendingTargetRefresh.integrationBranch,
-        ...(pendingTargetRefresh.lastFailure
-          ? { reason: pendingTargetRefresh.lastFailure }
-          : { reason: "Target-branch refresh" }),
+        reason: "Target-branch refresh",
+        runtimeMs: Math.max(0, Date.now() - integrationUnitStartedAtMs),
       };
     } else if (pendingTargetRefresh) {
+      integrationUnitStartedAtMs = undefined;
       state.integration = {
         ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
         attempt: pendingTargetRefresh.attempt,
@@ -9934,6 +10278,11 @@ export function createWorkflowCoordinator(
       };
     } else if (pendingIntegration && integrationInProgress) {
       // Unit is actively finishing (merge/verify/push) — wait must not P1-settle.
+      // Do not surface lastFailure while running: that is a prior attempt's fact
+      // and freezes the brief as if the unit is still failed.
+      if (integrationUnitStartedAtMs === undefined) {
+        integrationUnitStartedAtMs = Date.now();
+      }
       state.integration = {
         ticketNumber: pendingIntegration.ticketNumber,
         attempt: pendingIntegration.attempt,
@@ -9941,11 +10290,10 @@ export function createWorkflowCoordinator(
         branchName: pendingIntegration.conflict
           ? pendingIntegration.conflict.integrationBranch
           : pendingIntegration.branchName,
-        ...(pendingIntegration.lastFailure
-          ? { reason: pendingIntegration.lastFailure }
-          : {}),
+        runtimeMs: Math.max(0, Date.now() - integrationUnitStartedAtMs),
       };
     } else if (pendingIntegration) {
+      integrationUnitStartedAtMs = undefined;
       state.integration = {
         ticketNumber: pendingIntegration.ticketNumber,
         attempt: pendingIntegration.attempt,
@@ -9957,6 +10305,8 @@ export function createWorkflowCoordinator(
           ? { reason: pendingIntegration.lastFailure }
           : {}),
       };
+    } else {
+      integrationUnitStartedAtMs = undefined;
     }
 
     const ciEntries: NonNullable<WorkflowPanelState["ci"]>[number][] = [];

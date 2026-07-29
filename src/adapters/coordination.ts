@@ -11,7 +11,10 @@ import {
   isCanonicalRepositoryIdentity,
   isCanonicalTargetIdentity,
 } from "../coordination.js";
-import { DEFAULT_COORDINATION_LEASE_TTL_MS } from "../constants.js";
+import {
+  DEFAULT_COORDINATION_GIT_TIMEOUT_MS,
+  DEFAULT_COORDINATION_LEASE_TTL_MS,
+} from "../constants.js";
 import type {
   AcquireCoordinationLeaseInput,
   CoordinationLeaseKey,
@@ -735,22 +738,40 @@ async function runGit(
   cwd: string,
   args: readonly string[],
   env?: NodeJS.ProcessEnv,
+  timeoutMs: number = DEFAULT_COORDINATION_GIT_TIMEOUT_MS,
 ): Promise<GitResult> {
   try {
     const { stdout, stderr } = await execFileAsync("git", [...args], {
       cwd,
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
+      ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
       ...(env ? { env } : {}),
     });
     return { code: 0, stdout: stdout ?? "", stderr: stderr ?? "" };
   } catch (error) {
     const err = error as {
-      code?: number | string;
+      code?: number | string | null;
+      killed?: boolean;
+      signal?: NodeJS.Signals | number | null;
       stdout?: string;
       stderr?: string;
       message?: string;
     };
+    const timedOut =
+      err.killed === true ||
+      err.signal === "SIGTERM" ||
+      err.signal === "SIGKILL" ||
+      (typeof err.message === "string" && /timed?\s*out/i.test(err.message));
+    if (timedOut) {
+      return {
+        code: 124,
+        stdout: err.stdout ?? "",
+        stderr:
+          (err.stderr ?? "").trim() ||
+          `git ${args.join(" ")} timed out after ${timeoutMs}ms`,
+      };
+    }
     return {
       code: typeof err.code === "number" ? err.code : 1,
       stdout: err.stdout ?? "",
@@ -758,6 +779,11 @@ async function runGit(
     };
   }
 }
+
+/** Test seam for coordination Git I/O timeouts. */
+export const __coordinationGitTestables = {
+  runGit,
+};
 
 function gitFailure(description: string, result: GitResult): Error {
   const detail = (result.stderr || result.stdout || `exit ${result.code}`).trim();

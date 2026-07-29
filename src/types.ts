@@ -550,6 +550,11 @@ export type WorkflowPanelState = {
    */
   implementationRecovery?: readonly ImplementationRecoveryState[];
   ticketProgress?: TicketProgressSummary;
+  /**
+   * True while Create-tickets publish is in flight (session-local).
+   * Live brief should show this instead of a healthy idle lease-only view.
+   */
+  createTicketsPublishInProgress?: boolean;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */
   integration?: {
     ticketNumber: number;
@@ -558,6 +563,8 @@ export type WorkflowPanelState = {
     status: "pending-retry" | "conflict-resolution" | "running";
     branchName: string;
     reason?: string;
+    /** Live elapsed while status is running (ticks on local panel polls). */
+    runtimeMs?: number;
   };
   /** Compact CI gate status for open integrated tickets (no background polling). */
   ci?: readonly {

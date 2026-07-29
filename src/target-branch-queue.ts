@@ -162,6 +162,11 @@ export type TargetBranchQueueCommand =
       workflowCoordinatorLease: WorkflowCoordinatorLease;
       /** Updated only after a refresh/validation/PR update has changed PR facts. */
       prFreshness?: WorkflowPrFreshness;
+      /**
+       * When true (no required status checks on Target), re-admit merge-ready
+       * immediately instead of awaiting PR-check observation that will never run.
+       */
+      admitMergeReady?: boolean;
     }
   | {
       kind: "record-failure";
@@ -1015,7 +1020,18 @@ export function createTargetBranchQueueOrchestrator(
     const loaded = await loadOwnWorkflow();
     if (!loaded.ok) return loaded;
     const candidate = loaded.active.coordination?.queueCandidate;
-    if (candidate?.state !== "merge-ready") {
+    const missingValidatedTarget =
+      !loaded.active.coordination?.prFreshness?.validatedTargetSha;
+    // First-time Target refresh (no validatedTargetSha yet) may run from
+    // awaiting-pr-checks so delivery is not blocked when PR checks never start.
+    // Normal merge/refresh still requires merge-ready + FIFO head.
+    const refreshBootstrap =
+      input.phase === "refresh" &&
+      missingValidatedTarget &&
+      (candidate?.state === "awaiting-pr-checks" ||
+        candidate?.state === "refreshing" ||
+        candidate?.state === "merge-ready");
+    if (candidate?.state !== "merge-ready" && !refreshBootstrap) {
       return failure(
         "not-merge-ready",
         `Workflow #${options.workflowId} is not merge-ready and cannot acquire the Target-branch lease.`,
@@ -1023,7 +1039,7 @@ export function createTargetBranchQueueOrchestrator(
     }
     const queue = reconstructTargetBranchQueue(target, loaded.workflows);
     const position = targetBranchQueuePosition(queue, options.workflowId);
-    if (position !== 1) {
+    if (candidate?.state === "merge-ready" && position !== 1) {
       return {
         ...failure(
           "not-queue-head",
@@ -1031,6 +1047,23 @@ export function createTargetBranchQueueOrchestrator(
         ),
         queue,
         ...(position ? { position } : {}),
+      };
+    }
+    // Bootstrap refresh while not yet merge-ready: only when no other workflow
+    // already owns the merge-ready FIFO head.
+    if (
+      refreshBootstrap &&
+      candidate?.state !== "merge-ready" &&
+      queue.entries.length > 0 &&
+      queue.entries[0]?.workflowId !== options.workflowId
+    ) {
+      return {
+        ...failure(
+          "not-queue-head",
+          `Workflow #${options.workflowId} is waiting behind the FIFO Target-branch queue head.`,
+        ),
+        queue,
+        position: 1 + queue.entries.findIndex((e) => e.workflowId === options.workflowId),
       };
     }
 
@@ -1078,7 +1111,22 @@ export function createTargetBranchQueueOrchestrator(
       currentQueue,
       options.workflowId,
     );
-    if (currentCandidate?.state !== "merge-ready" || currentPosition !== 1) {
+    const currentMissingValidated =
+      !reloaded.active.coordination?.prFreshness?.validatedTargetSha;
+    const currentRefreshBootstrap =
+      input.phase === "refresh" &&
+      currentMissingValidated &&
+      (currentCandidate?.state === "awaiting-pr-checks" ||
+        currentCandidate?.state === "refreshing" ||
+        currentCandidate?.state === "merge-ready");
+    const stillEligible =
+      (currentCandidate?.state === "merge-ready" && currentPosition === 1) ||
+      (currentRefreshBootstrap &&
+        (currentCandidate?.state === "merge-ready"
+          ? currentPosition === 1
+          : currentQueue.entries.length === 0 ||
+            currentQueue.entries[0]?.workflowId === options.workflowId));
+    if (!stillEligible) {
       await releaseVerifiedTargetLease(targetAuthority.lease);
       return {
         ...failure(
@@ -1117,6 +1165,7 @@ export function createTargetBranchQueueOrchestrator(
   async function releaseForRemotePrChecks(input: {
     workflowCoordinatorLease: WorkflowCoordinatorLease;
     prFreshness?: WorkflowPrFreshness;
+    admitMergeReady?: boolean;
   }): Promise<TargetBranchQueueOperationResult> {
     // Check local lane ownership first so a different home cannot use another
     // workflow's coordinator lease to alter a refreshing candidate.
@@ -1148,25 +1197,30 @@ export function createTargetBranchQueueOrchestrator(
         "Target-branch lease release for remote checks requires a refreshing candidate.",
       );
     }
-    const awaiting: TargetBranchQueueCandidate = { state: "awaiting-pr-checks" };
+    const nextCandidate: TargetBranchQueueCandidate = input.admitMergeReady
+      ? {
+          state: "merge-ready",
+          mergeReadyAt: new Date().toISOString(),
+        }
+      : { state: "awaiting-pr-checks" };
     const persisted = await persistCandidate({
       active: loaded.active,
-      candidate: awaiting,
+      candidate: nextCandidate,
       workflowCoordinatorLease: workflowAuthority.lease,
       targetLease: targetAuthority.lease,
       ...(input.prFreshness ? { prFreshness: input.prFreshness } : {}),
     });
     const releaseFailure = await releaseVerifiedTargetLease(targetAuthority.lease);
     if (!persisted.ok) return persisted;
-    if (releaseFailure) return { ...releaseFailure, candidate: awaiting };
+    if (releaseFailure) return { ...releaseFailure, candidate: nextCandidate };
     return {
       ok: true,
       action: "released-for-pr-checks",
-      candidate: awaiting,
+      candidate: nextCandidate,
       queue: queueAfterCandidate(
         loaded.workflows,
         loaded.active,
-        awaiting,
+        nextCandidate,
         input.prFreshness,
       ),
     };
@@ -1453,6 +1507,7 @@ export function createTargetBranchQueueOrchestrator(
           ...(command.prFreshness
             ? { prFreshness: command.prFreshness }
             : {}),
+          ...(command.admitMergeReady ? { admitMergeReady: true } : {}),
         });
       case "record-failure":
         return recordFailure({
