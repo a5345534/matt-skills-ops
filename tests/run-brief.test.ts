@@ -5,6 +5,7 @@ import {
   formatLastTurnStartedAt,
   formatRunBriefLines,
   formatRuntimeMs,
+  freeReadyFrontierTickets,
   predictRunTerminationMode,
 } from "../src/ui/run-brief.js";
 import type { WorkflowPanelState } from "../src/types.js";
@@ -410,6 +411,134 @@ describe("buildRunBriefViewModel", () => {
         }),
       ),
     ).toBe("CI recovery #11 r1");
+  });
+
+  it("does not show tracker ready for a ticket that needs disposition", () => {
+    const panel = basePanel({
+      workers: [
+        {
+          ticketNumber: 55,
+          attempt: 1,
+          status: "needs-disposition",
+          branchName: "matt-auto/53/ticket-55/r1",
+          progress: "I'll start by reading the issue details…",
+          turnCount: 14,
+          workerProfile: {
+            provider: "grok-cli",
+            modelId: "grok-4.5",
+            thinkingLevel: "high",
+          },
+        },
+      ],
+      ticketProgress: {
+        workflowId: 53,
+        total: 3,
+        open: 2,
+        closed: 1,
+        ready: [
+          { number: 55, title: "Tests: home Start new" },
+          { number: 56, title: "README" },
+        ],
+        blocked: [],
+        awaitingCi: [],
+        items: [
+          {
+            number: 54,
+            title: "Always show Start new",
+            state: "CLOSED",
+            status: "closed",
+          },
+          {
+            number: 55,
+            title: "Tests: home Start new",
+            state: "OPEN",
+            status: "ready",
+          },
+          {
+            number: 56,
+            title: "README",
+            state: "OPEN",
+            status: "ready",
+          },
+        ],
+      },
+    });
+
+    expect(deriveContextLabel(panel)).toBe("Needs disposition #55 r1");
+    expect(freeReadyFrontierTickets(panel).map((t) => t.number)).toEqual([56]);
+    // Without session workers, frontier lists all tracker-ready tickets.
+    expect(
+      deriveContextLabel({
+        ...panel,
+        workers: [],
+      }),
+    ).toBe("Ready frontier: #55, #56");
+
+    const brief = buildRunBriefViewModel(panel);
+    const ticketBody = brief.sections.find((s) => s.id === "tickets")?.lines.join("\n") ?? "";
+    // READY/BLOCK must not say ready while STATUS is needs-disp.
+    const row55 = ticketBody
+      .split("\n")
+      .find((line) => line.includes("#55"));
+    expect(row55).toBeDefined();
+    expect(row55).toMatch(/needs-disp/);
+    expect(row55).not.toMatch(/\bready\b/);
+
+    const row56 = ticketBody.split("\n").find((line) => line.includes("#56"));
+    expect(row56).toMatch(/\bready\b/);
+
+    // Stale implement progress is not shown once disposition is pending.
+    const workerLines = brief.sections.find((s) => s.id === "workers")?.lines.join("\n") ?? "";
+    expect(workerLines).toContain("needs-disposition");
+    expect(workerLines).not.toContain("I'll start by reading");
+  });
+
+  it("lists only free ready tickets when context falls through to frontier", () => {
+    // No live workers needing disposition — but if we only had ready tickets
+    // with no workers, frontier shows all. When one is running, exclude it.
+    const panel = basePanel({
+      workers: [
+        {
+          ticketNumber: 55,
+          attempt: 1,
+          status: "running",
+          branchName: "matt-auto/53/ticket-55/r1",
+        },
+      ],
+      ticketProgress: {
+        workflowId: 53,
+        total: 2,
+        open: 2,
+        closed: 0,
+        ready: [
+          { number: 55, title: "A" },
+          { number: 56, title: "B" },
+        ],
+        blocked: [],
+        awaitingCi: [],
+        items: [
+          {
+            number: 55,
+            title: "A",
+            state: "OPEN",
+            status: "ready",
+          },
+          {
+            number: 56,
+            title: "B",
+            state: "OPEN",
+            status: "ready",
+          },
+        ],
+      },
+    });
+    // Running worker wins context.
+    expect(deriveContextLabel(panel)).toBe("Implementing #55 r1");
+    const row55 = buildRunBriefViewModel(panel)
+      .sections.find((s) => s.id === "tickets")
+      ?.lines.find((l) => l.includes("#55"));
+    expect(row55).toMatch(/running/);
+    expect(row55).not.toMatch(/\bready\b/);
   });
 
   it("does not throw on a minimal empty-worker panel", () => {

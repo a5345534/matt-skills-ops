@@ -294,13 +294,40 @@ export function deriveContextLabel(panel: WorkflowPanelState): string | undefine
   if (panel.runTerminated) return "Run terminated";
 
   if (panel.ticketProgress && panel.ticketProgress.ready.length > 0) {
-    const list = panel.ticketProgress.ready
-      .map((t) => `#${t.number}`)
-      .join(", ");
+    const freeReady = freeReadyFrontierTickets(panel);
+    if (freeReady.length === 0) return undefined;
+    const list = freeReady.map((t) => `#${t.number}`).join(", ");
     return `Ready frontier: ${list}`;
   }
 
   return undefined;
+}
+
+/**
+ * Tracker ready tickets that are not already occupied by a session worker
+ * (running, needs-disposition, recovery, etc.). Used so Ready frontier and
+ * READY/BLOCK do not contradict live STATUS.
+ */
+export function freeReadyFrontierTickets(
+  panel: WorkflowPanelState,
+): readonly { number: number; title: string }[] {
+  const ready = panel.ticketProgress?.ready ?? [];
+  if (ready.length === 0) return [];
+  return ready.filter((ticket) => {
+    const worker = panel.workers.find((w) => w.ticketNumber === ticket.number);
+    if (!worker) return true;
+    return !sessionOccupiesReadySlot(worker.status);
+  });
+}
+
+function sessionOccupiesReadySlot(status: PanelWorker["status"]): boolean {
+  return (
+    status === "running" ||
+    status === "needs-disposition" ||
+    status === "compatibility-recovery" ||
+    status === "failed" ||
+    status === "aborted"
+  );
 }
 
 function parallelDeliverySection(
@@ -335,11 +362,14 @@ function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
   const head = `#${worker.ticketNumber} r${worker.attempt}: ${worker.status}`;
   const model = formatWorkerModel(worker.workerProfile);
   const turnSummary = formatWorkerTurnSummary(worker);
+  // Stale implement progress is misleading once the worker is no longer running.
+  const showProgress =
+    Boolean(worker.progress?.trim()) && worker.status === "running";
   if (compact) {
     // Paths/ids live in logs; table already shows status/runtime.
     const withModel = model ? `${head} · model=${model}` : head;
     const lines = [
-      worker.progress ? `${withModel} — ${worker.progress}` : withModel,
+      showProgress ? `${withModel} — ${worker.progress!.trim()}` : withModel,
     ];
     if (turnSummary) lines.push(`  ${turnSummary}`);
     return lines;
@@ -369,7 +399,7 @@ function formatWorkerLines(worker: PanelWorker, compact: boolean): string[] {
   if (worker.transcriptPath) {
     lines.push(`  transcript: ${worker.transcriptPath}`);
   }
-  if (worker.progress) {
+  if (showProgress) {
     lines.push(`  progress: ${worker.progress}`);
   }
   return lines;
@@ -490,8 +520,14 @@ function ticketsSection(
   const progress = panel.ticketProgress;
   if (!progress) return undefined;
 
+  const freeReadyCount = freeReadyFrontierTickets(panel).length;
+  const trackerReadyCount = progress.ready.length;
+  const readySummary =
+    freeReadyCount === trackerReadyCount
+      ? `${trackerReadyCount} ready`
+      : `${freeReadyCount} free ready (${trackerReadyCount} tracker ready)`;
   const lines = [
-    `Summary: ${progress.ready.length} ready / ${progress.open} open / ${progress.closed} closed (total ${progress.total})`,
+    `Summary: ${readySummary} / ${progress.open} open / ${progress.closed} closed (total ${progress.total})`,
   ];
 
   const items =
@@ -617,9 +653,17 @@ export function formatTicketTableRow(
   const liveWorker = worker?.status === "running" ? worker : undefined;
   const telemetry = liveWorker ?? completedRun ?? worker;
 
-  // READY/BLOCK: tracker frontier only (not covered by running).
+  // READY/BLOCK: session lifecycle overlays tracker frontier so the column
+  // never says "ready" while STATUS is needs-disp / running / recovery.
   let readyBlock = "—";
-  if (item.status === "ready") readyBlock = "ready";
+  if (worker && sessionOccupiesReadySlot(worker.status)) {
+    if (worker.status === "needs-disposition") readyBlock = "needs-disp";
+    else if (worker.status === "running") readyBlock = "running";
+    else if (worker.status === "compatibility-recovery") readyBlock = "recovery";
+    else if (worker.status === "failed") readyBlock = "failed";
+    else if (worker.status === "aborted") readyBlock = "aborted";
+    else readyBlock = worker.status;
+  } else if (item.status === "ready") readyBlock = "ready";
   else if (item.status === "blocked") {
     readyBlock = item.openBlockers?.length
       ? `blocked by ${item.openBlockers.map((n) => `#${n}`).join(",")}`

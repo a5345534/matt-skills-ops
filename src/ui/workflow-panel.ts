@@ -125,7 +125,7 @@ export function buildCompactWorkflowPanel(
         const worker = panel.workers.find(
           (w) => w.ticketNumber === item.number,
         );
-        const ready =
+        let ready =
           item.status === "blocked"
             ? item.openBlockers?.length
               ? `blk #${item.openBlockers.join(",")}`
@@ -133,6 +133,11 @@ export function buildCompactWorkflowPanel(
             : item.status === "ready" || item.status === "awaiting-ci"
               ? "ready"
               : "—";
+        if (worker?.status === "needs-disposition") ready = "needs-d";
+        else if (worker?.status === "running") ready = "running";
+        else if (worker?.status === "compatibility-recovery") ready = "recovery";
+        else if (worker?.status === "failed") ready = "failed";
+        else if (worker?.status === "aborted") ready = "aborted";
         let status: string = item.status;
         if (item.status === "closed") status = "closed";
         else if (worker) {
@@ -258,7 +263,9 @@ function formatCompactWorkerLine(worker: PanelWorker): string {
   if (model) {
     line += ` · model=${model}`;
   }
-  if (worker.progress?.trim()) {
+  // Only attach progress while the process is still running — stale first-turn
+  // text next to needs-disposition is actively misleading.
+  if (worker.status === "running" && worker.progress?.trim()) {
     line += ` — ${worker.progress.trim()}`;
   }
   return line;
