@@ -169,6 +169,23 @@ export type WorkflowHomeBinding = {
   workflowId: number;
 };
 
+/** How a local unfinished workflow was discovered without contacting GitHub. */
+export type LocalUnfinishedWorkflowSource =
+  | "binding"
+  | "legacy-pointer"
+  | "transcripts";
+
+/**
+ * Checkout-local unfinished workflow candidate for the Matt Auto home menu.
+ * Built only from local preferences/transcripts; may be stale until drill-in.
+ */
+export type LocalUnfinishedWorkflow = {
+  workflowId: number;
+  sources: readonly LocalUnfinishedWorkflowSource[];
+  bound: boolean;
+  label: string;
+};
+
 /**
  * A locally held checkout-ownership guard. It rejects two Workflow homes in
  * one physical checkout; remote coordination leases remain the cross-machine
@@ -1109,6 +1126,16 @@ export type WorkflowCoordinator = {
    * Currently selected Workflow root (defaults to nearest enclosing Git root).
    */
   currentRoot(): Promise<WorkflowRoot>;
+  /**
+   * List unfinished workflows known only from checkout-local state.
+   * Never contacts GitHub; used by the Matt Auto home menu open path.
+   */
+  listLocalUnfinishedWorkflows(): Promise<readonly LocalUnfinishedWorkflow[]>;
+  /**
+   * Point this checkout at a local unfinished Workflow ID before drill-in.
+   * Local prefs only — GitHub is consulted by the subsequent workflow surface.
+   */
+  selectLocalUnfinishedWorkflow(workflowId: number): Promise<void>;
   /**
    * Discover selectable Workflow roots: nearest + nested independent.
    * Excludes Git submodules. Marks non-GitHub roots unavailable.

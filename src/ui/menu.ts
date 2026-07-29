@@ -1625,6 +1625,104 @@ export function buildMainMenuItems(
   return items;
 }
 
+const HOME_SETTINGS_ITEM = "Settings…";
+const HOME_START_NEW_ITEM = "Start new workflow";
+const HOME_UNFINISHED_HEADER = "--- Unfinished (local) ---";
+const HOME_EMPTY_ITEM = "No local unfinished workflows";
+
+function homeUnfinishedItem(label: string, workflowId: number): string {
+  return `${label} [#${workflowId}]`;
+}
+
+function parseHomeUnfinishedItem(selected: string): number | undefined {
+  const match = /\[#(\d+)\]\s*$/.exec(selected);
+  if (!match) return undefined;
+  const workflowId = Number(match[1]);
+  return Number.isInteger(workflowId) && workflowId > 0 ? workflowId : undefined;
+}
+
+/**
+ * Fast Matt Auto home: local prefs/transcripts only — never GitHub.
+ * Drill-in opens the workflow surface (GitHub) for one selected unfinished id.
+ */
+export async function presentMattAutoHome(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  pipelineOptions: RunPostGrillPipelineOptions = {},
+): Promise<void> {
+  for (;;) {
+    // Local root resolution is filesystem/git only; no tracker reads.
+    await coordinator.currentRoot();
+    const unfinished = await coordinator.listLocalUnfinishedWorkflows();
+    const items: string[] = [HOME_SETTINGS_ITEM];
+    if (unfinished.length === 0) {
+      items.push(HOME_EMPTY_ITEM, HOME_START_NEW_ITEM);
+    } else {
+      items.push(
+        HOME_UNFINISHED_HEADER,
+        ...unfinished.map((entry) =>
+          homeUnfinishedItem(entry.label, entry.workflowId),
+        ),
+      );
+    }
+
+    const selected = await ui.select("Matt Auto", items);
+    if (selected === undefined) return;
+    if (selected === HOME_EMPTY_ITEM || selected === HOME_UNFINISHED_HEADER) {
+      continue;
+    }
+    if (selected === HOME_SETTINGS_ITEM) {
+      await presentHomeSettingsMenu(coordinator, ui);
+      continue;
+    }
+    if (selected === HOME_START_NEW_ITEM) {
+      // Network begins here: Create-spec / pipeline needs tracker + skills host.
+      await runPostGrillPipeline(coordinator, ui, pipelineOptions);
+      continue;
+    }
+    const workflowId = parseHomeUnfinishedItem(selected);
+    if (workflowId === undefined) continue;
+    try {
+      await coordinator.selectLocalUnfinishedWorkflow(workflowId);
+    } catch (error) {
+      ui.notify(errorMessage(error), "error");
+      continue;
+    }
+    // Drill-in: full workflow surface may read GitHub.
+    if (await presentDashboardIfAvailable(coordinator, ui)) {
+      continue;
+    }
+    await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
+  }
+}
+
+async function presentHomeSettingsMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  for (;;) {
+    const options = [
+      CONFIGURE_WORKER_ITEM,
+      CONFIGURE_WORKER_CONCURRENCY_ITEM,
+      SWITCH_ROOT_ITEM,
+      BACK_ITEM,
+    ];
+    const selected = await ui.select("Matt Auto · Settings", options);
+    if (selected === undefined || selected === BACK_ITEM) return;
+    if (selected === CONFIGURE_WORKER_ITEM) {
+      await presentWorkerProfileMenu(coordinator, ui);
+      continue;
+    }
+    if (selected === CONFIGURE_WORKER_CONCURRENCY_ITEM) {
+      await presentWorkerConcurrencyMenu(coordinator, ui);
+      continue;
+    }
+    if (selected === SWITCH_ROOT_ITEM) {
+      await presentRootSwitcher(coordinator, ui);
+    }
+  }
+}
+
 /**
  * Present the full Matt Auto menu (root, Worker profile, preflight + Next actions).
  * Selecting a failed preflight row shows full corrective guidance.
@@ -1634,8 +1732,16 @@ export async function presentMainMenu(
   ui: MattAutoUi,
   pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
-  if (await presentDashboardIfAvailable(coordinator, ui)) return;
+  // Home is local-first and never opens the GitHub-backed dashboard immediately.
+  await presentMattAutoHome(coordinator, ui, pipelineOptions);
+}
 
+/** Legacy full blocking menu used after drill-in when custom() is unavailable. */
+async function presentWorkflowBlockingMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  pipelineOptions: RunPostGrillPipelineOptions = {},
+): Promise<void> {
   for (;;) {
     const currentRoot = await coordinator.currentRoot();
     const roots = await coordinator.listRoots();
@@ -1663,7 +1769,10 @@ export async function presentMainMenu(
       panel,
       resolvedConcurrency,
     );
-    const selected = await ui.select("Matt Auto", items);
+    // Offer a way back to the local-only home without Esc-to-chat.
+    items.push("← Back to home");
+    const selected = await ui.select("Matt Auto · Workflow", items);
+    if (selected === "← Back to home") return;
 
     if (selected === undefined) return;
     if (selected === REFRESH_ITEM || selected.startsWith("---")) continue;

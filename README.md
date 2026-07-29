@@ -4,7 +4,7 @@ Stage-gated workflow orchestration for [Pi Coding Agent](https://pi.dev).
 
 Matt Auto is a reusable Pi package. From Workflow home (after grilling), run:
 
-- `/matt-auto` — persistent Workflow dashboard on custom TUI hosts (or the blocking menu fallback)
+- `/matt-auto` — local-first home (Settings + unfinished workflows from this checkout); drill-in opens the workflow surface
 - `/matt-auto next` — dashboard narrowed to currently available Next actions (or the blocking Next-actions fallback)
 - `/matt-auto run` — post-grill **auto-advance** pipeline: `/skill:to-spec` → auto-publish → `/skill:to-tickets` → auto-publish → implement… (auto-Close starts Integration). It retains its separate live run brief.
 
@@ -32,11 +32,9 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 
 ## Manual Workflow dashboard
 
-When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, settings, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** to run a selected Next action or open Configure Worker profile / concurrency; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
+`/matt-auto` opens a **local-only home** first: Settings plus unfinished workflows discovered from this checkout (preferences, bindings, transcripts). It does **not** call GitHub on open. Selecting an unfinished workflow binds this checkout to that Workflow ID and then opens the workflow surface (persistent dashboard when `ctx.ui.custom()` exists, otherwise the blocking workflow menu), which may read GitHub. **Start new workflow** appears only when no local unfinished work is known.
 
-Press `r` for **Refresh**. Opening the dashboard, Refresh, and an action settlement take a full coordinator snapshot; normal browsing and periodic updates read only local worker/process/turn telemetry. After an action settles, the dashboard refreshes in place and keeps the relevant selected ticket or Worker attempt when it remains available.
-
-`/matt-auto next` uses the same surface but limits its browse rows to the workflow summary and currently available Next actions. On non-TUI, RPC, or partial hosts where `custom()` is unavailable, Matt Auto safely retains the existing blocking `select()` menus and their confirmations.
+On the workflow dashboard, use arrow keys to browse workflow, ticket, worker, preflight, settings, and action rows; **Enter** runs a Next action or opens Configure Worker profile / concurrency. Press `r` for a full refresh. `Esc` returns to the local home (or to chat from home). `/matt-auto next` still opens a Next-actions-focused surface and may read GitHub immediately.
 
 `/matt-auto run` does **not** open this manual dashboard. Its live run brief remains the primary wait surface, with its own Pause / Resume / Terminate controls; Matt Auto does not stack a dashboard or duplicate compact workflow widget while that auto-run surface owns the wait.
 

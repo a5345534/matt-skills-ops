@@ -59,6 +59,7 @@ import {
   graphqlBackoffRemainingMs,
   isInGraphqlBackoff,
 } from "./adapters/tracker-rate-limit.js";
+import { listLocalUnfinishedWorkflows as scanLocalUnfinishedWorkflows } from "./adapters/local-workflow-index.js";
 import { workerTranscriptPath } from "./adapters/transcripts.js";
 import { implementationWorktreePath } from "./adapters/workspace.js";
 import {
@@ -112,6 +113,7 @@ import type {
   ImplementationRecoveryState,
   ImplementationWorkerStatus,
   IntegratedTicketRef,
+  LocalUnfinishedWorkflow,
   NextAction,
   ParallelDeliveryPanelState,
   PipelineAffectedAttempt,
@@ -9807,6 +9809,31 @@ export function createWorkflowCoordinator(
     return ensureSelected();
   }
 
+  async function listLocalUnfinishedWorkflows(): Promise<
+    readonly LocalUnfinishedWorkflow[]
+  > {
+    const root = await ensureSelected();
+    return scanLocalUnfinishedWorkflows(root.path);
+  }
+
+  async function selectLocalUnfinishedWorkflow(
+    workflowId: number,
+  ): Promise<void> {
+    if (!Number.isInteger(workflowId) || workflowId <= 0) {
+      throw new Error(`Invalid local Workflow ID: ${workflowId}`);
+    }
+    const bound = await requireScoped();
+    const targetBranch = await resolveTargetBranch(
+      bound.preferences,
+      bound.environment,
+    );
+    await bound.preferences.setActiveWorkflowId(targetBranch, workflowId);
+    // Drop route cache so the next GitHub load uses the new local pointer.
+    workflowHomeRouteTtl = undefined;
+    cachedPanelActive = undefined;
+    cachedTicketProgress = undefined;
+  }
+
   let rootsCache: { roots: WorkflowRoot[]; at: number; startPath: string } | undefined;
   const ROOTS_TTL_MS = 30_000;
 
@@ -9965,6 +9992,8 @@ export function createWorkflowCoordinator(
     getActiveWorkflow,
     getTicketProgress,
     currentRoot,
+    listLocalUnfinishedWorkflows,
+    selectLocalUnfinishedWorkflow,
     listRoots,
     selectRoot,
     getWorkerProfile,

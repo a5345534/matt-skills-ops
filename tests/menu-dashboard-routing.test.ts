@@ -94,6 +94,15 @@ function coordinatorHarness() {
     getHomeModel: vi.fn(async () => undefined),
     getGlobalWorkerConcurrency: vi.fn(async () => undefined),
     getRootWorkerConcurrency: vi.fn(async () => undefined),
+    listLocalUnfinishedWorkflows: vi.fn(async () => [
+      {
+        workflowId: 38,
+        sources: ["legacy-pointer" as const],
+        bound: true,
+        label: "Workflow #38 · bound",
+      },
+    ]),
+    selectLocalUnfinishedWorkflow: vi.fn(async () => undefined),
   };
 }
 
@@ -165,51 +174,41 @@ function dismiss(component: WorkflowDashboardComponent): void {
 }
 
 describe("manual menu dashboard routing", () => {
-  it("routes custom-capable main and Next commands through one dashboard surface", async () => {
+  it("opens a local-only home first, then drills into the GitHub dashboard", async () => {
     const coordinator = coordinatorHarness();
     const mainHarness = customHarness();
+    // 1) Home select unfinished · 2) after dashboard Esc, home select cancel
+    mainHarness.ui.selects
+      .mockResolvedValueOnce("Workflow #38 · bound [#38]")
+      .mockResolvedValueOnce(undefined);
+
     const mainOpening = presentMainMenu(
       coordinator as unknown as WorkflowCoordinator,
       mainHarness.ui,
     );
-    const main = await capturedComponent(mainHarness);
 
-    expect(main.render(120).join("\n")).toContain(
-      "Matt Auto · Workflow dashboard",
-    );
-    expect(main.render(120).join("\n")).toContain(
-      "Settings · Configure Worker profile…",
-    );
-    expect(mainHarness.ui.selects).not.toHaveBeenCalled();
-    expect(coordinator.currentRoot).not.toHaveBeenCalled();
-
-    // Passive Workflow → ticket selection stays inline and silent.
-    main.handleInput!("\u001b[B");
-    expect(main.render(120).join("\n")).toContain("Selected · Ticket #43");
-    expect(mainHarness.ui.notices).toEqual([]);
-
-    // Ticket → settings: Configure Worker profile…
-    main.handleInput!("\u001b[B");
-    expect(main.render(120).join("\n")).toContain(
-      "Selected · Settings: Configure Worker profile",
-    );
-
-    // Enter leaves the dashboard into the blocking Worker profile menu, then
-    // reopens the dashboard after that menu is cancelled.
-    mainHarness.ui.selects.mockResolvedValueOnce(undefined);
-    main.handleInput!("\r");
     await vi.waitFor(() => {
       expect(mainHarness.ui.selects).toHaveBeenCalledWith(
-        "Worker profile",
-        expect.any(Array),
+        "Matt Auto",
+        expect.arrayContaining([
+          "Settings…",
+          "--- Unfinished (local) ---",
+          "Workflow #38 · bound [#38]",
+        ]),
       );
     });
-    const reopened = await capturedComponent(mainHarness);
-    expect(reopened.render(120).join("\n")).toContain(
+    // Home lists local unfinished before any GitHub-backed snapshot path.
+    expect(coordinator.listLocalUnfinishedWorkflows).toHaveBeenCalled();
+    expect(coordinator.selectLocalUnfinishedWorkflow).toHaveBeenCalledWith(38);
+    expect(
+      coordinator.listLocalUnfinishedWorkflows.mock.invocationCallOrder[0],
+    ).toBeLessThan(coordinator.preflight.mock.invocationCallOrder[0] ?? Infinity);
+
+    const main = await capturedComponent(mainHarness);
+    expect(main.render(120).join("\n")).toContain(
       "Matt Auto · Workflow dashboard",
     );
-
-    dismiss(reopened);
+    dismiss(main);
     await expect(mainOpening).resolves.toBeUndefined();
 
     const nextHarness = customHarness();
@@ -238,7 +237,10 @@ describe("manual menu dashboard routing", () => {
     };
 
     await presentMainMenu(coordinator as unknown as WorkflowCoordinator, fallbackUi);
-    expect(selects).toHaveBeenCalledWith("Matt Auto", expect.any(Array));
+    expect(selects).toHaveBeenCalledWith(
+      "Matt Auto",
+      expect.arrayContaining(["Settings…"]),
+    );
 
     selects.mockClear();
     await presentNextActions(coordinator as unknown as WorkflowCoordinator, fallbackUi);

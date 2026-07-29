@@ -63,6 +63,13 @@ export {
 export { createWorkersPort } from "./workers.js";
 export { createTranscriptPort } from "./transcripts.js";
 export {
+  listLocalUnfinishedWorkflows,
+} from "./local-workflow-index.js";
+export type {
+  LocalUnfinishedWorkflow,
+  LocalUnfinishedWorkflowSource,
+} from "./local-workflow-index.js";
+export {
   createVerificationPort,
   discoverLocalVerificationCommands,
 } from "./verification.js";
