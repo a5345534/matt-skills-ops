@@ -3565,6 +3565,53 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
   });
 
+  it("recovers Retry Integration after Close interrupted mid-unit (no failure event)", async () => {
+    // Mirrors Workflow #53 / #55: operator pause after disposition close and
+    // local merge, before integration-unit-completed. New session must not
+    // re-offer Implement for a completed r1 awaiting Integration.
+    const attempts = new Map<string, number>([["42:43", 1]]);
+    const workspace = createWorkspace("/repo", { attempts });
+    const transcripts = createTranscripts();
+    const key = { workflowId: 42, ticketNumber: 43, attempt: 1 };
+    await transcripts.port.append(key, {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: {
+        status: "completed",
+        summary: "test: cover home Start new",
+        localCommitSha: "330ab5fe1cfa359c9dfbdb628a480003894c73b0",
+      },
+    });
+    await transcripts.port.append(key, {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+    await transcripts.port.append(key, {
+      type: "disposition",
+      decision: "close",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-start",
+      ticketBranch: "matt-auto/42/ticket-43/r1",
+    });
+    await transcripts.port.append(key, {
+      type: "integration-unit-merged",
+      integrationBranch: "matt-auto/42/integration",
+      mergeCommitSha: "a155476162e65ae3d5081dcd43f280ee975a6637",
+    });
+
+    const { coordinator } = ticketsPublishedFixture({
+      workspace,
+      transcripts,
+    });
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toEqual([integrateTicketActionId(43)]);
+    expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
+    expect(actions[0]?.description).toMatch(/pending Integration|Integration/i);
+  });
+
   it("recovers Retry Integration after submodule merge conflict (not re-Implement)", async () => {
     // Mirrors Workflow #298 / #301: conflict worker died; new session must not
     // offer Implement for a completed r1 awaiting Integration.
