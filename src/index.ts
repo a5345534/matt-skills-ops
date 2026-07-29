@@ -1,5 +1,13 @@
 export { createWorkflowCoordinator } from "./coordinator.js";
 export {
+  activeWorkflowFromManifest,
+  activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
+  formatWorkflowManifestComment,
+  parseWorkflowManifestComment,
+  workflowManifestMatchesTarget,
+} from "./adapters/workflow-manifest.js";
+export {
   buildDashboardActionPromptView,
   buildDashboardActionResultView,
   createFallbackWorkflowActionInteraction,
@@ -39,6 +47,7 @@ export {
   CREATE_TICKETS_ACTION,
   DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS,
   DEFAULT_COORDINATION_LEASE_TTL_MS,
+  DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS,
   DEFAULT_TARGET_BRANCH,
   DEFAULT_WORKER_CONCURRENCY,
   DISPOSITION_ACTION_PREFIX,
@@ -156,6 +165,17 @@ export type {
   TargetBranchQueueSnapshot,
   TargetBranchQueueStore,
 } from "./target-branch-queue.js";
+export {
+  isLiveWorkerSlotLease,
+  planRepositoryWorkerSlots,
+} from "./worker-capacity.js";
+export type {
+  OccupiedRepositoryWorkerSlot,
+  RepositoryWorkerDemand,
+  RepositoryWorkerSlotAssignment,
+  RepositoryWorkerSlotClaim,
+  RepositoryWorkerSlotPlan,
+} from "./worker-capacity.js";
 export type {
   AcquireCoordinationLeaseInput,
   AcquireCoordinationLeaseResult,

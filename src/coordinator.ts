@@ -8,6 +8,8 @@ import {
   CREATE_SPEC_ACTION,
   CREATE_TICKETS_ACTION,
   DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_COORDINATION_LEASE_TTL_MS,
+  DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS,
   DEFAULT_TARGET_BRANCH,
   dispositionActionId,
   IMPLEMENTATION_DISPOSITION_OPTIONS,
@@ -38,6 +40,7 @@ import {
   WORKFLOW_MANIFEST_SCHEMA,
 } from "./constants.js";
 import {
+  canonicalRepositoryIdentityKey,
   canonicalTargetIdentityKey,
   isCanonicalRepositoryIdentity,
   targetRefFromBranch,
@@ -62,6 +65,12 @@ import {
   implementationLaunchBlockReason,
   runningTicketsBlockedByOpen,
 } from "./launch-rules.js";
+import {
+  planRepositoryWorkerSlots,
+  type OccupiedRepositoryWorkerSlot,
+  type RepositoryWorkerDemand,
+  type RepositoryWorkerSlotPlan,
+} from "./worker-capacity.js";
 import type {
   RootScopedPorts,
   TrackerTicket,
@@ -71,6 +80,7 @@ import type {
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CanonicalRepositoryIdentity,
   CanonicalTargetIdentity,
   CompletedWorkerTelemetry,
   CiRecoveryDecision,
@@ -84,6 +94,7 @@ import type {
   PreflightCheck,
   PreflightResult,
   ReadyTicket,
+  RepositorySchedulerLease,
   ResolvedWorkerProfile,
   RunTerminationMode,
   RunTerminationResult,
@@ -104,6 +115,7 @@ import type {
   WorkflowRoot,
   WorkflowRootKind,
   WorkflowStage,
+  WorkerSlotLease,
 } from "./types.js";
 
 type PendingCreateSpec = {
@@ -147,6 +159,31 @@ type HeldWorkflowCoordinatorLease = {
   lease: WorkflowCoordinatorLease;
   renewedAtMs: number;
 };
+
+/** One live Implementation worker's fenced repository-wide capacity lease. */
+type HeldWorkerSlot = {
+  workerId: string;
+  workflowId: number;
+  ticketNumber: number;
+  lease: WorkerSlotLease;
+  renewedAtMs: number;
+};
+
+type RepositoryWorkerSlotPreview =
+  | {
+      ok: true;
+      capacity: number;
+      plan: RepositoryWorkerSlotPlan;
+    }
+  | { ok: false; reason: string };
+
+type RepositoryWorkerSlotAcquire =
+  | {
+      ok: true;
+      lease: WorkerSlotLease;
+      capacity: number;
+    }
+  | { ok: false; reason: string };
 
 type WorkflowCoordinatorLeaseCheck =
   | { ok: true; lease: WorkflowCoordinatorLease }
@@ -476,6 +513,16 @@ export function createWorkflowCoordinator(
   let workflowCoordinatorHeartbeatInFlight = false;
   /** Serialize conditional lease maintenance from UI, workers, and heartbeats. */
   let workflowCoordinatorLeaseMutex: Promise<void> = Promise.resolve();
+  /**
+   * Repository-wide worker-slot leases owned by this Workflow home, keyed by
+   * the live Implementation worker they authorize. A slot is never used by
+   * Planning, Integration, or Conflict resolution workers.
+   */
+  const heldWorkerSlots = new Map<string, HeldWorkerSlot>();
+  let workerSlotHeartbeatTimer: NodeJS.Timeout | undefined;
+  let workerSlotHeartbeatInFlight = false;
+  /** Serialize slot loss/release/heartbeat so stale callbacks cannot revive ownership. */
+  let workerSlotLeaseMutex: Promise<void> = Promise.resolve();
   /** Session-local pending Stage confirmation (never remote until Publish). */
   let pending: PendingStage | undefined;
   /**
@@ -802,12 +849,18 @@ export function createWorkflowCoordinator(
    * Free Implementation slots: max(0, N - running).
    * N is effective Worker concurrency (root → global → default 2).
    */
+  async function localWorkerCapacitySeed(
+    bound: RootScopedPorts,
+  ): Promise<number> {
+    const root = await bound.preferences.getRootWorkerConcurrency();
+    const global = await bound.preferences.getGlobalWorkerConcurrency();
+    return resolveEffectiveWorkerConcurrency(root, global);
+  }
+
   async function freeImplementationSlots(
     bound: RootScopedPorts,
   ): Promise<{ n: number; running: number; slots: number }> {
-    const root = await bound.preferences.getRootWorkerConcurrency();
-    const global = await bound.preferences.getGlobalWorkerConcurrency();
-    const n = resolveEffectiveWorkerConcurrency(root, global);
+    const n = await localWorkerCapacitySeed(bound);
     const running = runningImplementationCount();
     return { n, running, slots: computeImplementationSlots(n, running) };
   }
@@ -846,8 +899,16 @@ export function createWorkflowCoordinator(
     bound: RootScopedPorts,
     ticketNumber: number,
     stage: "implement" | "rework" = "implement",
+    active?: ActiveWorkflow,
   ): Promise<StageResult | undefined> {
-    const { n, running, slots } = await freeImplementationSlots(bound);
+    // Coordination-aware workflows use remote worker-slot leases instead of
+    // this checkout's local N/running accounting. Keep only the workflow-local
+    // P1 gates here; actual repository capacity is acquired immediately before
+    // a worker process starts.
+    const localSlots = active?.coordination
+      ? { n: 0, running: runningImplementationCount(), slots: 1 }
+      : await freeImplementationSlots(bound);
+    const { n, running, slots } = localSlots;
     const reason = implementationLaunchBlockReason({
       slots,
       pendingDisposition: hasNeedsDispositionWaiting(),
@@ -896,6 +957,526 @@ export function createWorkflowCoordinator(
       reason: `No free Implementation worker slots (running ${running} of effective concurrency ${n}). Wait for a worker to finish before launching another.`,
       ticketNumber,
     };
+  }
+
+  async function withWorkerSlotLeaseMutex<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = workerSlotLeaseMutex;
+    let unlock: (() => void) | undefined;
+    workerSlotLeaseMutex = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      unlock?.();
+    }
+  }
+
+  function sameCanonicalRepository(
+    left: CanonicalRepositoryIdentity,
+    right: CanonicalRepositoryIdentity,
+  ): boolean {
+    return canonicalRepositoryIdentityKey(left) === canonicalRepositoryIdentityKey(right);
+  }
+
+  /**
+   * Read the ready queues that are eligible for repository-wide scheduling.
+   * The optional repository query is used when available so a second Target
+   * branch cannot silently evade the repository capacity policy. Older
+   * TrackerPorts retain a safe exact-Target fallback while they migrate.
+   */
+  async function repositoryWorkerDemands(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<RepositoryWorkerDemand[]> {
+    const target = active.coordination?.target;
+    if (!target) return [];
+
+    const discovered = bound.tracker.findActiveWorkflowsForRepository
+      ? await bound.tracker.findActiveWorkflowsForRepository(target.repository)
+      : await bound.tracker.findActiveWorkflows(target);
+    const byWorkflowId = new Map<number, ActiveWorkflow>();
+    for (const candidate of discovered) {
+      if (
+        !candidate.coordination ||
+        !sameCanonicalRepository(
+          candidate.coordination.target.repository,
+          target.repository,
+        )
+      ) {
+        continue;
+      }
+      byWorkflowId.set(candidate.workflowId, candidate);
+    }
+    // Tracker snapshots can briefly lag a freshly written manifest. The bound
+    // workflow's current observed facts must still participate in its own plan.
+    byWorkflowId.set(active.workflowId, active);
+
+    const workflows = [...byWorkflowId.values()]
+      .filter(
+        (candidate) =>
+          Boolean(candidate.coordination) &&
+          isTicketWorkStage(candidate.stage) &&
+          (candidate.tickets?.length ?? 0) > 0,
+      )
+      .sort((left, right) => left.workflowId - right.workflowId);
+
+    return Promise.all(
+      workflows.map(async (workflow): Promise<RepositoryWorkerDemand> => {
+        const tickets = await bound.tracker.listTickets(workflow.tickets ?? []);
+        const integrated = new Set(
+          (workflow.integratedTickets ?? []).map((ticket) => ticket.number),
+        );
+        const progress = computeTicketProgress(
+          workflow.workflowId,
+          tickets,
+          integrated,
+        );
+        return {
+          workflowId: workflow.workflowId,
+          readyTicketNumbers: progress.ready.map((ticket) => ticket.number),
+        };
+      }),
+    );
+  }
+
+  async function repositoryWorkerSlotPlan(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+    capacity: number,
+  ): Promise<RepositoryWorkerSlotPlan> {
+    const coordination = bound.coordination;
+    const target = active.coordination?.target;
+    if (!coordination || !target) {
+      throw new Error("Repository worker scheduling requires coordination-aware workflow facts.");
+    }
+
+    // Demand is read before leases so the latter is the closest practical
+    // snapshot to conditional allocation while the scheduler lease is held.
+    const demands = await repositoryWorkerDemands(bound, active);
+    const leases = await coordination.listLeases({
+      repository: target.repository,
+      kind: "worker-slot",
+    });
+    // Ask the CoordinationPort to apply its authoritative clock/fence check
+    // rather than inferring liveness from this process's wall clock. That keeps
+    // deterministic ports and separate machines consistent at lease expiry.
+    const verifiedSlots = await Promise.all(
+      leases
+        .filter(
+          (lease): lease is WorkerSlotLease =>
+            lease.kind === "worker-slot" && lease.releasedAt === undefined,
+        )
+        .map(async (lease) => {
+          const verified = await coordination.verifyLease(lease);
+          return verified.valid && verified.lease.kind === "worker-slot"
+            ? verified.lease
+            : undefined;
+        }),
+    );
+    const occupied: OccupiedRepositoryWorkerSlot[] = verifiedSlots
+      .filter((lease): lease is WorkerSlotLease => lease !== undefined)
+      .map((lease) => ({
+        slot: lease.scope.slot,
+        workflowId: lease.workflowId,
+        ...(lease.ticketNumber !== undefined
+          ? { ticketNumber: lease.ticketNumber }
+          : {}),
+      }));
+
+    return planRepositoryWorkerSlots({ capacity, occupied, demands });
+  }
+
+  /** Read-only advisory used by Next actions; conditional acquisition remains authoritative. */
+  async function previewRepositoryWorkerSlots(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<RepositoryWorkerSlotPreview> {
+    const coordination = bound.coordination;
+    const target = active.coordination?.target;
+    if (!coordination || !target) {
+      return {
+        ok: false,
+        reason: "Repository worker scheduling is unavailable for this coordination-aware workflow.",
+      };
+    }
+    try {
+      const policy = await coordination.getWorkerCapacityPolicy(target.repository);
+      const capacity = policy?.workerCapacity ?? (await localWorkerCapacitySeed(bound));
+      return {
+        ok: true,
+        capacity,
+        plan: await repositoryWorkerSlotPlan(bound, active, capacity),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not inspect repository-wide Implementation capacity: ${message}`,
+      };
+    }
+  }
+
+  function repositorySlotWaitReason(
+    plan: RepositoryWorkerSlotPlan,
+    workflowId: number,
+    ticketNumber: number,
+  ): string {
+    if (plan.freeSlots.length === 0) {
+      return `Repository-wide Implementation capacity is full (${plan.occupied.length} live worker-slot lease(s) for capacity ${plan.capacity}). Wait for a worker to finish or an expired lease to be reclaimed.`;
+    }
+    const sameWorkflow = plan.claimable.find(
+      (claim) => claim.workflowId === workflowId,
+    );
+    if (sameWorkflow) {
+      return `Repository scheduler allocates tickets in ready order: #${sameWorkflow.ticketNumber} receives Workflow #${workflowId}'s next fair slot before #${ticketNumber}.`;
+    }
+    const next = plan.claimable[0];
+    if (next) {
+      return `Repository scheduler gives Workflow #${next.workflowId} its first fair slot for #${next.ticketNumber} before Workflow #${workflowId} receives another slot.`;
+    }
+    return `No repository-wide Implementation worker slot is currently allocatable for #${ticketNumber}.`;
+  }
+
+  async function acquireRepositorySchedulerLease(
+    bound: RootScopedPorts,
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<
+    | { acquired: true; lease: RepositorySchedulerLease }
+    | { acquired: false; holderId?: string }
+  > {
+    const coordination = bound.coordination;
+    if (!coordination) return { acquired: false };
+
+    // Separate homes commonly enter /matt-auto run together. Wait briefly for
+    // a compliant scheduler holder to finish its tiny snapshot/assignment
+    // critical section rather than treating an ordinary race as a pipeline
+    // failure. TTL recovery remains the safe path for a crashed holder.
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const result = await coordination.acquireLease({
+        kind: "repository-scheduler",
+        repository,
+        holderId: workflowHomeHolderId,
+        ttlMs: DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS,
+      });
+      if (result.acquired && result.lease.kind === "repository-scheduler") {
+        return { acquired: true, lease: result.lease };
+      }
+      if (!result.acquired && result.reason !== "held") {
+        return { acquired: false, ...(result.lease ? { holderId: result.lease.holderId } : {}) };
+      }
+      if (attempt < 24) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+      if (!result.acquired && attempt === 24) {
+        return {
+          acquired: false,
+          ...(result.lease ? { holderId: result.lease.holderId } : {}),
+        };
+      }
+    }
+    return { acquired: false };
+  }
+
+  /**
+   * Acquire the one remote worker-slot lease that authorizes a new
+   * Implementation process. Scheduler ownership is released before the worker
+   * launches; the worker retains only its own renewable slot lease.
+   */
+  async function acquireRepositoryWorkerSlot(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+    ticketNumber: number,
+  ): Promise<RepositoryWorkerSlotAcquire> {
+    const coordination = bound.coordination;
+    const target = active.coordination?.target;
+    if (!coordination || !target) {
+      return {
+        ok: false,
+        reason:
+          "Repository worker scheduling is unavailable for this coordination-aware workflow.",
+      };
+    }
+
+    // Never schedule additional work while a previously owned worker may have
+    // lost its fence. This check aborts any unowned process before proceeding.
+    await heartbeatHeldWorkerSlots(bound, { verify: true });
+
+    let capacity: number;
+    try {
+      const policy = await coordination.ensureWorkerCapacityPolicy({
+        repository: target.repository,
+        seedWorkerCapacity: await localWorkerCapacitySeed(bound),
+      });
+      capacity = policy.policy.workerCapacity;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not load the repository-wide worker-capacity policy: ${message}`,
+      };
+    }
+
+    let schedulerLease: RepositorySchedulerLease | undefined;
+    try {
+      const acquired = await acquireRepositorySchedulerLease(
+        bound,
+        target.repository,
+      );
+      if (!acquired.acquired) {
+        return {
+          ok: false,
+          reason: `Repository worker scheduler is busy${acquired.holderId ? ` (held by ${acquired.holderId})` : ""}. Wait for its short lease to release, then retry the ready frontier.`,
+        };
+      }
+      schedulerLease = acquired.lease;
+
+      const plan = await repositoryWorkerSlotPlan(bound, active, capacity);
+      // Discovery can take longer than the scheduler's short TTL. Renew and
+      // fence-check immediately before assigning a slot from this snapshot.
+      const renewed = await coordination.renewLease({
+        lease: schedulerLease,
+        ttlMs: DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS,
+      });
+      if (!renewed.renewed || renewed.lease.kind !== "repository-scheduler") {
+        return {
+          ok: false,
+          reason: `Repository worker scheduler lease was lost while computing allocation (${renewed.renewed ? "unexpected lease kind" : renewed.reason}). Retry the ready frontier.`,
+        };
+      }
+      schedulerLease = renewed.lease;
+
+      const claim = plan.claimable.find(
+        (candidate) =>
+          candidate.workflowId === active.workflowId &&
+          candidate.ticketNumber === ticketNumber,
+      );
+      const slotNumber = plan.freeSlots[0];
+      if (!claim || slotNumber === undefined) {
+        return {
+          ok: false,
+          reason: repositorySlotWaitReason(plan, active.workflowId, ticketNumber),
+        };
+      }
+
+      const slot = await coordination.acquireLease({
+        kind: "worker-slot",
+        repository: target.repository,
+        slot: slotNumber,
+        holderId: workflowHomeHolderId,
+        workflowId: active.workflowId,
+        ticketNumber,
+        ttlMs: DEFAULT_COORDINATION_LEASE_TTL_MS,
+      });
+      if (!slot.acquired || slot.lease.kind !== "worker-slot") {
+        return {
+          ok: false,
+          reason: `Repository worker-slot ${slotNumber} changed while it was being assigned${!slot.acquired && slot.lease?.holderId ? ` (now held by ${slot.lease.holderId})` : ""}. Retry the ready frontier.`,
+        };
+      }
+      return { ok: true, lease: slot.lease, capacity };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not allocate a repository-wide Implementation worker slot: ${message}`,
+      };
+    } finally {
+      if (schedulerLease) {
+        try {
+          await coordination.releaseLease(schedulerLease);
+        } catch {
+          // A short TTL provides fail-closed recovery if a release races or the
+          // remote becomes unreachable after the worker slot was assigned.
+        }
+      }
+    }
+  }
+
+  function stopWorkerSlotHeartbeat(): void {
+    if (workerSlotHeartbeatTimer) {
+      clearInterval(workerSlotHeartbeatTimer);
+      workerSlotHeartbeatTimer = undefined;
+    }
+  }
+
+  function startWorkerSlotHeartbeat(bound: RootScopedPorts): void {
+    if (workerSlotHeartbeatTimer || heldWorkerSlots.size === 0) return;
+    workerSlotHeartbeatTimer = setInterval(() => {
+      if (workerSlotHeartbeatInFlight || scoped !== bound) return;
+      workerSlotHeartbeatInFlight = true;
+      void heartbeatHeldWorkerSlots(bound).finally(() => {
+        workerSlotHeartbeatInFlight = false;
+      });
+    }, Math.max(1_000, Math.floor(DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS / 2)));
+    workerSlotHeartbeatTimer.unref();
+  }
+
+  function holdWorkerSlot(bound: RootScopedPorts, held: HeldWorkerSlot): void {
+    heldWorkerSlots.set(held.workerId, held);
+    startWorkerSlotHeartbeat(bound);
+  }
+
+  async function releaseHeldWorkerSlotUnlocked(
+    bound: RootScopedPorts | undefined,
+    workerId: string,
+  ): Promise<void> {
+    const held = heldWorkerSlots.get(workerId);
+    if (!held) return;
+    heldWorkerSlots.delete(workerId);
+    if (heldWorkerSlots.size === 0) stopWorkerSlotHeartbeat();
+    if (!bound?.coordination) return;
+    try {
+      await bound.coordination.releaseLease(held.lease);
+    } catch {
+      // A worker has already stopped. TTL expiry is sufficient if an explicit
+      // release cannot reach the coordination ref.
+    }
+  }
+
+  async function releaseHeldWorkerSlot(
+    bound: RootScopedPorts | undefined,
+    workerId: string,
+  ): Promise<void> {
+    await withWorkerSlotLeaseMutex(() =>
+      releaseHeldWorkerSlotUnlocked(bound, workerId),
+    );
+  }
+
+  async function releaseAllHeldWorkerSlots(
+    bound: RootScopedPorts | undefined,
+  ): Promise<void> {
+    await withWorkerSlotLeaseMutex(async () => {
+      for (const workerId of [...heldWorkerSlots.keys()]) {
+        await releaseHeldWorkerSlotUnlocked(bound, workerId);
+      }
+    });
+  }
+
+  async function abandonLostWorkerSlotUnlocked(
+    bound: RootScopedPorts,
+    held: HeldWorkerSlot,
+    reason: string,
+  ): Promise<void> {
+    // Delete before aborting. A late timer or worker event must never treat a
+    // lost fencing token as capacity it can renew or release.
+    if (heldWorkerSlots.get(held.workerId) !== held) return;
+    heldWorkerSlots.delete(held.workerId);
+    if (heldWorkerSlots.size === 0) stopWorkerSlotHeartbeat();
+
+    try {
+      await bound.workers.abort(held.workerId);
+    } catch {
+      // Worker adapters own process termination; do not keep scheduling based
+      // on a slot we can no longer prove we own if their best-effort abort fails.
+    }
+
+    const worker = activeImplementationWorkers.get(held.workerId);
+    if (worker?.status === "running") {
+      worker.status = "aborted";
+      activeImplementationWorkers.delete(held.workerId);
+      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+    }
+    await bound.transcripts.append(
+      {
+        workflowId: held.workflowId,
+        ticketNumber: held.ticketNumber,
+        attempt: worker?.attempt ?? 1,
+      },
+      {
+        type: "worker-slot-lost",
+        workerId: held.workerId,
+        slot: held.lease.scope.slot,
+        generation: held.lease.generation,
+        reason,
+      },
+    );
+    invalidatePanelCaches();
+  }
+
+  /** Renew live slots, or prove ownership before a new launch when requested. */
+  async function heartbeatHeldWorkerSlots(
+    bound: RootScopedPorts,
+    options: { verify?: boolean } = {},
+  ): Promise<void> {
+    await withWorkerSlotLeaseMutex(async () => {
+      const coordination = bound.coordination;
+      for (const held of [...heldWorkerSlots.values()]) {
+        if (heldWorkerSlots.get(held.workerId) !== held) continue;
+        const worker = activeImplementationWorkers.get(held.workerId);
+        if (!worker || worker.status !== "running") {
+          await releaseHeldWorkerSlotUnlocked(bound, held.workerId);
+          continue;
+        }
+        const runtime = bound.workers.getRuntime(held.workerId);
+        if (!runtime || !runtime.alive) {
+          // A dead process cannot retain capacity while the panel/reconciler
+          // synthesizes its terminal Worker protocol event.
+          await releaseHeldWorkerSlotUnlocked(bound, held.workerId);
+          continue;
+        }
+        if (!coordination) {
+          await abandonLostWorkerSlotUnlocked(
+            bound,
+            held,
+            "Remote worker-slot coordination is no longer available.",
+          );
+          continue;
+        }
+
+        const due =
+          Date.now() - held.renewedAtMs >=
+          DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS;
+        try {
+          if (due) {
+            const renewed = await coordination.renewLease({
+              lease: held.lease,
+              ttlMs: DEFAULT_COORDINATION_LEASE_TTL_MS,
+            });
+            if (!renewed.renewed || renewed.lease.kind !== "worker-slot") {
+              await abandonLostWorkerSlotUnlocked(
+                bound,
+                held,
+                `Worker-slot lease could not be renewed (${renewed.renewed ? "unexpected lease kind" : renewed.reason}).`,
+              );
+              continue;
+            }
+            heldWorkerSlots.set(held.workerId, {
+              ...held,
+              lease: renewed.lease,
+              renewedAtMs: Date.now(),
+            });
+            continue;
+          }
+
+          if (options.verify) {
+            const verified = await coordination.verifyLease(held.lease);
+            if (!verified.valid || verified.lease.kind !== "worker-slot") {
+              await abandonLostWorkerSlotUnlocked(
+                bound,
+                held,
+                `Worker-slot lease is no longer valid (${verified.valid ? "unexpected lease kind" : verified.reason}).`,
+              );
+              continue;
+            }
+            heldWorkerSlots.set(held.workerId, {
+              ...held,
+              lease: verified.lease,
+            });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await abandonLostWorkerSlotUnlocked(
+            bound,
+            held,
+            `Could not prove worker-slot ownership: ${message}`,
+          );
+        }
+      }
+    });
   }
 
   /**
@@ -2762,15 +3343,28 @@ export function createWorkflowCoordinator(
         return [];
       }
 
-      // Slot math: N effective concurrency; slots = max(0, N - running).
-      // While slots remain and P1 allows, offer ready-frontier implements so
-      // the run loop can fill without waiting for the first worker to finish.
-      // When slots are full, the passive panel owns progress (empty Next list).
-      const { slots } = await freeImplementationSlots(bound);
+      // Legacy workflows retain local N/running accounting. Coordination-aware
+      // workflows preview the shared remote plan instead; conditional slot
+      // acquisition in startImplementation remains the authoritative fence.
+      const localCapacity = active.coordination
+        ? undefined
+        : await freeImplementationSlots(bound);
+      const slots = localCapacity?.slots ?? 1;
       const runningWorkers = hasRunningImplementationWorkers();
+      let repositoryLaunchableTicketNumbers: ReadonlySet<number> | undefined;
+      if (active.coordination) {
+        const preview = await previewRepositoryWorkerSlots(bound, active);
+        repositoryLaunchableTicketNumbers = new Set(
+          preview.ok
+            ? preview.plan.claimable
+                .filter((claim) => claim.workflowId === active.workflowId)
+                .map((claim) => claim.ticketNumber)
+            : [],
+        );
+      }
 
-      if (slots === 0 && runningWorkers) {
-        // No free slots while workers run — wait surface, no overflow implements.
+      if (!active.coordination && slots === 0 && runningWorkers) {
+        // No free local slots while legacy workers run — wait surface, no overflow implements.
         return [];
       }
 
@@ -2821,10 +3415,20 @@ export function createWorkflowCoordinator(
         }
       }
 
-      // Offer Implement only while free slots remain (P1 already gated above).
-      if (slots > 0) {
+      // Offer Implement only when local legacy capacity or the current shared
+      // repository plan can allocate that exact ready ticket (P1 already gated).
+      const canOfferImplementation = active.coordination
+        ? (repositoryLaunchableTicketNumbers?.size ?? 0) > 0
+        : slots > 0;
+      if (canOfferImplementation) {
         const now = Date.now();
         const launchable = progress.ready.filter((ticket) => {
+          if (
+            active.coordination &&
+            !repositoryLaunchableTicketNumbers?.has(ticket.number)
+          ) {
+            return false;
+          }
           if (findRunningWorkerForTicket(ticket.number)) return false;
           const cooled = implementationRecoveryCooldown.get(ticket.number);
           if (cooled === undefined) return true;
@@ -2837,8 +3441,10 @@ export function createWorkflowCoordinator(
         // Stable ticket-number order is already how progress.ready is sorted.
         actions.push(...launchable.map(formatImplementAction));
 
-        // Pre-merge Rework for closed integrated tickets (same slot rules).
-        if (!active.workflowPr || active.stage === "pr-opened") {
+        // Pre-merge Rework for closed integrated tickets (same local P1 rules).
+        // Coordination-aware rework is offered after reopening creates a fresh
+        // ready ticket; its remote slot cannot be predicted while still closed.
+        if (!active.coordination && (!active.workflowPr || active.stage === "pr-opened")) {
           const closedIntegrated = (active.integratedTickets ?? []).filter(
             (t) =>
               !progress.ready.some((r) => r.number === t.number) &&
@@ -2861,7 +3467,7 @@ export function createWorkflowCoordinator(
           }
         }
       } else if (runningWorkers) {
-        // No free slots and workers still running — wait (panel owns progress).
+        // No locally/fairly allocatable slot and workers still run — wait.
         return [];
       }
 
@@ -3896,6 +4502,7 @@ export function createWorkflowCoordinator(
       bound,
       ticketNumber,
       "implement",
+      active,
     );
     if (launchBlock) return launchBlock;
 
@@ -3991,6 +4598,38 @@ export function createWorkflowCoordinator(
         ].join("\n")
       : prepared.prompt;
 
+    // A coordinator lease may have expired during local workspace preparation.
+    // Re-prove authority before mutating repository capacity, then acquire one
+    // fenced worker slot only for a coordination-aware Implementation process.
+    const preSlotAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!preSlotAuthority.ok) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: preSlotAuthority.reason,
+        ticketNumber,
+        attempt,
+        workflowId: active.workflowId,
+      };
+    }
+
+    const repositorySlot = active.coordination
+      ? await acquireRepositoryWorkerSlot(bound, active, ticketNumber)
+      : undefined;
+    if (repositorySlot && !repositorySlot.ok) {
+      return {
+        status: "failed",
+        stage: "implement",
+        reason: repositorySlot.reason,
+        ticketNumber,
+        attempt,
+        workflowId: active.workflowId,
+      };
+    }
+
     const workerId = `implement-${active.workflowId}-${ticketNumber}-r${attempt}`;
     const worker: ActiveImplementationWorker = {
       workerId,
@@ -4006,6 +4645,15 @@ export function createWorkflowCoordinator(
       receivedStageResult: false,
     };
     activeImplementationWorkers.set(workerId, worker);
+    if (repositorySlot?.ok) {
+      holdWorkerSlot(bound, {
+        workerId,
+        workflowId: active.workflowId,
+        ticketNumber,
+        lease: repositorySlot.lease,
+        renewedAtMs: Date.now(),
+      });
+    }
 
     const transcriptKey = {
       workflowId: active.workflowId,
@@ -4020,6 +4668,15 @@ export function createWorkflowCoordinator(
       branchName: workspace.branchName,
       worktreePath: workspace.worktreePath,
       skillCommand: prepared.skillCommand,
+      ...(repositorySlot?.ok
+        ? {
+            workerSlot: {
+              slot: repositorySlot.lease.scope.slot,
+              generation: repositorySlot.lease.generation,
+              capacity: repositorySlot.capacity,
+            },
+          }
+        : {}),
       ...(reusingAttempt ? { reusedAttempt: true } : {}),
     });
 
@@ -4033,6 +4690,7 @@ export function createWorkflowCoordinator(
     );
     if (!launchAuthority.ok) {
       activeImplementationWorkers.delete(workerId);
+      await releaseHeldWorkerSlot(bound, workerId);
       await bound.transcripts.append(transcriptKey, {
         type: "worker-launch-blocked",
         reason: launchAuthority.reason,
@@ -4081,6 +4739,7 @@ export function createWorkflowCoordinator(
       });
     } catch (error) {
       activeImplementationWorkers.delete(workerId);
+      await releaseHeldWorkerSlot(bound, workerId);
       const message = error instanceof Error ? error.message : String(error);
       await bound.transcripts.append(transcriptKey, {
         type: "worker-launch-failed",
@@ -4146,6 +4805,16 @@ export function createWorkflowCoordinator(
     }
 
     await heartbeatHeldWorkflowCoordinatorLease(bound);
+    // A running process must never continue to be treated as scheduled after
+    // its remote worker-slot fence changes. Event traffic is an additional
+    // prompt ownership check, alongside the periodic heartbeat.
+    await heartbeatHeldWorkerSlots(bound, { verify: true });
+    if (
+      !activeImplementationWorkers.has(worker.workerId) &&
+      pendingDisposition?.workerId !== worker.workerId
+    ) {
+      return;
+    }
 
     const transcriptKey = {
       workflowId: worker.workflowId,
@@ -4171,6 +4840,9 @@ export function createWorkflowCoordinator(
     }
 
     if (event.type === "stage-result") {
+      // The Implementation process has reported its terminal result, so its
+      // repository capacity becomes available before the local disposition.
+      await releaseHeldWorkerSlot(bound, worker.workerId);
       // Stage results only apply to workers still in the multi-worker set.
       if (!activeImplementationWorkers.has(worker.workerId)) {
         return;
@@ -4200,6 +4872,7 @@ export function createWorkflowCoordinator(
     }
 
     // process-exit
+    await releaseHeldWorkerSlot(bound, worker.workerId);
     if (worker.receivedStageResult) {
       // Stage result already settled the attempt; keep disposition if pending.
       return;
@@ -6460,16 +7133,6 @@ export function createWorkflowCoordinator(
 
   async function startRework(ticketNumber: number): Promise<StageResult> {
     const bound = await requireScoped();
-
-    // Rework attempts use the same slot + P1 rules as Implement (check before
-    // reopening / mutating the manifest so a blocked launch is a no-op).
-    const launchBlock = await blockNewImplementationLaunch(
-      bound,
-      ticketNumber,
-      "rework",
-    );
-    if (launchBlock) return launchBlock;
-
     const active = await loadActiveWorkflow(bound);
     if (!active || !isTicketWorkStage(active.stage)) {
       return {
@@ -6490,6 +7153,17 @@ export function createWorkflowCoordinator(
         ticketNumber,
       };
     }
+
+    // Rework uses the same workflow-local P1 gate as Implement before it
+    // reopens a ticket. Coordination-aware capacity itself is leased only by
+    // the eventual fresh Implementation process after the ticket is ready.
+    const launchBlock = await blockNewImplementationLaunch(
+      bound,
+      ticketNumber,
+      "rework",
+      active,
+    );
+    if (launchBlock) return launchBlock;
 
     const reworkAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
@@ -6651,6 +7325,7 @@ export function createWorkflowCoordinator(
       } catch {
         // Best-effort; still drop session state so the run loop does not wait.
       }
+      await releaseHeldWorkerSlot(bound, worker.workerId);
       worker.status = "aborted";
       activeImplementationWorkers.delete(worker.workerId);
       // Cooldown so auto-advance does not immediately re-pick a still-blocked ticket.
@@ -6725,6 +7400,7 @@ export function createWorkflowCoordinator(
     }
 
     for (const worker of runningWorkers) {
+      await releaseHeldWorkerSlot(bound, worker.workerId);
       worker.status = "aborted";
       activeImplementationWorkers.delete(worker.workerId);
       if (options.setCooldown) {
@@ -6774,6 +7450,12 @@ export function createWorkflowCoordinator(
 
   async function releaseWorkflowHome(): Promise<void> {
     const bound = scoped;
+    // Callers normally abort first, but never release capacity underneath a
+    // still-running session worker when releaseWorkflowHome is used directly.
+    if (bound && heldWorkerSlots.size > 0) {
+      await abortWorkers();
+    }
+    await releaseAllHeldWorkerSlots(bound);
     await releaseHeldWorkflowCoordinatorLease(bound);
     const lock = heldWorkflowHomeLock;
     heldWorkflowHomeLock = undefined;
@@ -7167,6 +7849,7 @@ export function createWorkflowCoordinator(
   }): Promise<WorkflowPanelState | undefined> {
     const bound = await requireScoped();
     await heartbeatHeldWorkflowCoordinatorLease(bound);
+    await heartbeatHeldWorkerSlots(bound, { verify: true });
     // Detect zombie running state before snapshotting the panel.
     await reconcileDeadWorkers(bound);
     const mode = options?.mode ?? "full";

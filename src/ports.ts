@@ -582,6 +582,16 @@ export type TrackerPort = {
     target: CanonicalTargetIdentity,
   ): Promise<readonly ActiveWorkflow[]>;
   /**
+   * Discover coordination-aware Active workflows across every Target branch in
+   * one canonical repository. Repository worker scheduling uses this broader
+   * view because worker capacity is repository-scoped, not checkout- or
+   * Target-scoped. Optional while older test/third-party TrackerPorts migrate;
+   * callers fail closed or fall back to their exact Target snapshot.
+   */
+  findActiveWorkflowsForRepository?(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<readonly ActiveWorkflow[]>;
+  /**
    * Legacy single-workflow lookup used only by version 1 coordinator routing.
    * When no hint is available, implementations return a workflow only if exactly
    * one matches; parallel manifests are never collapsed to an arbitrary result.

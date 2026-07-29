@@ -19,6 +19,13 @@ export const DEFAULT_COORDINATION_LEASE_TTL_MS = 60_000;
 export const DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS = 15_000;
 
 /**
+ * Short lease used only while a coordinator snapshots demand and conditionally
+ * assigns repository-wide Implementation worker slots. It is intentionally
+ * shorter than a worker slot lease: scheduler ownership never spans a worker.
+ */
+export const DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS = 15_000;
+
+/**
  * Concurrency warning threshold for the configure UI.
  * Setting N above this shows a one-time confirmation; run-time filling does not re-prompt.
  * Fixed for this slice (initially four).

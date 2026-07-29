@@ -8,6 +8,7 @@ import {
 } from "../src/coordination.js";
 import {
   activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
   workflowManifestMatchesTarget,
@@ -271,5 +272,44 @@ describe("Active workflow discovery projection", () => {
     expect(workflowManifestMatchesTarget(legacy, target)).toBe(true);
     expect(workflowManifestMatchesTarget(coordinated, target)).toBe(true);
     expect(workflowManifestMatchesTarget(otherRepository, target)).toBe(false);
+  });
+
+  it("finds coordination-aware workflows across Target branches for repository scheduling", () => {
+    const main = coordinatedManifest(40);
+    const release: CoordinationWorkflowManifest = {
+      ...coordinatedManifest(41),
+      targetBranch: "release/2026.07",
+      workflowPr: {
+        ...coordinatedManifest(41).workflowPr!,
+        baseBranch: "release/2026.07",
+      },
+      coordination: {
+        ...coordinatedManifest(41).coordination,
+        target: {
+          repository: target.repository,
+          targetRef: "refs/heads/release/2026.07",
+        },
+      },
+    };
+
+    const active = coordinatedActiveWorkflowsFromIssues(target.repository, [
+      {
+        number: 39,
+        state: "OPEN",
+        comments: [{ body: formatWorkflowManifestComment(legacyManifest(39)) }],
+      },
+      {
+        number: 40,
+        state: "OPEN",
+        comments: [{ body: formatWorkflowManifestComment(main) }],
+      },
+      {
+        number: 41,
+        state: "OPEN",
+        comments: [{ body: formatWorkflowManifestComment(release) }],
+      },
+    ]);
+
+    expect(active.map((workflow) => workflow.workflowId)).toEqual([40, 41]);
   });
 });

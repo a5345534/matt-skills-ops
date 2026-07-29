@@ -28,6 +28,7 @@ import type {
 } from "../types.js";
 import {
   activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
   formatWorkflowManifestComment,
   type WorkflowManifestIssue,
 } from "./workflow-manifest.js";
@@ -35,6 +36,7 @@ import {
 export {
   activeWorkflowFromManifest,
   activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
   workflowManifestMatchesTarget,
@@ -331,6 +333,30 @@ export function createTrackerPort(cwd: string): TrackerPort {
     return undefined;
   }
 
+  async function loadActiveWorkflowSnapshots(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<readonly WorkflowManifestIssue[]> {
+    const issues = await listOpenWorkflowIssues(repository);
+    if (!issues) {
+      throw new Error("Could not paginate open GitHub issues for workflow discovery.");
+    }
+
+    return mapWithConcurrency(issues, 8, async (issue) => {
+      const comments = await loadIssueComments(repository, issue.number);
+      if (!comments) {
+        throw new Error(
+          `Could not paginate managed comments for workflow issue #${issue.number}.`,
+        );
+      }
+      return {
+        number: issue.number,
+        ...(issue.title ? { title: issue.title } : {}),
+        ...(issue.state ? { state: issue.state } : {}),
+        comments,
+      } satisfies WorkflowManifestIssue;
+    });
+  }
+
   async function discoverActiveWorkflows(
     target: CanonicalTargetIdentity,
   ): Promise<readonly ActiveWorkflow[]> {
@@ -339,27 +365,24 @@ export function createTrackerPort(cwd: string): TrackerPort {
     if (!repository || !repositoriesMatch(repository, target.repository)) {
       return [];
     }
-    const issues = await listOpenWorkflowIssues(repository);
-    if (!issues) {
-      throw new Error("Could not paginate open GitHub issues for workflow discovery.");
-    }
+    return activeWorkflowsFromIssues(
+      target,
+      await loadActiveWorkflowSnapshots(repository),
+    );
+  }
 
-    const snapshots = await mapWithConcurrency(issues, 8, async (issue) => {
-      const comments = await loadIssueComments(repository, issue.number);
-      if (!comments) {
-        throw new Error(
-          `Could not paginate managed comments for workflow issue #${issue.number}.`,
-        );
-      }
-      const snapshot: WorkflowManifestIssue = {
-        number: issue.number,
-        ...(issue.title ? { title: issue.title } : {}),
-        ...(issue.state ? { state: issue.state } : {}),
-        comments,
-      };
-      return snapshot;
-    });
-    return activeWorkflowsFromIssues(target, snapshots);
+  async function discoverActiveWorkflowsForRepository(
+    requestedRepository: CanonicalRepositoryIdentity,
+  ): Promise<readonly ActiveWorkflow[]> {
+    if (!isCanonicalRepositoryIdentity(requestedRepository)) return [];
+    const repository = await resolveRepoFullName(cwd);
+    if (!repository || !repositoriesMatch(repository, requestedRepository)) {
+      return [];
+    }
+    return coordinatedActiveWorkflowsFromIssues(
+      repository,
+      await loadActiveWorkflowSnapshots(repository),
+    );
   }
 
   async function loadActiveWorkflowById(
@@ -478,6 +501,10 @@ export function createTrackerPort(cwd: string): TrackerPort {
 
     async findActiveWorkflows(target) {
       return discoverActiveWorkflows(target);
+    },
+
+    async findActiveWorkflowsForRepository(repository) {
+      return discoverActiveWorkflowsForRepository(repository);
     },
 
     async findActiveWorkflow(targetBranch, hintWorkflowId) {
