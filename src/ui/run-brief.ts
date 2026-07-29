@@ -31,6 +31,7 @@ export type RunBriefSectionId =
   | "context"
   | "parallel-delivery"
   | "workers"
+  | "recovery"
   | "integration"
   | "ci"
   | "workflow-pr"
@@ -143,6 +144,9 @@ export function buildRunBriefViewModel(
   );
   const workers = workersSection(panel.workers, hasTicketTable);
   if (workers) sections.push(workers);
+
+  const recovery = implementationRecoverySection(panel);
+  if (recovery) sections.push(recovery);
 
   const integration = integrationSection(panel.integration);
   if (integration) sections.push(integration);
@@ -379,6 +383,29 @@ export function formatIntegrationReasonForBrief(
   const oneLine = reason.replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxLen) return oneLine;
   return `${oneLine.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+function implementationRecoverySection(
+  panel: WorkflowPanelState,
+  nowMs: number = Date.now(),
+): RunBriefSection | undefined {
+  const recovery = panel.implementationRecovery;
+  if (!recovery || recovery.length === 0) return undefined;
+  const lines = recovery.map((entry) => {
+    const remainingMs = Math.max(0, entry.untilMs - nowMs);
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const until = new Date(entry.untilMs).toISOString().slice(11, 16) + "Z";
+    const reason = entry.reason ? ` — ${entry.reason}` : "";
+    return `#${entry.ticketNumber}: cooling ~${minutes}m (until ${until})${reason}`;
+  });
+  return {
+    id: "recovery",
+    title: "Implementation recovery",
+    lines: [
+      "Auto Implement withheld after Compatibility recovery:",
+      ...lines,
+    ],
+  };
 }
 
 function integrationSection(

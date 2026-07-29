@@ -188,6 +188,8 @@ describe("persistent workflow dashboard surface", () => {
     expect(initial).toContain("Workflow summary");
     expect(initial).toContain("Tickets · #43 — Dashboard ticket");
     expect(initial).toContain("Worker attempts · #43 r1 — running");
+    expect(initial).toContain("Settings · Configure Worker profile…");
+    expect(initial).toContain("Settings · Configure Worker concurrency…");
     expect(initial).toContain("Next actions · Implement #43");
     expect(initial).toContain("Esc return to chat");
 
@@ -207,15 +209,20 @@ describe("persistent workflow dashboard surface", () => {
     expect(harness.doneValues).toEqual([]);
     expect(notify).not.toHaveBeenCalled();
 
-    // Worker → action. A read-only data source has no coordinator action seam,
-    // so action rows remain safely inspectable in this presentation-only test.
+    // Worker → settings → Next action. A read-only data source has no
+    // coordinator action seam, so action rows remain safely inspectable.
+    send(component, "\u001b[B");
+    expect(component.render(120).join("\n")).toContain(
+      "Selected · Settings: Configure Worker profile",
+    );
+    send(component, "\u001b[B");
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(
       "Selected · Next action: Implement #43",
     );
 
-    // Enter remains passive when the caller did not supply an action-capable
-    // coordinator; passive browsing never resolves or writes to chat.
+    // Enter remains passive for Next actions when the caller did not supply an
+    // action-capable coordinator; passive browsing never resolves or writes chat.
     send(component, "\r");
     expect(harness.doneValues).toEqual([]);
     expect(notify).not.toHaveBeenCalled();
@@ -223,6 +230,32 @@ describe("persistent workflow dashboard surface", () => {
     send(component, "\u001b");
     await expect(opening).resolves.toEqual({ status: "dismissed" });
     expect(harness.doneValues).toEqual([{ status: "dismissed" }]);
+  });
+
+  it("leaves the dashboard to open Worker profile settings", async () => {
+    const dashboardSource = source();
+    const harness = dashboardHarness();
+    const opening = presentWorkflowDashboard(dashboardSource, harness.ui, {
+      initialSnapshot: snapshot(),
+      pollIntervalMs: 10_000,
+    });
+    const component = await capturedComponent(harness);
+
+    // Workflow → ticket → worker → Configure Worker profile…
+    send(component, "\u001b[B");
+    send(component, "\u001b[B");
+    send(component, "\u001b[B");
+    expect(component.render(120).join("\n")).toContain(
+      "Selected · Settings: Configure Worker profile",
+    );
+
+    send(component, "\r");
+    await expect(opening).resolves.toEqual({
+      status: "configure-worker-profile",
+    });
+    expect(harness.doneValues).toEqual([
+      { status: "configure-worker-profile" },
+    ]);
   });
 
   it("polls only local panel telemetry and retains the selected worker key", async () => {
@@ -358,7 +391,9 @@ describe("persistent workflow dashboard surface", () => {
     );
     const component = await capturedComponent(harness);
 
-    // Workflow → ticket → explicit Next action.
+    // Workflow → ticket → settings → settings → explicit Next action.
+    send(component, "\u001b[B");
+    send(component, "\u001b[B");
     send(component, "\u001b[B");
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(

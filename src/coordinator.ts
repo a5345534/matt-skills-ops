@@ -109,6 +109,7 @@ import type {
   CiRecoveryDecision,
   EmergencyStopResult,
   ImplementationDispositionDecision,
+  ImplementationRecoveryState,
   ImplementationWorkerStatus,
   IntegratedTicketRef,
   NextAction,
@@ -461,6 +462,8 @@ type ActiveImplementationWorker = {
   startedAtMs: number;
   /** True once a stage-result event was handled for this worker. */
   receivedStageResult: boolean;
+  /** Last provider/model error observed on the worker stream, when any. */
+  lastError?: string;
 };
 
 /**
@@ -636,8 +639,42 @@ export function createWorkflowCoordinator(
     | { workflowId: number; title?: string; targetBranch: string }
     | undefined;
   /** Ticket numbers that recently hit implementation recovery — skip auto re-launch. */
-  const implementationRecoveryCooldown = new Map<number, number>();
+  const implementationRecoveryCooldown = new Map<
+    number,
+    { sinceMs: number; reason?: string }
+  >();
   const IMPLEMENTATION_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+
+  function rememberImplementationRecovery(
+    ticketNumber: number,
+    reason?: string,
+  ): void {
+    implementationRecoveryCooldown.set(ticketNumber, {
+      sinceMs: Date.now(),
+      ...(reason ? { reason } : {}),
+    });
+  }
+
+  function getImplementationRecoveryStates(): readonly ImplementationRecoveryState[] {
+    const now = Date.now();
+    const states: ImplementationRecoveryState[] = [];
+    for (const [ticketNumber, entry] of implementationRecoveryCooldown) {
+      const untilMs = entry.sinceMs + IMPLEMENTATION_RECOVERY_COOLDOWN_MS;
+      const remainingMs = untilMs - now;
+      if (remainingMs <= 0) {
+        implementationRecoveryCooldown.delete(ticketNumber);
+        continue;
+      }
+      states.push({
+        ticketNumber,
+        sinceMs: entry.sinceMs,
+        untilMs,
+        remainingMs,
+        ...(entry.reason ? { reason: entry.reason } : {}),
+      });
+    }
+    return states.sort((a, b) => a.ticketNumber - b.ticketNumber);
+  }
   /**
    * Session-owned Pipeline pause flag. When true, auto-advance / preferred Next
    * must not continue the run loop. Cleared only by Resume or beginPipelineRun.
@@ -1515,7 +1552,10 @@ export function createWorkflowCoordinator(
     if (worker?.status === "running") {
       worker.status = "aborted";
       activeImplementationWorkers.delete(held.workerId);
-      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      rememberImplementationRecovery(
+        worker.ticketNumber,
+        "Worker aborted after losing its repository worker-slot lease.",
+      );
     }
     await bound.transcripts.append(
       {
@@ -3728,7 +3768,7 @@ export function createWorkflowCoordinator(
           if (findRunningWorkerForTicket(ticket.number)) return false;
           const cooled = implementationRecoveryCooldown.get(ticket.number);
           if (cooled === undefined) return true;
-          if (now - cooled >= IMPLEMENTATION_RECOVERY_COOLDOWN_MS) {
+          if (now - cooled.sinceMs >= IMPLEMENTATION_RECOVERY_COOLDOWN_MS) {
             implementationRecoveryCooldown.delete(ticket.number);
             return true;
           }
@@ -5145,6 +5185,14 @@ export function createWorkflowCoordinator(
       return;
     }
 
+    if (event.type === "worker-error") {
+      worker.lastError = event.message;
+      if (worker.status === "running") {
+        worker.progress = `error: ${event.message}`;
+      }
+      return;
+    }
+
     if (event.type === "progress") {
       // Progress only mutates the addressed running worker (never worker B via A).
       if (worker.status === "running") {
@@ -5245,12 +5293,15 @@ export function createWorkflowCoordinator(
     worker.status = "compatibility-recovery";
     activeImplementationWorkers.delete(worker.workerId);
     // Cooldown so /matt-auto run does not immediately re-launch the same ticket.
-    implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+    const recoveryReason =
+      worker.lastError ??
+      "Implementation worker process exited without a Stage result on the Worker protocol.";
+    rememberImplementationRecovery(worker.ticketNumber, recoveryReason);
     await bound.transcripts.append(transcriptKey, {
       type: "compatibility-recovery",
-      reason:
-        "Implementation worker process exited without a Stage result on the Worker protocol.",
+      reason: recoveryReason,
       code: event.code,
+      ...(worker.lastError ? { workerError: worker.lastError } : {}),
     });
   }
 
@@ -5277,6 +5328,11 @@ export function createWorkflowCoordinator(
         worker.turnCount = (worker.turnCount ?? 0) + 1;
         worker.lastTurnStartedAtMs = event.timestampMs;
       }
+      return;
+    }
+
+    if (event.type === "worker-error") {
+      worker.progress = `error: ${event.message}`;
       return;
     }
 
@@ -8713,7 +8769,10 @@ export function createWorkflowCoordinator(
       worker.status = "aborted";
       activeImplementationWorkers.delete(worker.workerId);
       // Cooldown so auto-advance does not immediately re-pick a still-blocked ticket.
-      implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+      rememberImplementationRecovery(
+        worker.ticketNumber,
+        "Worker aborted because the ticket became blocked again.",
+      );
       await bound.transcripts.append(
         {
           workflowId: worker.workflowId,
@@ -8789,7 +8848,10 @@ export function createWorkflowCoordinator(
       activeImplementationWorkers.delete(worker.workerId);
       if (options.setCooldown) {
         // Prevent the pipeline from immediately re-selecting the same ticket.
-        implementationRecoveryCooldown.set(worker.ticketNumber, Date.now());
+        rememberImplementationRecovery(
+          worker.ticketNumber,
+          "Worker aborted by pipeline pause or run termination.",
+        );
       }
       await bound.transcripts.append(
         {
@@ -9599,6 +9661,10 @@ export function createWorkflowCoordinator(
     if (completedWorkerRuns.length > 0) {
       state.completedWorkerRuns = completedWorkerRuns;
     }
+    const implementationRecovery = getImplementationRecoveryStates();
+    if (implementationRecovery.length > 0) {
+      state.implementationRecovery = implementationRecovery;
+    }
     if (typeof pipelineRunStartedAtMs === "number") {
       state.runStartedAtMs = pipelineRunStartedAtMs;
       const endMs =
@@ -9814,6 +9880,28 @@ export function createWorkflowCoordinator(
     await bound.preferences.clearRootWorkerProfile();
   }
 
+  async function setActiveWorkflowWorkerProfile(
+    profile: WorkerProfile,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    await assertValidWorkerProfile(profile);
+    const active = await loadActiveWorkflow(bound, { force: true });
+    if (!active) {
+      throw new Error(
+        "No Active workflow on this Target branch. Configure the global default or Workflow-root override instead.",
+      );
+    }
+    const manifest = manifestFromActive(active);
+    manifest.workerProfile = {
+      provider: profile.provider,
+      modelId: profile.modelId,
+      thinkingLevel: profile.thinkingLevel,
+    };
+    await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    // Drop TTL so the next resolve reads the rewritten snapshot immediately.
+    workflowHomeRouteTtl = undefined;
+  }
+
   async function getEffectiveWorkerConcurrency(): Promise<number> {
     const bound = await requireScoped();
     const root = await bound.preferences.getRootWorkerConcurrency();
@@ -9884,6 +9972,7 @@ export function createWorkflowCoordinator(
     getRootWorkerProfile,
     setGlobalWorkerProfile,
     setRootWorkerProfile,
+    setActiveWorkflowWorkerProfile,
     clearRootWorkerProfile,
     getEffectiveWorkerConcurrency,
     getGlobalWorkerConcurrency,
@@ -9896,6 +9985,7 @@ export function createWorkflowCoordinator(
     thinkingLevelsFor,
     getPanelState,
     getCompletedWorkerTelemetry,
+    getImplementationRecoveryStates,
     getPipelineRunElapsedMs,
     confirmDisposition,
     abortWorkers,

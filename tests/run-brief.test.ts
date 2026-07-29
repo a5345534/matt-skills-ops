@@ -187,6 +187,28 @@ describe("buildRunBriefViewModel", () => {
     expect(brief.lines.join("\n")).not.toMatch(/\[x\]|click|button/i);
   });
 
+  it("shows Implementation recovery cooldown with observed reason", () => {
+    const brief = buildRunBriefViewModel(
+      basePanel({
+        implementationRecovery: [
+          {
+            ticketNumber: 44,
+            sinceMs: Date.parse("2026-07-29T02:05:00.000Z"),
+            untilMs: Date.parse("2026-07-29T02:35:00.000Z"),
+            remainingMs: 20 * 60_000,
+            reason: "Codex error: The usage limit has been reached",
+          },
+        ],
+      }),
+    );
+    const recovery = brief.sections.find((section) => section.id === "recovery");
+    expect(recovery?.title).toBe("Implementation recovery");
+    expect(recovery?.lines.join("\n")).toContain("#44: cooling");
+    expect(recovery?.lines.join("\n")).toContain(
+      "Codex error: The usage limit has been reached",
+    );
+  });
+
   it("shows legacy transcript turns without inventing runtime", () => {
     const brief = buildRunBriefViewModel(
       basePanel({

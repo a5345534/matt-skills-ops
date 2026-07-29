@@ -8,6 +8,7 @@ import {
   buildMainMenuItems,
   concurrencyWarningMessage,
   confirmConcurrencyWarning,
+  formatImplementationRecoveryLines,
   formatResolvedWorkerConcurrencyLine,
   formatTicketProgressLines,
   needsConcurrencyWarning,
@@ -627,6 +628,27 @@ describe("presentWorkerConcurrencyMenu", () => {
     expect(setSpy).not.toHaveBeenCalled();
     expect(coordinator.store.global).toBe(2);
     expect(notifies.some((n) => n.type === "error")).toBe(true);
+  });
+});
+
+describe("formatImplementationRecoveryLines", () => {
+  it("renders cooldown tickets with remaining minutes and reason", () => {
+    const nowMs = Date.parse("2026-07-29T02:10:00.000Z");
+    const lines = formatImplementationRecoveryLines(
+      [
+        {
+          ticketNumber: 44,
+          sinceMs: nowMs - 5 * 60_000,
+          untilMs: nowMs + 25 * 60_000,
+          remainingMs: 25 * 60_000,
+          reason: "Codex error: The usage limit has been reached",
+        },
+      ],
+      nowMs,
+    );
+    expect(lines).toEqual([
+      "#44: cooling ~25m (until 02:35Z) — Codex error: The usage limit has been reached",
+    ]);
   });
 });
 

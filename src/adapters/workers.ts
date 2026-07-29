@@ -105,6 +105,23 @@ function parseWorkerProtocolEvent(
   if (obj.type === "message_end") {
     const message = obj.message as Record<string, unknown> | undefined;
     if (message?.role === "assistant") {
+      const stopReason =
+        typeof message.stopReason === "string" ? message.stopReason : undefined;
+      const errorMessage =
+        typeof message.errorMessage === "string"
+          ? message.errorMessage.trim()
+          : "";
+      if (stopReason === "error" && errorMessage.length > 0) {
+        return {
+          type: "worker-error",
+          workerId,
+          message:
+            errorMessage.length > 400
+              ? `${errorMessage.slice(0, 397)}...`
+              : errorMessage,
+        };
+      }
+
       const content = message.content;
       let text = "";
       if (typeof content === "string") {

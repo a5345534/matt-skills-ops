@@ -32,7 +32,7 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 
 ## Manual Workflow dashboard
 
-When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** only to run a selected Next action; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
+When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, settings, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** to run a selected Next action or open Configure Worker profile / concurrency; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
 
 Press `r` for **Refresh**. Opening the dashboard, Refresh, and an action settlement take a full coordinator snapshot; normal browsing and periodic updates read only local worker/process/turn telemetry. After an action settles, the dashboard refreshes in place and keeps the relevant selected ticket or Worker attempt when it remains available.
 
@@ -88,6 +88,8 @@ Configure from the Matt Auto menu (**Configure Worker profile…**):
 Model choices come from Pi’s authenticated available-model catalog via a searchable selector. Thinking levels are limited to those the selected model supports. Configuring a Worker profile never changes the Workflow home currently selected model.
 
 Precedence: workflow snapshot (later tickets) → Workflow-root override → global default.
+
+Changing the global default or Workflow-root override does **not** move an already-published Active workflow off its snapshot. Use **Override Active workflow Worker profile…** in the Worker profile menu to rewrite that workflow’s manifest snapshot for later Implementation workers.
 
 Example preferences:
 
