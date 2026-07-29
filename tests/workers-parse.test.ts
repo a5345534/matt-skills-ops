@@ -28,6 +28,28 @@ describe("worker stage-result protocol JSON", () => {
     });
   });
 
+  it("maps assistant stopReason=error to worker-error", () => {
+    const event = __workersTestables.parseWorkerProtocolEvent(
+      "implement-38-44-r2",
+      JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage:
+            'OpenAI API error (403): 403 "Your newly created team doesn\'t have any credits"',
+        },
+      }),
+    );
+    expect(event).toEqual({
+      type: "worker-error",
+      workerId: "implement-38-44-r2",
+      message:
+        'OpenAI API error (403): 403 "Your newly created team doesn\'t have any credits"',
+    });
+  });
+
   it("parses completed stage-result as top-level JSON", () => {
     const line = JSON.stringify({
       type: "stage-result",

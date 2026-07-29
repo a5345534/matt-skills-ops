@@ -59,6 +59,7 @@ function log(
 import type {
   AvailableModel,
   ImplementationDispositionDecision,
+  ImplementationRecoveryState,
   NextAction,
   PreflightCheck,
   PreflightResult,
@@ -97,6 +98,20 @@ import {
  */
 function isReworkNextAction(action: NextAction): boolean {
   return action.id.startsWith(REWORK_TICKET_ACTION_PREFIX);
+}
+
+/** Human-readable Implementation recovery cooldown lines for pipeline stop/UI. */
+export function formatImplementationRecoveryLines(
+  recovery: readonly ImplementationRecoveryState[],
+  nowMs: number = Date.now(),
+): string[] {
+  return recovery.map((entry) => {
+    const remainingMs = Math.max(0, entry.untilMs - nowMs);
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const until = new Date(entry.untilMs).toISOString().slice(11, 16) + "Z";
+    const reason = entry.reason ? ` — ${entry.reason}` : "";
+    return `#${entry.ticketNumber}: cooling ~${minutes}m (until ${until})${reason}`;
+  });
 }
 
 /**
@@ -1931,19 +1946,39 @@ export async function runPostGrillPipeline(
             }
             continue;
           }
+          const recovery = coordinator.getImplementationRecoveryStates();
+          const recoveryLines =
+            formatImplementationRecoveryLines(recovery);
           ui.notify(
             [
               "Pipeline stopped: only Rework actions remain, and Rework is not auto-advanced.",
-              "Closed integrated tickets stay closed so Auto-Close cannot loop into Rework.",
-              "Use /matt-auto next to rework a ticket deliberately, or wait for the ready frontier.",
+              ...(recoveryLines.length > 0
+                ? [
+                    "Ready tickets are in Implementation recovery cooldown (auto Implement withheld):",
+                    ...recoveryLines.map((line) => `• ${line}`),
+                    "Wait for cooldown, /reload to clear session cooldown, or fix the worker model/provider error and re-run.",
+                  ]
+                : [
+                    "Closed integrated tickets stay closed so Auto-Close cannot loop into Rework.",
+                    "Use /matt-auto next to rework a ticket deliberately, or wait for the ready frontier.",
+                  ]),
               ...actionable.map((a) => `• ${a.label} — ${a.description}`),
             ].join("\n"),
-            "info",
+            recoveryLines.length > 0 ? "warning" : "info",
           );
           log("info", "pipeline:stop", {
-            reason: "rework-not-auto",
+            reason:
+              recoveryLines.length > 0
+                ? "implementation-recovery-cooldown"
+                : "rework-not-auto",
             step,
             nextActions: nextActions.map((a) => a.id),
+            implementationRecovery: recovery.map((entry) => ({
+              ticketNumber: entry.ticketNumber,
+              remainingMs: entry.remainingMs,
+              untilMs: entry.untilMs,
+              ...(entry.reason ? { reason: entry.reason } : {}),
+            })),
           });
           return;
         }

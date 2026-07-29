@@ -3236,6 +3236,63 @@ describe("Workflow coordinator single Implementation worker path", () => {
     expect(actions.map((a) => a.id)).not.toContain(implementTicketActionId(43));
     // Sibling ready tickets remain available.
     expect(actions.map((a) => a.id)).toContain(implementTicketActionId(44));
+
+    const recovery = coordinator.getImplementationRecoveryStates();
+    expect(recovery).toEqual([
+      expect.objectContaining({
+        ticketNumber: 43,
+        reason:
+          "Implementation worker process exited without a Stage result on the Worker protocol.",
+      }),
+    ]);
+    expect(recovery[0]!.remainingMs).toBeGreaterThan(0);
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.implementationRecovery).toEqual([
+      expect.objectContaining({ ticketNumber: 43 }),
+    ]);
+  });
+
+  it("records provider errors into Implementation recovery cooldown", async () => {
+    const { coordinator, workers } = ticketsPublishedFixture();
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "worker-error",
+      workerId: "implement-42-43-r1",
+      message: "Codex error: The usage limit has been reached",
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    const recovery = coordinator.getImplementationRecoveryStates();
+    expect(recovery).toEqual([
+      expect.objectContaining({
+        ticketNumber: 43,
+        reason: "Codex error: The usage limit has been reached",
+      }),
+    ]);
+
+    const transcript = await coordinator.getWorkerTranscript({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(transcript).toContainEqual({
+      type: "worker-error",
+      workerId: "implement-42-43-r1",
+      message: "Codex error: The usage limit has been reached",
+    });
+    expect(transcript).toContainEqual(
+      expect.objectContaining({
+        type: "compatibility-recovery",
+        reason: "Codex error: The usage limit has been reached",
+        workerError: "Codex error: The usage limit has been reached",
+      }),
+    );
   });
 
   it("infers completion when worker exits 0 with local commits but no Stage result JSON", async () => {

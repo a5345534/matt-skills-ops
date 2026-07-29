@@ -290,6 +290,11 @@ export type WorkflowPanelState = {
    * contribute only directly observed turn counts and omit runtime.
    */
   completedWorkerRuns?: readonly CompletedWorkerTelemetry[];
+  /**
+   * Ready tickets temporarily withheld from Implement after Compatibility recovery.
+   * Session-local; cleared on successful relaunch or after the cooldown elapses.
+   */
+  implementationRecovery?: readonly ImplementationRecoveryState[];
   ticketProgress?: TicketProgressSummary;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */
   integration?: {
@@ -367,6 +372,19 @@ export type RunTerminationResult = {
   runTerminated: true;
 };
 
+/** One ticket withheld from auto Implement after a failed worker attempt. */
+export type ImplementationRecoveryState = {
+  ticketNumber: number;
+  /** Epoch ms when recovery cooldown began. */
+  sinceMs: number;
+  /** Epoch ms when Implement may be offered again. */
+  untilMs: number;
+  /** Remaining cooldown in ms at the time of observation (>= 0). */
+  remainingMs: number;
+  /** Observed failure reason when known (provider error, missing Stage result, …). */
+  reason?: string;
+};
+
 /**
  * Exact telemetry captured when a session-owned worker reports successful completion.
  * It is persisted locally in the attempt transcript and restored after reload.
@@ -400,6 +418,12 @@ export type WorkerProtocolEvent =
     }
   | {
       type: "progress";
+      workerId: string;
+      message: string;
+    }
+  | {
+      /** Provider/model failure observed on the worker JSON stream (usage limit, 403, …). */
+      type: "worker-error";
       workerId: string;
       message: string;
     }
@@ -821,6 +845,11 @@ export type WorkflowCoordinator = {
   getCompletedWorkerTelemetry(
     workflowId: number,
   ): readonly CompletedWorkerTelemetry[];
+  /**
+   * Session-local Implementation recovery cooldowns that withhold ready tickets
+   * from auto Implement after Compatibility recovery.
+   */
+  getImplementationRecoveryStates(): readonly ImplementationRecoveryState[];
   /** Wall-clock elapsed time for the current `/matt-auto run`, when known. */
   getPipelineRunElapsedMs(): number | undefined;
   /**
