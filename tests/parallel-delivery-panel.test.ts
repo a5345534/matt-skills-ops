@@ -214,6 +214,11 @@ function createWorkspace(home: string): WorkspacePort {
       worktreePath: `/workspaces/${home}/integration`,
     }),
     mergeIntoIntegration: async () => ({ ok: true }),
+    refreshIntegrationFromTarget: async () => ({
+      ok: true as const,
+      targetSha: "a".repeat(40),
+      mergeCommitSha: "refresh-sha-1",
+    }),
     listWorkflowBranches: async () => [],
     cleanupWorkflowWorkspaces: async () => ({
       removedWorktrees: [],
