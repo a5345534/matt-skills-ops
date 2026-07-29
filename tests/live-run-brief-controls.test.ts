@@ -37,6 +37,29 @@ describe("live wait helpers", () => {
     expect(isSettled(panel({ pipelinePaused: true }))).toBe(false);
   });
 
+  it("holdUntilRunEnd keeps the surface open across idle ticket gaps", () => {
+    // No runners / needs-disposition would settle normally, but not while holding.
+    expect(isSettled(panel(), { holdUntilRunEnd: true })).toBe(false);
+    expect(
+      isSettled(
+        panel({
+          workers: [
+            {
+              ticketNumber: 1,
+              attempt: 1,
+              status: "needs-disposition",
+              branchName: "b",
+            },
+          ],
+        }),
+        { holdUntilRunEnd: true },
+      ),
+    ).toBe(false);
+    expect(
+      isSettled(panel({ runTerminated: true }), { holdUntilRunEnd: true }),
+    ).toBe(true);
+  });
+
   it("offers Pause/Terminate while running and Resume when paused", () => {
     const running = controlItems(panel());
     expect(running.map((i) => i.value)).toEqual(["pause", "terminate"]);

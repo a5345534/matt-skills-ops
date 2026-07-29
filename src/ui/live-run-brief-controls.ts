@@ -56,9 +56,16 @@ export type LiveWaitTheme = {
 
 export type LiveWaitPanelSource = Pick<WorkflowCoordinator, "getPanelState">;
 
-function isSettled(panel: WorkflowPanelState | undefined): boolean {
+function isSettled(
+  panel: WorkflowPanelState | undefined,
+  options: { holdUntilRunEnd?: boolean } = {},
+): boolean {
   if (!panel) return true;
   if (panel.runTerminated) return true;
+  if (options.holdUntilRunEnd) {
+    // Stay open across ticket gaps, disposition, and Integration until the run ends.
+    return false;
+  }
   if (panel.pipelinePaused) return false;
   if (panel.workers.some((w) => w.status === "running")) return false;
   if (panel.integration?.status === "conflict-resolution") return false;
@@ -131,6 +138,13 @@ export async function presentLiveWaitControls(
     pollIntervalMs?: number;
     overlay?: boolean;
     /**
+     * Keep the surface open across ticket transitions / disposition / Integration
+     * until the run ends (runTerminated) or shouldFinish() is true.
+     */
+    holdUntilRunEnd?: boolean;
+    /** When holdUntilRunEnd, finish as soon as this returns true (pipeline done). */
+    shouldFinish?: () => boolean;
+    /**
      * Called every poll while the live surface is open (e.g. ghostty title
      * braille). Outer wait loops cannot tick during blocking `ui.custom()`.
      */
@@ -138,6 +152,7 @@ export async function presentLiveWaitControls(
   } = {},
 ): Promise<LiveWaitControlChoice> {
   const pollIntervalMs = options.pollIntervalMs ?? 500;
+  const holdUntilRunEnd = options.holdUntilRunEnd === true;
 
   const result = await ui.custom<LiveWaitControlChoice>(
     (tui, theme, _kb, done) => {
@@ -176,7 +191,9 @@ export async function presentLiveWaitControls(
         theme.fg(
           "accent",
           theme.bold(
-            `Matt Auto · Workflow #${panel.workflowId} · live (options + refresh)`,
+            holdUntilRunEnd
+              ? `Matt Auto · Workflow #${panel.workflowId} · live until run ends`
+              : `Matt Auto · Workflow #${panel.workflowId} · live (options + refresh)`,
           ),
         ),
         1,
@@ -185,7 +202,9 @@ export async function presentLiveWaitControls(
       const helpText = (paused: boolean) =>
         paused
           ? "Paused · Esc returns to chat · resume later: /matt-auto resume"
-          : "Brief auto-refreshes · ↑↓ / Enter pick control · Esc stays here";
+          : holdUntilRunEnd
+            ? "Brief stays up for the whole run · 0.5s refresh · ↑↓ / Enter controls"
+            : "Brief auto-refreshes · ↑↓ / Enter pick control · Esc stays here";
       let help = new Text(
         theme.fg("dim", helpText(panel.pipelinePaused)),
         1,
@@ -200,6 +219,10 @@ export async function presentLiveWaitControls(
       const refresh = async () => {
         if (finished) return;
         try {
+          if (options.shouldFinish?.()) {
+            finish({ action: "settled" });
+            return;
+          }
           const next = await coordinator.getPanelState({ mode: "local" });
           if (!next) {
             finish({ action: "settled" });
@@ -214,7 +237,10 @@ export async function presentLiveWaitControls(
             finish({ action: "settled" });
             return;
           }
-          if (isSettled(panel) && !panel.pipelinePaused) {
+          if (
+            isSettled(panel, { holdUntilRunEnd }) &&
+            !panel.pipelinePaused
+          ) {
             finish({ action: "settled" });
             return;
           }

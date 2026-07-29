@@ -195,6 +195,11 @@ export type WaitForPipelineWorkersOptions = {
    * Set false only for pure auto-poll (tests / headless).
    */
   offerRunningControls?: boolean;
+  /**
+   * When true, do not open `presentLiveWaitControls` — a parent persistent live
+   * surface already owns the brief for the whole run (still polls at pollIntervalMs).
+   */
+  skipLiveSurface?: boolean;
 };
 
 /**
@@ -830,6 +835,7 @@ export async function waitForPipelineWorkers(
   // Default ON: Pause/Terminate must be selectable options. Shortcuts alone
   // failed in real terminals (Ctrl+Alt often never reaches the editor).
   const offerRunningControls = options.offerRunningControls !== false;
+  const skipLiveSurface = options.skipLiveSurface === true;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
   // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
@@ -839,7 +845,8 @@ export async function waitForPipelineWorkers(
   const initialPaused = initialPanel?.pipelinePaused === true;
   const initialP1 = hasP1RunLoopWork(initialPanel);
 
-  const liveWaitAvailable = canPresentLiveWaitControls(ui);
+  const liveWaitAvailable =
+    !skipLiveSurface && canPresentLiveWaitControls(ui);
 
   // Already settled (no live runners, or P1 work ready) and not paused — do not block.
   if ((initialRunning.length === 0 || initialP1) && !initialPaused) {
@@ -1983,6 +1990,69 @@ export async function runPostGrillPipeline(
       }
     | undefined;
 
+  // Persistent live brief for the whole /matt-auto run: stays open across ticket
+  // transitions (disposition / integration) with 0.5s local panel polls until
+  // the run ends. Pipeline work continues in parallel; per-stage waits skip a
+  // second custom() surface so the brief does not disappear between issues.
+  let stopPersistentLive = false;
+  let persistentLiveOpen = false;
+  const persistentLiveCapable = canPresentLiveWaitControls(ui);
+  const persistentLivePromise: Promise<unknown> = persistentLiveCapable
+    ? (async () => {
+        const activity = startGhosttyActivity(ui, {
+          cwd: process.cwd(),
+          detail: "pipeline",
+        });
+        try {
+          // Create-spec may run before any Active workflow panel exists.
+          let panel: WorkflowPanelState | undefined;
+          for (let i = 0; i < 120 && !stopPersistentLive; i += 1) {
+            panel = await coordinator.getPanelState({ mode: "local" });
+            if (panel) break;
+            await sleep(250);
+          }
+          if (!panel || stopPersistentLive) return;
+          persistentLiveOpen = true;
+          const live = await presentLiveWaitControls(ui, coordinator, panel, {
+            pollIntervalMs: 500,
+            holdUntilRunEnd: true,
+            shouldFinish: () =>
+              stopPersistentLive || coordinator.isRunTerminated(),
+            onTick: (p) => {
+              activity.tick(activityDetailFromPanel(p));
+            },
+          });
+          // Operator used live controls — apply confirmations after custom() closes.
+          const latest =
+            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+          if (live.action === "pause") {
+            await applyConfirmedPause(coordinator, ui, latest);
+          } else if (live.action === "terminate") {
+            const result = await applyConfirmedTerminate(
+              coordinator,
+              ui,
+              latest,
+            );
+            if (result) {
+              ui.notify(formatTerminateNotify(result), "warning");
+            }
+          } else if (live.action === "resume") {
+            await applyConfirmedResume(coordinator, ui, latest);
+          }
+        } finally {
+          persistentLiveOpen = false;
+          activity.stop();
+        }
+      })().catch((error) => {
+        persistentLiveOpen = false;
+        log("warn", "pipeline:persistent-live-failed", {
+          reason: errorMessage(error),
+        });
+      })
+    : Promise.resolve();
+  const skipPersistentLiveSurface = () =>
+    persistentLiveCapable && persistentLiveOpen;
+
   try {
   for (let step = 0; step < 50; step += 1) {
     // Out-of-band stop between stages (shortcuts + run-control file).
@@ -2048,7 +2118,9 @@ export async function runPostGrillPipeline(
 
     // Pipeline pause keeps the brief visible until Resume or Terminate.
     if (coordinator.isPipelinePaused()) {
-      const waitResult = await waitForPipelineWorkers(coordinator, ui);
+      const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        skipLiveSurface: skipPersistentLiveSurface(),
+      });
       if (isWaitStopResult(waitResult)) {
         log("info", "pipeline:stop", {
           reason:
@@ -2124,7 +2196,9 @@ export async function runPostGrillPipeline(
           integration: panel?.integration,
           ...(diagnostic ? { nextActionsDiagnostic: diagnostic } : {}),
         });
-        const waitResult = await waitForPipelineWorkers(coordinator, ui);
+        const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+          skipLiveSurface: skipPersistentLiveSurface(),
+        });
         if (isWaitStopResult(waitResult)) {
           log("info", "pipeline:stop", {
             reason:
@@ -2200,7 +2274,9 @@ export async function runPostGrillPipeline(
         };
         return;
       }
-      const waitResult = await waitForPipelineWorkers(coordinator, ui);
+      const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        skipLiveSurface: skipPersistentLiveSurface(),
+      });
       if (isWaitStopResult(waitResult)) {
         log("info", "pipeline:stop", {
           reason:
@@ -2255,7 +2331,9 @@ export async function runPostGrillPipeline(
                 status: w.status,
               })),
             });
-            const waitResult = await waitForPipelineWorkers(coordinator, ui);
+            const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        skipLiveSurface: skipPersistentLiveSurface(),
+      });
             if (isWaitStopResult(waitResult)) {
               log("info", "pipeline:stop", {
                 reason:
@@ -2437,6 +2515,12 @@ export async function runPostGrillPipeline(
     warning: true,
   };
   } finally {
+    stopPersistentLive = true;
+    try {
+      await persistentLivePromise;
+    } catch {
+      // Live surface failures must not mask completion signaling.
+    }
     if (endSignal) {
       signalMattAutoComplete(ui, {
         cwd: process.cwd(),

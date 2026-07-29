@@ -36,7 +36,7 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 
 On the workflow dashboard, use arrow keys to browse workflow, ticket, worker, preflight, settings, and action rows; **Enter** runs a Next action or opens Configure Worker profile / concurrency. Press `r` for a full refresh. `Esc` returns to the local home (or to chat from home). `/matt-auto next` still opens a Next-actions-focused surface and may read GitHub immediately.
 
-`/matt-auto run` does **not** open this manual dashboard. Its live run brief remains the primary wait surface, with its own Pause / Resume / Terminate controls; Matt Auto does not stack a dashboard or duplicate compact workflow widget while that auto-run surface owns the wait.
+`/matt-auto run` does **not** open the manual dashboard. Its **live run brief stays open for the whole run** (including ticket transitions, disposition, and Integration), refreshing about every **0.5s** from local panel state, with Pause / Resume / Terminate controls. The brief closes when the run ends (workflow-complete, terminate, idle, or failure). Matt Auto does not stack the manual dashboard on top of that surface.
 
 ## Develop
 
