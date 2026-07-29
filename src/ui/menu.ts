@@ -1746,7 +1746,10 @@ const HOME_SETTINGS_ITEM = "Settings…";
 const HOME_START_NEW_ITEM = "Start new workflow";
 const HOME_UNFINISHED_HEADER = "--- Unfinished (local) ---";
 const HOME_EMPTY_ITEM = "No local unfinished workflows";
-const WORKFLOW_OPEN_ITEM = "Open this workflow";
+/** Bind sticky local pointer and start /matt-auto run (live brief), not the dashboard. */
+const WORKFLOW_OPEN_ITEM = "Open this workflow (run)";
+/** Optional full Workflow dashboard browser (manual Next actions). */
+const WORKFLOW_DASHBOARD_ITEM = "Open Workflow dashboard…";
 const WORKFLOW_TAKE_OVER_THIS_ITEM = "Take over this workflow…";
 const WORKFLOW_SWITCH_ANOTHER_ITEM =
   "Switch / take over another Active workflow…";
@@ -1825,6 +1828,7 @@ async function presentSelectedWorkflowMenu(
   for (;;) {
     const selected = await ui.select(`Workflow #${workflowId}`, [
       WORKFLOW_OPEN_ITEM,
+      WORKFLOW_DASHBOARD_ITEM,
       WORKFLOW_TAKE_OVER_THIS_ITEM,
       WORKFLOW_SWITCH_ANOTHER_ITEM,
       BACK_ITEM,
@@ -1845,9 +1849,21 @@ async function presentSelectedWorkflowMenu(
         continue;
       }
       ui.notify(
-        `This home took over Workflow #${workflowId}. Opening workflow surface…`,
+        `This home took over Workflow #${workflowId}. Starting delivery (live brief)…`,
         "info",
       );
+      // Delivery path = /matt-auto run (live brief), not the manual dashboard.
+      await runPostGrillPipeline(coordinator, ui, pipelineOptions);
+      return;
+    }
+
+    if (selected === WORKFLOW_DASHBOARD_ITEM) {
+      try {
+        await coordinator.selectLocalUnfinishedWorkflow(workflowId);
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+        return;
+      }
       if (await presentDashboardIfAvailable(coordinator, ui)) {
         return;
       }
@@ -1862,11 +1878,12 @@ async function presentSelectedWorkflowMenu(
       ui.notify(errorMessage(error), "error");
       return;
     }
-    // Drill-in: full workflow surface may read GitHub.
-    if (await presentDashboardIfAvailable(coordinator, ui)) {
-      return;
-    }
-    await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
+    // Open = continue delivery with the same surface as /matt-auto run.
+    ui.notify(
+      `Workflow #${workflowId}: starting delivery (live run brief)…`,
+      "info",
+    );
+    await runPostGrillPipeline(coordinator, ui, pipelineOptions);
     return;
   }
 }
@@ -1923,13 +1940,11 @@ export async function presentTakeOverWorkflowMenu(
     return;
   }
   ui.notify(
-    `This home is bound to Workflow #${workflowId}. Opening workflow surface…`,
+    `This home is bound to Workflow #${workflowId}. Starting delivery (live brief)…`,
     "info",
   );
-  if (await presentDashboardIfAvailable(coordinator, ui)) {
-    return;
-  }
-  await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
+  // Same path as /matt-auto run — live brief, not Workflow dashboard.
+  await runPostGrillPipeline(coordinator, ui, pipelineOptions);
 }
 
 async function presentHomeSettingsMenu(

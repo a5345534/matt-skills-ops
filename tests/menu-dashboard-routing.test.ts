@@ -174,55 +174,57 @@ function dismiss(component: WorkflowDashboardComponent): void {
 }
 
 describe("manual menu dashboard routing", () => {
-  it("opens a local-only home first, then drills into the GitHub dashboard", async () => {
+  it("opens a local-only home first; Open runs delivery (not the dashboard)", async () => {
     const coordinator = coordinatorHarness();
+    const beginPipelineRun = vi.fn();
+    const runCoordinator = {
+      ...coordinator,
+      beginPipelineRun,
+      isRunTerminated: vi.fn(() => false),
+      isPipelinePaused: vi.fn(() => false),
+      nextActions: vi.fn(async () => []),
+      getPanelState: vi.fn(async () => undefined),
+    };
     const mainHarness = customHarness();
-    // 1) Home select unfinished · 2) Open this workflow · 3) after Esc, cancel home
+    // 1) Home select unfinished · 2) Open this workflow (run) · pipeline idles
     mainHarness.ui.selects
       .mockResolvedValueOnce("Workflow #38 · bound [#38]")
-      .mockResolvedValueOnce("Open this workflow")
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce("Open this workflow (run)");
 
-    const mainOpening = presentMainMenu(
-      coordinator as unknown as WorkflowCoordinator,
+    await presentMainMenu(
+      runCoordinator as unknown as WorkflowCoordinator,
       mainHarness.ui,
     );
 
-    await vi.waitFor(() => {
-      expect(mainHarness.ui.selects).toHaveBeenCalledWith(
-        "Matt Auto",
-        expect.arrayContaining([
-          "Settings…",
-          "--- Unfinished (local) ---",
-          "Workflow #38 · bound [#38]",
-        ]),
-      );
-      expect(mainHarness.ui.selects).toHaveBeenCalledWith(
-        "Workflow #38",
-        expect.arrayContaining([
-          "Open this workflow",
-          "Take over this workflow…",
-          "Switch / take over another Active workflow…",
-        ]),
-      );
-    });
-    // Home lists local unfinished before any GitHub-backed snapshot path.
-    expect(coordinator.listLocalUnfinishedWorkflows).toHaveBeenCalled();
-    expect(coordinator.selectLocalUnfinishedWorkflow).toHaveBeenCalledWith(38);
-    expect(
-      coordinator.listLocalUnfinishedWorkflows.mock.invocationCallOrder[0],
-    ).toBeLessThan(coordinator.preflight.mock.invocationCallOrder[0] ?? Infinity);
-
-    const main = await capturedComponent(mainHarness);
-    expect(main.render(120).join("\n")).toContain(
-      "Matt Auto · Workflow dashboard",
+    expect(mainHarness.ui.selects).toHaveBeenCalledWith(
+      "Matt Auto",
+      expect.arrayContaining([
+        "Settings…",
+        "--- Unfinished (local) ---",
+        "Workflow #38 · bound [#38]",
+      ]),
     );
-    dismiss(main);
-    await expect(mainOpening).resolves.toBeUndefined();
+    expect(mainHarness.ui.selects).toHaveBeenCalledWith(
+      "Workflow #38",
+      expect.arrayContaining([
+        "Open this workflow (run)",
+        "Open Workflow dashboard…",
+        "Take over this workflow…",
+        "Switch / take over another Active workflow…",
+      ]),
+    );
+    // Home lists local unfinished before any GitHub-backed snapshot path.
+    expect(runCoordinator.listLocalUnfinishedWorkflows).toHaveBeenCalled();
+    expect(runCoordinator.selectLocalUnfinishedWorkflow).toHaveBeenCalledWith(38);
+    // Open continues as /matt-auto run — never opens the Workflow dashboard custom surface.
+    expect(beginPipelineRun).toHaveBeenCalled();
+    expect(mainHarness.component()).toBeUndefined();
 
+    // /matt-auto next still uses the Next-actions dashboard scope.
+    const nextCoordinator = coordinatorHarness();
     const nextHarness = customHarness();
     const nextOpening = presentNextActions(
-      coordinator as unknown as WorkflowCoordinator,
+      nextCoordinator as unknown as WorkflowCoordinator,
       nextHarness.ui,
     );
     const next = await capturedComponent(nextHarness);
@@ -235,6 +237,28 @@ describe("manual menu dashboard routing", () => {
     expect(nextHarness.ui.selects).not.toHaveBeenCalled();
     dismiss(next);
     await expect(nextOpening).resolves.toBeUndefined();
+  });
+
+  it("opens the Workflow dashboard only from the explicit dashboard menu item", async () => {
+    const coordinator = coordinatorHarness();
+    const mainHarness = customHarness();
+    mainHarness.ui.selects
+      .mockResolvedValueOnce("Workflow #38 · bound [#38]")
+      .mockResolvedValueOnce("Open Workflow dashboard…")
+      .mockResolvedValueOnce(undefined);
+
+    const mainOpening = presentMainMenu(
+      coordinator as unknown as WorkflowCoordinator,
+      mainHarness.ui,
+    );
+
+    const main = await capturedComponent(mainHarness);
+    expect(main.render(120).join("\n")).toContain(
+      "Matt Auto · Workflow dashboard",
+    );
+    dismiss(main);
+    await expect(mainOpening).resolves.toBeUndefined();
+    expect(coordinator.selectLocalUnfinishedWorkflow).toHaveBeenCalledWith(38);
   });
 
   it("retains blocking select menus when custom is absent or rejects", async () => {
