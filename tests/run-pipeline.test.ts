@@ -578,6 +578,8 @@ describe("runPostGrillPipeline fill slots then wait", () => {
         abortedWorkerCount: 0,
         affectedAttempts: [],
         pipelinePaused: true as const,
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
       }),
       resumePipeline: async () => ({ pipelinePaused: false as const }),
       terminateRun: async () => ({
@@ -587,6 +589,17 @@ describe("runPostGrillPipeline fill slots then wait", () => {
         discardedBranches: [],
         discardedWorktrees: [],
         runTerminated: true as const,
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
+      }),
+      emergencyStop: async () => ({
+        abortedWorkerCount: 0,
+        affectedAttempts: [],
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
+        releasedCoordinatorLease: false,
+        runTerminated: true as const,
+        lastStopReason: "emergency-stop" as const,
       }),
     } as unknown as WorkflowCoordinator;
     const ui: MattAutoUi = {

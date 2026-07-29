@@ -515,6 +515,12 @@ export type WorkflowPanelState = {
     baseBranch: string;
     headBranch: string;
   };
+  /**
+   * Observed parallel-delivery diagnostics for coordination-aware workflows.
+   * Populated only from current manifests, coordination refs, worker processes,
+   * CI facts, and persisted transcripts — never from inferred history.
+   */
+  parallelDelivery?: ParallelDeliveryPanelState;
   /** True when Pipeline pause is active for this coordinator session. */
   pipelinePaused: boolean;
   /** True after Run termination until a new pipeline run begins. */
@@ -527,9 +533,113 @@ export type WorkflowPanelState = {
   /** Epoch ms when the current pipeline run began. */
   runStartedAtMs?: number;
   /** Last operator stop control that affected the run loop. */
-  lastStopReason?: "pipeline-pause" | "run-termination";
+  lastStopReason?:
+    | "pipeline-pause"
+    | "run-termination"
+    | "emergency-stop";
   /** T1 stop-only vs T2 discard-unintegrated, when last stop was Run termination. */
   terminationMode?: RunTerminationMode;
+};
+
+/**
+ * Distilled waiting/delivery state for a coordination-aware workflow.
+ * Derived only from currently observed queue, lease, and PR facts.
+ */
+export type ParallelDeliveryWaitingState =
+  | "queue-waiting"
+  | "ci-pending"
+  | "target-refresh"
+  | "retryable-failure"
+  | "lost-lease"
+  | "merge-ready"
+  | "merged"
+  | "not-in-delivery";
+
+/** Observed Workflow coordinator lease health for the bound workflow. */
+export type CoordinatorLeaseHealthObservation =
+  | {
+      status: "held";
+      generation: number;
+      holderId: string;
+      expiresAt: string;
+      /** True when this Workflow home holds the live lease. */
+      heldByUs: boolean;
+    }
+  | { status: "lost" }
+  | { status: "absent" }
+  | { status: "unavailable" };
+
+/** Observed Target-branch lease holder / phase for the canonical Target. */
+export type TargetBranchLeaseObservation = {
+  status: "held-by-us" | "held-by-other" | "absent" | "expired" | "lost";
+  holderId?: string;
+  workflowId?: number;
+  generation?: number;
+  expiresAt?: string;
+  /** Present only when this home is actively driving a known delivery phase. */
+  phase?: "refresh" | "validation" | "pr-update" | "merge";
+};
+
+/**
+ * Sibling Active workflow facts visible to the bound home.
+ * Delivery observations only — never grants cross-workflow action ownership.
+ */
+export type SiblingWorkflowSummary = {
+  workflowId: number;
+  title?: string;
+  queueState?: TargetBranchQueueState;
+  workflowPr?: { number: number; status: "open" | "merged" };
+  prHeadSha?: string;
+  validatedTargetSha?: string;
+  mergeReadyAt?: string;
+  /** Live repository worker slots currently held by this sibling. */
+  heldWorkerSlots: number;
+};
+
+/** One occupied repository-wide Implementation worker slot. */
+export type WorkerSlotAllocationEntry = {
+  slot: number;
+  workflowId: number;
+  ticketNumber?: number;
+  /** True when the bound workflow home holds this slot. */
+  ownedByBoundWorkflow: boolean;
+};
+
+/** Repository-wide worker-slot allocation observed from live leases + policy. */
+export type WorkerSlotAllocationSummary = {
+  capacity: number;
+  occupied: readonly WorkerSlotAllocationEntry[];
+  freeSlotCount: number;
+  boundWorkflowHeldCount: number;
+};
+
+/**
+ * Parallel-delivery panel DTO. All fields are optional observations; missing
+ * values mean "not currently observed", never invented history.
+ */
+export type ParallelDeliveryPanelState = {
+  /** Canonical repository + fully qualified Target ref for the bound workflow. */
+  target: CanonicalTargetIdentity;
+  /** Bound Workflow ID (same as panel.workflowId; repeated for delivery context). */
+  boundWorkflowId: number;
+  coordinatorLease: CoordinatorLeaseHealthObservation;
+  targetBranchLease?: TargetBranchLeaseObservation;
+  /** Observed queue candidate for the bound workflow. */
+  queueCandidate?: TargetBranchQueueCandidate;
+  /** Distilled waiting/delivery state for UI labels. */
+  waitingState: ParallelDeliveryWaitingState;
+  /** 1-based FIFO position among merge-ready candidates when applicable. */
+  queuePosition?: number;
+  /** Number of merge-ready candidates in the reconstructed Target-branch queue. */
+  queueLength?: number;
+  /** Exact PR head SHA from current freshness facts, when observed. */
+  prHeadSha?: string;
+  /** Target SHA used for the most recent refresh/validation, when observed. */
+  validatedTargetSha?: string;
+  /** Sibling Active workflows on the same Target (facts only). */
+  siblings: readonly SiblingWorkflowSummary[];
+  /** Repository-wide Implementation worker-slot allocation, when observed. */
+  workerSlots?: WorkerSlotAllocationSummary;
 };
 
 /** Run termination mode: T1 stop-only vs T2 discard unintegrated attempts. */
@@ -548,6 +658,10 @@ export type PipelinePauseResult = {
   abortedWorkerCount: number;
   affectedAttempts: readonly PipelineAffectedAttempt[];
   pipelinePaused: true;
+  /** True when this home released its held Target-branch lease during Pause. */
+  releasedTargetBranchLease: boolean;
+  /** Number of repository worker-slot leases released for the bound workflow. */
+  releasedWorkerSlotCount: number;
 };
 
 /** Outcome of resuming after Pipeline pause. */
@@ -563,6 +677,25 @@ export type RunTerminationResult = {
   discardedBranches: readonly string[];
   discardedWorktrees: readonly string[];
   runTerminated: true;
+  /** True when this home released its held Target-branch lease during Terminate. */
+  releasedTargetBranchLease: boolean;
+  /** Number of repository worker-slot leases released for the bound workflow. */
+  releasedWorkerSlotCount: number;
+};
+
+/**
+ * Outcome of a repository-scoped emergency stop.
+ * Distinct from Pause/Terminate: releases the bound workflow's coordinator lease
+ * in addition to workers, slots, and any held Target-branch lease.
+ */
+export type EmergencyStopResult = {
+  abortedWorkerCount: number;
+  affectedAttempts: readonly PipelineAffectedAttempt[];
+  releasedTargetBranchLease: boolean;
+  releasedWorkerSlotCount: number;
+  releasedCoordinatorLease: boolean;
+  runTerminated: true;
+  lastStopReason: "emergency-stop";
 };
 
 /**
@@ -1059,6 +1192,8 @@ export type WorkflowCoordinator = {
   /**
    * Pipeline pause: abort session-owned workers and stop auto-advance.
    * Leaves GitHub issues, labels, manifests, and integrated history untouched.
+   * Scoped to the bound workflow: releases its workers, slots, and any held
+   * Target-branch lease without interrupting sibling workflows.
    * Confirmation is owned by the UI; this method performs the operation.
    */
   pausePipeline(): Promise<PipelinePauseResult>;
@@ -1072,9 +1207,20 @@ export type WorkflowCoordinator = {
    * T2 (no successful integrate and no Workflow PR): may discard unintegrated
    * attempt workspaces/branches only. T1 (integratedTickets or workflowPr):
    * stop-only — never rewrites integrated history or reopens closed tickets.
+   * Scoped to the bound workflow: releases its workers, slots, and any held
+   * Target-branch lease without interrupting sibling workflows.
    * Confirmation is owned by the UI; this method performs the operation.
    */
   terminateRun(): Promise<RunTerminationResult>;
+  /**
+   * Repository-scoped emergency stop for this Workflow home.
+   * Distinct from Pause/Terminate: aborts session-owned workers, releases the
+   * bound workflow's slots, any held Target-branch lease, and the Workflow
+   * coordinator lease. Sibling homes are not directly controlled; fencing
+   * prevents releasing leases this home does not hold.
+   * Confirmation is owned by the UI; this method performs the operation.
+   */
+  emergencyStop(): Promise<EmergencyStopResult>;
   /** True when Pipeline pause is active (auto-advance must not continue). */
   isPipelinePaused(): boolean;
   /** True after Run termination until {@link beginPipelineRun}. */

@@ -93,6 +93,7 @@ import type {
   WorkerEventSink,
   WorkflowCoordinatorPorts,
 } from "./ports.js";
+import { buildParallelDeliveryPanelState } from "./parallel-delivery-state.js";
 import type {
   ActiveWorkflow,
   AvailableModel,
@@ -100,10 +101,12 @@ import type {
   CanonicalTargetIdentity,
   CompletedWorkerTelemetry,
   CiRecoveryDecision,
+  EmergencyStopResult,
   ImplementationDispositionDecision,
   ImplementationWorkerStatus,
   IntegratedTicketRef,
   NextAction,
+  ParallelDeliveryPanelState,
   PipelineAffectedAttempt,
   PipelinePauseResult,
   PipelineResumeResult,
@@ -117,6 +120,7 @@ import type {
   SpecDraft,
   StageConfirmationDecision,
   StageResult,
+  TargetBranchLease,
   TicketDraft,
   TicketProgressSummary,
   TicketsDraft,
@@ -183,6 +187,13 @@ type HeldWorkerSlot = {
   ticketNumber: number;
   lease: WorkerSlotLease;
   renewedAtMs: number;
+};
+
+/** Optional in-memory Target-branch lease held while this home drives delivery. */
+type HeldTargetBranchLease = {
+  target: CanonicalTargetIdentity;
+  lease: TargetBranchLease;
+  phase?: "refresh" | "validation" | "pr-update" | "merge";
 };
 
 type RepositoryWorkerSlotPreview =
@@ -632,9 +643,24 @@ export function createWorkflowCoordinator(
   /** Session-owned Run termination flag until the next explicit pipeline run. */
   let runTerminated = false;
   /** Last operator stop that affected the run loop (panel / brief surface). */
-  let lastStopReason: "pipeline-pause" | "run-termination" | undefined;
+  let lastStopReason:
+    | "pipeline-pause"
+    | "run-termination"
+    | "emergency-stop"
+    | undefined;
   /** T1/T2 mode recorded when lastStopReason is run-termination. */
   let lastTerminationMode: RunTerminationMode | undefined;
+  /**
+   * Target-branch lease held by this home while driving serial delivery.
+   * Pause/Terminate also release a remotely observed lease when holderId matches.
+   */
+  let heldTargetBranchLease: HeldTargetBranchLease | undefined;
+  /** Cached parallel-delivery snapshot for local panel polls. */
+  let cachedParallelDelivery:
+    | { workflowId: number; state: ParallelDeliveryPanelState }
+    | undefined;
+  /** True after a heartbeat/verification loses the Workflow coordinator lease. */
+  let coordinatorLeaseLost = false;
   /**
    * Successful worker facts outlive the live-worker panel within this session.
    * They are keyed by attempt/kind so retries and conflict workers stay distinct.
@@ -1404,14 +1430,60 @@ export function createWorkflowCoordinator(
     );
   }
 
+  /**
+   * Release every repository worker-slot lease currently held by this home.
+   * Returns how many slots were released (best-effort).
+   */
   async function releaseAllHeldWorkerSlots(
     bound: RootScopedPorts | undefined,
-  ): Promise<void> {
-    await withWorkerSlotLeaseMutex(async () => {
-      for (const workerId of [...heldWorkerSlots.keys()]) {
+  ): Promise<number> {
+    return withWorkerSlotLeaseMutex(async () => {
+      const workerIds = [...heldWorkerSlots.keys()];
+      for (const workerId of workerIds) {
         await releaseHeldWorkerSlotUnlocked(bound, workerId);
       }
+      return workerIds.length;
     });
+  }
+
+  /**
+   * Release the Target-branch lease when this home holds it (in-memory or by
+   * matching remote holderId). Never releases a sibling home's lease.
+   */
+  async function releaseBoundTargetBranchLease(
+    bound: RootScopedPorts | undefined,
+    target?: CanonicalTargetIdentity,
+  ): Promise<boolean> {
+    if (!bound?.coordination) {
+      heldTargetBranchLease = undefined;
+      return false;
+    }
+
+    const held = heldTargetBranchLease;
+    if (held) {
+      heldTargetBranchLease = undefined;
+      try {
+        const released = await bound.coordination.releaseLease(held.lease);
+        return released.released;
+      } catch {
+        return false;
+      }
+    }
+
+    if (!target) return false;
+    try {
+      const observed = await bound.coordination.getLease({
+        kind: "target-branch",
+        target,
+      });
+      if (!observed || observed.kind !== "target-branch") return false;
+      if (observed.releasedAt) return false;
+      if (observed.holderId !== workflowHomeHolderId) return false;
+      const released = await bound.coordination.releaseLease(observed);
+      return released.released;
+    } catch {
+      return false;
+    }
   }
 
   async function abandonLostWorkerSlotUnlocked(
@@ -2040,6 +2112,7 @@ export function createWorkflowCoordinator(
           renewedAtMs: Date.now(),
         };
         heldWorkflowCoordinatorLease = lease;
+        coordinatorLeaseLost = false;
       } else if (
         Date.now() - lease.renewedAtMs >=
         DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS
@@ -2047,6 +2120,7 @@ export function createWorkflowCoordinator(
         const renewed = await coordination.renewLease({ lease: lease.lease });
         if (!renewed.renewed) {
           heldWorkflowCoordinatorLease = undefined;
+          coordinatorLeaseLost = true;
           return {
             ok: false,
             reason: `Workflow #${workflowId} coordinator lease could not be renewed (${renewed.reason}). Remote mutation is blocked until it is explicitly resumed.`,
@@ -2055,6 +2129,7 @@ export function createWorkflowCoordinator(
         }
         if (renewed.lease.kind !== "workflow-coordinator") {
           heldWorkflowCoordinatorLease = undefined;
+          coordinatorLeaseLost = true;
           return {
             ok: false,
             reason: `Workflow #${workflowId} coordinator lease renewal returned an unexpected lease kind. Remote mutation is blocked until it is explicitly resumed.`,
@@ -2071,6 +2146,7 @@ export function createWorkflowCoordinator(
       const verified = await coordination.verifyLease(lease.lease);
       if (!verified.valid) {
         heldWorkflowCoordinatorLease = undefined;
+        coordinatorLeaseLost = true;
         return {
           ok: false,
           reason: `Workflow #${workflowId} coordinator lease is no longer valid (${verified.reason}). Remote mutation is blocked until it is explicitly resumed.`,
@@ -2079,6 +2155,7 @@ export function createWorkflowCoordinator(
       }
       if (verified.lease.kind !== "workflow-coordinator") {
         heldWorkflowCoordinatorLease = undefined;
+        coordinatorLeaseLost = true;
         return {
           ok: false,
           reason: `Workflow #${workflowId} coordinator lease verification returned an unexpected lease kind. Remote mutation is blocked until it is explicitly resumed.`,
@@ -2089,6 +2166,7 @@ export function createWorkflowCoordinator(
         lease: verified.lease,
       };
       heldWorkflowCoordinatorLease = lease;
+      coordinatorLeaseLost = false;
       return { ok: true, lease: lease.lease };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -8402,6 +8480,10 @@ export function createWorkflowCoordinator(
   }
 
   async function pausePipeline(): Promise<PipelinePauseResult> {
+    const bound = scoped ?? (await requireScoped());
+    const active = await loadActiveWorkflow(bound, { force: true });
+    const slotsBefore = heldWorkerSlots.size;
+
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: false,
       transcriptEvent: {
@@ -8411,6 +8493,14 @@ export function createWorkflowCoordinator(
       preservePendingIntegrationMessage:
         "Conflict resolution worker aborted by Pipeline pause. In-progress merge is preserved for retry.",
     });
+
+    // Abort releases per-worker slots; drain any remaining bound capacity.
+    const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
+    const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
+      bound,
+      active?.coordination?.target,
+    );
 
     pipelinePaused = true;
     pipelinePausedAtMs = Date.now();
@@ -8422,6 +8512,8 @@ export function createWorkflowCoordinator(
       abortedWorkerCount: affectedAttempts.length,
       affectedAttempts,
       pipelinePaused: true,
+      releasedTargetBranchLease,
+      releasedWorkerSlotCount,
     };
   }
 
@@ -8485,6 +8577,7 @@ export function createWorkflowCoordinator(
     // Need fresh integratedTickets / workflowPr for T1 vs T2 (not a TTL snapshot).
     const active = await loadActiveWorkflow(bound, { force: true });
     const mode = resolveTerminationMode(active);
+    const slotsBefore = heldWorkerSlots.size;
 
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: false,
@@ -8600,6 +8693,13 @@ export function createWorkflowCoordinator(
       }
     }
 
+    const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
+    const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
+      bound,
+      active?.coordination?.target,
+    );
+
     pipelinePaused = false;
     pipelinePausedAtMs = undefined;
     runTerminated = true;
@@ -8613,6 +8713,50 @@ export function createWorkflowCoordinator(
       discardedBranches,
       discardedWorktrees,
       runTerminated: true,
+      releasedTargetBranchLease,
+      releasedWorkerSlotCount,
+    };
+  }
+
+  async function emergencyStop(): Promise<EmergencyStopResult> {
+    const bound = scoped ?? (await requireScoped());
+    const active = await loadActiveWorkflow(bound, { force: true });
+    const slotsBefore = heldWorkerSlots.size;
+    const hadCoordinatorLease = Boolean(heldWorkflowCoordinatorLease);
+
+    const affectedAttempts = await abortSessionWorkers({
+      setCooldown: true,
+      transcriptEvent: {
+        type: "pipeline:emergency-stop",
+        reason: "emergency-stop",
+      },
+      preservePendingIntegrationMessage:
+        "Conflict resolution worker aborted by emergency stop. In-progress merge is preserved.",
+    });
+
+    const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
+    const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
+      bound,
+      active?.coordination?.target,
+    );
+    await releaseHeldWorkflowCoordinatorLease(bound);
+    coordinatorLeaseLost = false;
+
+    pipelinePaused = false;
+    pipelinePausedAtMs = undefined;
+    runTerminated = true;
+    lastStopReason = "emergency-stop";
+    lastTerminationMode = undefined;
+
+    return {
+      abortedWorkerCount: affectedAttempts.length,
+      affectedAttempts,
+      releasedTargetBranchLease,
+      releasedWorkerSlotCount,
+      releasedCoordinatorLease: hadCoordinatorLease,
+      runTerminated: true,
+      lastStopReason: "emergency-stop",
     };
   }
 
@@ -8751,8 +8895,159 @@ export function createWorkflowCoordinator(
   function invalidatePanelCaches(): void {
     cachedPanelActive = undefined;
     cachedTicketProgress = undefined;
+    cachedParallelDelivery = undefined;
     workflowHomeRouteTtl = undefined;
     ticketProgressTtl = undefined;
+  }
+
+  async function observeParallelDelivery(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+    mode: "full" | "local",
+  ): Promise<ParallelDeliveryPanelState | undefined> {
+    if (!active.coordination) return undefined;
+
+    if (
+      mode === "local" &&
+      cachedParallelDelivery &&
+      cachedParallelDelivery.workflowId === active.workflowId
+    ) {
+      // Refresh only in-memory lease ownership flags on local polls.
+      const cached = cachedParallelDelivery.state;
+      return {
+        ...cached,
+        coordinatorLease:
+          heldWorkflowCoordinatorLease &&
+          heldWorkflowCoordinatorLease.workflowId === active.workflowId
+            ? {
+                status: "held",
+                generation: heldWorkflowCoordinatorLease.lease.generation,
+                holderId: heldWorkflowCoordinatorLease.lease.holderId,
+                expiresAt: heldWorkflowCoordinatorLease.lease.expiresAt,
+                heldByUs: true,
+              }
+            : coordinatorLeaseLost
+              ? { status: "lost" }
+              : cached.coordinatorLease,
+        ...(heldTargetBranchLease
+          ? {
+              targetBranchLease: {
+                status: "held-by-us" as const,
+                holderId: heldTargetBranchLease.lease.holderId,
+                ...(typeof heldTargetBranchLease.lease.workflowId === "number"
+                  ? { workflowId: heldTargetBranchLease.lease.workflowId }
+                  : {}),
+                generation: heldTargetBranchLease.lease.generation,
+                expiresAt: heldTargetBranchLease.lease.expiresAt,
+                ...(heldTargetBranchLease.phase
+                  ? { phase: heldTargetBranchLease.phase }
+                  : {}),
+              },
+            }
+          : {}),
+      };
+    }
+
+    const target = active.coordination.target;
+    let siblingsOnTarget: readonly ActiveWorkflow[] = [active];
+    let coordinatorLeaseRemote: WorkflowCoordinatorLease | undefined;
+    let targetBranchLeaseRemote: TargetBranchLease | undefined;
+    let workerSlotLeases: WorkerSlotLease[] = [];
+    let workerCapacity: number | undefined;
+
+    try {
+      siblingsOnTarget = await bound.tracker.findActiveWorkflows(target);
+    } catch {
+      siblingsOnTarget = [active];
+    }
+
+    if (bound.coordination) {
+      try {
+        const observedCoordinator = await bound.coordination.getLease({
+          kind: "workflow-coordinator",
+          repository: target.repository,
+          target,
+          workflowId: active.workflowId,
+        });
+        if (
+          observedCoordinator &&
+          observedCoordinator.kind === "workflow-coordinator"
+        ) {
+          coordinatorLeaseRemote = observedCoordinator;
+        }
+      } catch {
+        // Observation is best-effort; panel must not invent lease health.
+      }
+
+      try {
+        const observedTarget = await bound.coordination.getLease({
+          kind: "target-branch",
+          target,
+        });
+        if (observedTarget && observedTarget.kind === "target-branch") {
+          targetBranchLeaseRemote = observedTarget;
+        }
+      } catch {
+        // Best-effort observation.
+      }
+
+      try {
+        const leases = await bound.coordination.listLeases({
+          repository: target.repository,
+          kind: "worker-slot",
+        });
+        workerSlotLeases = leases.filter(
+          (lease): lease is WorkerSlotLease => lease.kind === "worker-slot",
+        );
+      } catch {
+        workerSlotLeases = [];
+      }
+
+      try {
+        const policy = await bound.coordination.getWorkerCapacityPolicy(
+          target.repository,
+        );
+        if (policy) workerCapacity = policy.workerCapacity;
+      } catch {
+        workerCapacity = undefined;
+      }
+    }
+
+    const state = buildParallelDeliveryPanelState({
+      boundWorkflowId: active.workflowId,
+      active,
+      siblingsOnTarget,
+      ...(coordinatorLeaseRemote
+        ? { coordinatorLease: coordinatorLeaseRemote }
+        : heldWorkflowCoordinatorLease
+          ? { coordinatorLease: heldWorkflowCoordinatorLease.lease }
+          : {}),
+      coordinatorLeaseHeldByUs:
+        heldWorkflowCoordinatorLease?.workflowId === active.workflowId,
+      coordinatorLeaseLost,
+      ...(targetBranchLeaseRemote
+        ? { targetBranchLease: targetBranchLeaseRemote }
+        : heldTargetBranchLease
+          ? { targetBranchLease: heldTargetBranchLease.lease }
+          : {}),
+      targetBranchLeaseHeldByUs: Boolean(heldTargetBranchLease),
+      ...(heldTargetBranchLease?.phase
+        ? { targetBranchLeasePhase: heldTargetBranchLease.phase }
+        : {}),
+      workerSlotLeases,
+      ...(typeof workerCapacity === "number" ? { workerCapacity } : {}),
+      holderId: workflowHomeHolderId,
+    });
+
+    if (state) {
+      cachedParallelDelivery = {
+        workflowId: active.workflowId,
+        state,
+      };
+    } else {
+      cachedParallelDelivery = undefined;
+    }
+    return state;
   }
 
   async function getPanelState(options?: {
@@ -8998,6 +9293,12 @@ export function createWorkflowCoordinator(
     if (ciEntries.length > 0) {
       state.ci = ciEntries;
     }
+
+    const parallelDelivery = await observeParallelDelivery(bound, active, mode);
+    if (parallelDelivery) {
+      state.parallelDelivery = parallelDelivery;
+    }
+
     return state;
   }
 
@@ -9176,6 +9477,7 @@ export function createWorkflowCoordinator(
     pausePipeline,
     resumePipeline,
     terminateRun,
+    emergencyStop,
     isPipelinePaused,
     isRunTerminated,
     reconcileBlockedRunningWorkers,

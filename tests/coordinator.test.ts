@@ -5051,6 +5051,8 @@ describe("Workflow coordinator Pipeline pause and Run termination", () => {
         },
       ],
       pipelinePaused: true,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     });
     expect(workers.state.abortAllCount).toBe(1);
     expect(workers.state.aborts).toContain("implement-42-43-r1");
