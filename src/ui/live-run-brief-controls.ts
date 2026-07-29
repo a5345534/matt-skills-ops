@@ -323,7 +323,14 @@ export async function presentLiveWaitControls(
     options.overlay ? { overlay: true } : undefined,
   );
 
-  return result ?? { action: "settled" };
+  // Pi RPC / partial hosts resolve custom() as undefined without running the factory.
+  // Do not pretend workers settled — callers must fall back to select/chat brief.
+  if (result === undefined) {
+    throw new Error(
+      "Live wait custom surface returned undefined (UI host may not support ctx.ui.custom).",
+    );
+  }
+  return result;
 }
 
 /** True when the UI can host a live custom wait surface. */

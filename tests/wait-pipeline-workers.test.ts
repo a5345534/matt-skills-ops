@@ -703,19 +703,25 @@ describe("waitForPipelineWorkers", () => {
     });
 
     expect(customRenders).toBeGreaterThan(0);
-    // Short live-wait hint is fine; full multi-section dumps must not pile up.
+    // One opening chat snapshot is intentional so the brief is visible even if
+    // the editor custom surface is easy to miss; do not stack every poll.
     const fullBriefNotices = ui.notices.filter(
       (n) => n.includes("Workers") && n.includes("#19 r1"),
     );
-    // At most the final settle snapshot (and never a stack of running briefs).
-    expect(fullBriefNotices.length).toBeLessThanOrEqual(1);
-    expect(ui.notices.some((n) => n.includes("Live wait"))).toBe(true);
-    // No mid-wait full brief of a still-running worker (progress/processAlive).
+    expect(fullBriefNotices.length).toBeGreaterThanOrEqual(1);
+    expect(fullBriefNotices.length).toBeLessThanOrEqual(2);
+    expect(
+      ui.notices.some(
+        (n) =>
+          n.includes("Live run brief") || n.includes("Live wait"),
+      ),
+    ).toBe(true);
+    // Opening snapshot may mention a running worker once; do not re-notify every poll.
     expect(
       ui.notices.filter(
         (n) => n.includes("processAlive: true") || n.includes("progress: tick"),
       ).length,
-    ).toBe(0);
+    ).toBeLessThanOrEqual(1);
   });
 
   it("returns settled status when workers finish without controls", async () => {

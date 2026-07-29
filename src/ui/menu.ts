@@ -868,11 +868,10 @@ export async function waitForPipelineWorkers(
   }
 
   if (initialPanel) {
-    // Live custom already paints the full brief — chat-notify here would stack
-    // a second copy that never updates while the live surface refreshes.
-    const initialBrief = liveWaitAvailable
-      ? touchRunBriefStatus(ui, initialPanel)
-      : notifyRunBrief(ui, initialPanel);
+    // Always paint the current brief into chat once when wait starts so the
+    // operator still has a readable snapshot if the editor custom surface is
+    // easy to miss or fails open. Live custom owns subsequent refreshes.
+    const initialBrief = notifyRunBrief(ui, initialPanel);
     log("info", "pipeline:wait-workers", {
       runningCount: initialRunning.length,
       pipelinePaused: initialPaused,
@@ -885,9 +884,11 @@ export async function waitForPipelineWorkers(
   if (!initialPaused) {
     const controlPath = runControlFilePath(process.cwd());
     if (liveWaitAvailable) {
-      // One short line only — do not dump the brief body into chat.
       ui.notify(
-        `Live wait · shell fallback: echo terminate-now > ${controlPath}`,
+        [
+          "Live run brief is opening in the editor (Pause / Terminate selectable).",
+          `Emergency shell: echo terminate-now > ${controlPath}`,
+        ].join("\n"),
         "info",
       );
     } else if (offerRunningControls) {
@@ -1189,12 +1190,48 @@ export async function waitForPipelineWorkers(
             continue;
           }
         } else if (liveWaitAvailable) {
-          const live = await presentLiveWaitControls(ui, controls, panel, {
-            pollIntervalMs,
-            onTick: (p) => {
-              activity.tick(activityDetailFromPanel(p));
-            },
-          });
+          let live: Awaited<ReturnType<typeof presentLiveWaitControls>>;
+          try {
+            live = await presentLiveWaitControls(ui, controls, panel, {
+              pollIntervalMs,
+              onTick: (p) => {
+                activity.tick(activityDetailFromPanel(p));
+              },
+            });
+          } catch (error) {
+            log("warn", "pipeline:live-wait-custom-failed", {
+              reason: errorMessage(error),
+            });
+            // Fall through to select-menu path on this tick.
+            if (offerRunningControls) {
+              notifyRunBrief(ui, panel);
+              const control = await presentRunBriefControlMenu(
+                controls,
+                ui,
+                panel,
+              );
+              if (control.action === "terminated") {
+                const latest =
+                  (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+                notifyRunBrief(ui, latest, "warning");
+                ui.notify(formatTerminateNotify(control.result), "warning");
+                return { status: "terminated", result: control.result };
+              }
+              if (control.action === "emergency-stopped") {
+                const latest =
+                  (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+                notifyRunBrief(ui, latest, "error");
+                return {
+                  status: "emergency-stopped",
+                  result: control.result,
+                };
+              }
+              if (control.action === "paused") continue;
+            } else {
+              await sleepFn(pollIntervalMs);
+            }
+            continue;
+          }
           if (live.action === "settled") {
             // Panel may have P1 work or workers finished — re-check outer loop.
             continue;
@@ -2287,9 +2324,9 @@ export async function runPostGrillPipeline(
     | undefined;
 
   // Persistent live brief for the whole /matt-auto run: stays open across ticket
-  // transitions (disposition / integration) with 0.5s local panel polls until
-  // the run ends. Pipeline work continues in parallel; per-stage waits skip a
-  // second custom() surface so the brief does not disappear between issues.
+  // transitions (disposition / integration) with local panel polls until the run
+  // ends. Pipeline work continues in parallel; per-stage waits skip a second
+  // custom() surface so the brief does not disappear between issues.
   let stopPersistentLive = false;
   let persistentLiveOpen = false;
   const persistentLiveCapable = canPresentLiveWaitControls(ui);
@@ -2299,6 +2336,7 @@ export async function runPostGrillPipeline(
       : DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS;
   log("info", "pipeline:live-wait-poll-interval", {
     intervalMs: liveWaitPollIntervalMs,
+    persistentLiveCapable,
   });
   const persistentLivePromise: Promise<unknown> = persistentLiveCapable
     ? (async () => {
@@ -2307,14 +2345,40 @@ export async function runPostGrillPipeline(
           detail: "pipeline",
         });
         try {
-          // Create-spec may run before any Active workflow panel exists.
+          // Create-spec may run for minutes before any Active workflow panel exists.
+          // Wait for the whole run (not a short cap) so the brief does not miss open.
           let panel: WorkflowPanelState | undefined;
-          for (let i = 0; i < 120 && !stopPersistentLive; i += 1) {
+          let waitedMs = 0;
+          while (!stopPersistentLive) {
             panel = await coordinator.getPanelState({ mode: "local" });
             if (panel) break;
             await sleep(250);
+            waitedMs += 250;
+            if (waitedMs === 30_000 || waitedMs % 60_000 === 0) {
+              log("info", "pipeline:persistent-live-waiting-panel", {
+                waitedMs,
+              });
+            }
           }
-          if (!panel || stopPersistentLive) return;
+          if (!panel || stopPersistentLive) {
+            log("info", "pipeline:persistent-live-skip", {
+              reason: !panel ? "no-panel" : "stopped-before-open",
+              waitedMs,
+            });
+            return;
+          }
+          log("info", "pipeline:persistent-live-open", {
+            workflowId: panel.workflowId,
+            waitedMs,
+            pollIntervalMs: liveWaitPollIntervalMs,
+          });
+          // One chat snapshot so the operator has a readable brief even if the
+          // editor custom surface is easy to miss in a long transcript.
+          notifyRunBrief(ui, panel);
+          ui.notify(
+            "Live run brief is open in the editor until this run ends (Pause / Terminate).",
+            "info",
+          );
           persistentLiveOpen = true;
           const live = await presentLiveWaitControls(ui, coordinator, panel, {
             pollIntervalMs: liveWaitPollIntervalMs,
@@ -2324,6 +2388,10 @@ export async function runPostGrillPipeline(
             onTick: (p) => {
               activity.tick(activityDetailFromPanel(p));
             },
+          });
+          log("info", "pipeline:persistent-live-close", {
+            workflowId: panel.workflowId,
+            action: live.action,
           });
           // Operator used live controls — apply confirmations after custom() closes.
           const latest =
@@ -2351,6 +2419,10 @@ export async function runPostGrillPipeline(
         log("warn", "pipeline:persistent-live-failed", {
           reason: errorMessage(error),
         });
+        ui.notify(
+          `Live run brief failed to open (${errorMessage(error)}). Stage waits will use the control menu / chat brief.`,
+          "warning",
+        );
       })
     : Promise.resolve();
   const skipPersistentLiveSurface = () =>
