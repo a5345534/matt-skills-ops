@@ -699,6 +699,11 @@ function sortedPreflightChecks(
     "target-branch",
     "matt-skills",
     "worker-profile",
+    "canonical-repository",
+    "coordination-refs",
+    "merge-method",
+    "stale-base-protection",
+    "merge-authority",
   ];
   return [...preflight.checks].sort(
     (left, right) => order.indexOf(left.id) - order.indexOf(right.id),

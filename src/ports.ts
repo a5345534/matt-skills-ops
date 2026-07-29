@@ -15,7 +15,9 @@ import type {
   WorkflowHomeBinding,
   WorkflowHomeLock,
   WorkflowManifest,
+  WorkflowMergeMethod,
 } from "./types.js";
+import type { ProtectedBranchAutomationPolicy } from "./workflow-pr-guard.js";
 
 /**
  * Environment facts for Workflow preflight on one Workflow root.
@@ -480,6 +482,15 @@ export type CoordinationPort = {
   releaseLease(lease: CoordinationLease): Promise<ReleaseCoordinationLeaseResult>;
   /** Verify current holder, fencing generation, and TTL before an irreversible action. */
   verifyLease(lease: CoordinationLease): Promise<VerifyCoordinationLeaseResult>;
+  /**
+   * Preflight probe: can this home update reserved coordination refs?
+   * Must not leave durable lease/policy mutations behind. Optional while older
+   * CoordinationPort fakes migrate; production adapters implement it.
+   */
+  canWriteCoordinationRefs?(repository: CanonicalRepositoryIdentity): Promise<
+    | { ok: true }
+    | { ok: false; reason: string }
+  >;
   /** Read the authoritative repository-wide worker-capacity policy. */
   getWorkerCapacityPolicy(
     repository: CanonicalRepositoryIdentity,
@@ -710,9 +721,39 @@ export type TrackerPort = {
     body: string;
   }): Promise<{ number: number; url?: string }>;
   /**
-   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   * Observe protected-branch automation compatibility for one Target branch.
+   * Preflight only — never mutates branch protection, merge settings, or refs.
+   * Optional while legacy version-1 fixtures migrate; production adapters implement it.
    */
-  mergePullRequest(input: { number: number }): Promise<void>;
+  inspectProtectedBranchAutomation?(input: {
+    targetBranch: string;
+  }): Promise<ProtectedBranchAutomationPolicy>;
+  /**
+   * Live Workflow PR head/base facts used for merge-time freshness preflight.
+   * Optional while legacy version-1 fixtures migrate; production adapters implement it.
+   */
+  getPullRequestFreshness?(input: {
+    number: number;
+  }): Promise<{
+    headSha: string;
+    baseSha: string;
+    /** When known, whether GitHub currently considers the PR mergeable. */
+    mergeable?: boolean;
+  }>;
+  /**
+   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   * Automatic delivery must pass the repository-configured merge method and
+   * the expected head SHA so GitHub cannot merge a different tip.
+   */
+  mergePullRequest(input: {
+    number: number;
+    /** Repository-configured method; required for automatic delivery. */
+    mergeMethod?: WorkflowMergeMethod;
+    /** Exact expected PR head; fail closed on mismatch when provided. */
+    expectedHeadSha?: string;
+    /** Exact expected Target/base SHA observed by the caller (local guard). */
+    expectedTargetSha?: string;
+  }): Promise<void>;
 };
 
 /**
