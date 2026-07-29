@@ -3692,6 +3692,178 @@ describe("Workflow coordinator single Implementation worker path", () => {
     );
   });
 
+  it("reconciles a dead worker once instead of spamming process-gone / settlement", async () => {
+    const workspace = createWorkspace("/repo");
+    let releaseAhead: (() => void) | undefined;
+    const aheadGate = new Promise<void>((resolve) => {
+      releaseAhead = resolve;
+    });
+    workspace.port.hasCommitsAhead = async () => {
+      await aheadGate;
+      return { ahead: false, count: 0 };
+    };
+
+    const workers = createWorkers();
+    let reportAlive = true;
+    const baseGetRuntime = workers.port.getRuntime.bind(workers.port);
+    workers.port.getRuntime = (workerId) => {
+      const runtime = baseGetRuntime(workerId);
+      if (!runtime) return undefined;
+      return { ...runtime, alive: reportAlive };
+    };
+
+    const { coordinator, transcripts } = ticketsPublishedFixture({
+      workspace,
+      workers,
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    // Observe alive so reconcile is allowed to treat a later death as real.
+    await coordinator.getPanelState();
+
+    reportAlive = false;
+    // Concurrent panel polls while process-exit settlement awaits hasCommitsAhead.
+    const polls = Promise.all(
+      Array.from({ length: 8 }, () => coordinator.getPanelState()),
+    );
+    // Let the in-flight settlement(s) reach the await, then release.
+    await new Promise((r) => setTimeout(r, 20));
+    releaseAhead?.();
+    await polls;
+
+    const events = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    const types = events.map((e) =>
+      typeof e === "object" && e !== null
+        ? (e as { type?: string }).type
+        : undefined,
+    );
+    expect(types.filter((t) => t === "process-gone")).toHaveLength(1);
+    // No commits ahead → single compatibility-recovery (not a storm).
+    expect(types.filter((t) => t === "compatibility-recovery")).toHaveLength(1);
+    expect(types.filter((t) => t === "stage-result-inferred")).toHaveLength(0);
+  });
+
+  it("does not synthesize process-gone before the OS process was observed alive", async () => {
+    const workers = createWorkers();
+    let releaseLaunch: (() => void) | undefined;
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    let launchReleased = false;
+    const baseLaunch = workers.port.launch.bind(workers.port);
+    workers.port.launch = async (input, sink) => {
+      // Register sink so emit works, but delay returning so the coordinator has
+      // status=running while runtime is still unpublished (launch window).
+      workers.state.launches.push(input);
+      workers.state.sinks.set(input.workerId, sink);
+      await launchGate;
+      launchReleased = true;
+      return { workerId: input.workerId, pid: 4242, alive: true };
+    };
+    workers.port.getRuntime = (workerId) => {
+      if (!launchReleased || !workers.state.sinks.has(workerId)) return undefined;
+      return { workerId, pid: 4242, alive: true };
+    };
+
+    const { coordinator, transcripts } = ticketsPublishedFixture({ workers });
+
+    const implementPromise = coordinator.runNextAction(
+      implementTicketActionId(43),
+    );
+    for (let i = 0; i < 50 && workers.state.launches.length === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(workers.state.launches.length).toBe(1);
+
+    await coordinator.getPanelState();
+    await coordinator.getPanelState();
+
+    const midEvents = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    expect(
+      midEvents.some(
+        (e) =>
+          typeof e === "object" &&
+          e !== null &&
+          (e as { type?: string }).type === "process-gone",
+      ),
+    ).toBe(false);
+
+    releaseLaunch?.();
+    const launched = await implementPromise;
+    expect(launched).toMatchObject({ status: "running" });
+
+    const panel = await coordinator.getPanelState();
+    expect(panel?.workers.some((w) => w.status === "running")).toBe(true);
+  });
+
+  it("does not re-infer completion after a Stage result already settled the worker", async () => {
+    const workspace = createWorkspace("/repo");
+    workspace.port.hasCommitsAhead = async () => ({
+      ahead: true,
+      headSha: "deadbeef",
+      count: 1,
+    });
+    const workers = createWorkers();
+    let reportAlive = true;
+    const baseGetRuntime = workers.port.getRuntime.bind(workers.port);
+    workers.port.getRuntime = (workerId) => {
+      const runtime = baseGetRuntime(workerId);
+      if (!runtime) return undefined;
+      return { ...runtime, alive: reportAlive };
+    };
+    const { coordinator, transcripts } = ticketsPublishedFixture({
+      workspace,
+      workers,
+    });
+
+    await coordinator.runNextAction(implementTicketActionId(43));
+    await workers.emit("implement-42-43-r1", {
+      type: "stage-result",
+      workerId: "implement-42-43-r1",
+      outcome: {
+        status: "completed",
+        summary: "done",
+        localCommitSha: "deadbeef",
+      },
+    });
+    await workers.emit("implement-42-43-r1", {
+      type: "process-exit",
+      workerId: "implement-42-43-r1",
+      code: 0,
+    });
+
+    reportAlive = false;
+    for (let i = 0; i < 5; i += 1) {
+      await coordinator.getPanelState();
+    }
+
+    const events = await transcripts.port.read({
+      workflowId: 42,
+      ticketNumber: 43,
+      attempt: 1,
+    });
+    const types = events.map((e) =>
+      typeof e === "object" && e !== null
+        ? (e as { type?: string }).type
+        : undefined,
+    );
+    expect(types.filter((t) => t === "stage-result")).toHaveLength(1);
+    expect(types.filter((t) => t === "stage-result-inferred")).toHaveLength(0);
+    expect(types.filter((t) => t === "process-gone")).toHaveLength(0);
+    expect(types.filter((t) => t === "compatibility-recovery")).toHaveLength(0);
+
+    const actions = await coordinator.nextActions();
+    expect(actions.map((a) => a.id)).toContain(dispositionActionId(43));
+  });
+
   it("aborts workers when switching Workflow root", async () => {
     const tracker = createTracker({
       active: {

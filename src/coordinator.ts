@@ -468,6 +468,12 @@ type ActiveImplementationWorker = {
   startedAtMs: number;
   /** True once a stage-result event was handled for this worker. */
   receivedStageResult: boolean;
+  /**
+   * True once WorkersPort reported this attempt's OS child as alive.
+   * Used so panel reconcile does not treat the launch window (runtime not
+   * registered yet) as process-gone.
+   */
+  processObservedAlive?: boolean;
   /** Last provider/model error observed on the worker stream, when any. */
   lastError?: string;
 };
@@ -507,6 +513,8 @@ type ActiveConflictWorker = {
   /** Epoch ms when this conflict worker was launched (R1 runtime base). */
   startedAtMs: number;
   receivedStageResult: boolean;
+  /** True once the conflict worker OS child was observed alive. */
+  processObservedAlive?: boolean;
 };
 
 /**
@@ -606,6 +614,17 @@ export function createWorkflowCoordinator(
     string,
     ActiveImplementationWorker
   >();
+  /**
+   * Worker ids currently settling a process-exit (real or reconciled).
+   * Prevents concurrent panel polls from re-entering settlement and spamming
+   * stage-result-inferred / compatibility-recovery events.
+   */
+  const processExitHandling = new Set<string>();
+  /**
+   * Worker ids for which we already synthesized a process-gone event this session.
+   * Permanent for the attempt so live panel polls never re-append process-gone.
+   */
+  const processGoneSynthesized = new Set<string>();
   /**
    * The single Implementation disposition currently offered as a Next action.
    * Additional completed workers stay in activeImplementationWorkers until
@@ -1598,7 +1617,14 @@ export function createWorkflowCoordinator(
           continue;
         }
         const runtime = bound.workers.getRuntime(held.workerId);
-        if (!runtime || !runtime.alive) {
+        noteRuntimeObservation(worker, runtime);
+        // Only free capacity for a process we can prove is gone. Missing runtime
+        // during the launch window must not drop the slot (live panel polls race
+        // workers.launch registration).
+        const processGone =
+          (runtime !== undefined && !runtime.alive) ||
+          (runtime === undefined && worker.processObservedAlive === true);
+        if (processGone) {
           // A dead process cannot retain capacity while the panel/reconciler
           // synthesizes its terminal Worker protocol event.
           await releaseHeldWorkerSlotUnlocked(bound, held.workerId);
@@ -3300,7 +3326,8 @@ export function createWorkflowCoordinator(
   let preflightCache:
     | { result: PreflightResult; at: number; rootPath: string }
     | undefined;
-  const PREFLIGHT_TTL_MS = 5_000;
+  /** Cache preflight long enough to cover a full run-loop step (preflight → nextActions). */
+  const PREFLIGHT_TTL_MS = 60_000;
 
   async function collectProtectedBranchAutomationChecks(
     bound: RootScopedPorts,
@@ -5183,6 +5210,9 @@ export function createWorkflowCoordinator(
       if (typeof runtime.pid === "number") {
         worker.pid = runtime.pid;
       }
+      if (runtime.alive) {
+        worker.processObservedAlive = true;
+      }
       await bound.transcripts.append(transcriptKey, {
         type: "worker-process",
         workerId,
@@ -5338,76 +5368,91 @@ export function createWorkflowCoordinator(
       return;
     }
 
-    // process-exit
-    await releaseHeldWorkerSlot(bound, worker.workerId);
-    if (worker.receivedStageResult) {
-      // Stage result already settled the attempt; keep disposition if pending.
+    // process-exit — settle at most once per worker attempt.
+    if (worker.receivedStageResult || worker.status !== "running") {
+      await releaseHeldWorkerSlot(bound, worker.workerId);
       return;
     }
+    if (processExitHandling.has(worker.workerId)) {
+      return;
+    }
+    processExitHandling.add(worker.workerId);
+    try {
+      await releaseHeldWorkerSlot(bound, worker.workerId);
+      if (worker.receivedStageResult || worker.status !== "running") {
+        // Stage result / concurrent settlement won the race.
+        return;
+      }
 
-    // Fallback: many agents finish with exit 0 + local commits but forget the
-    // Stage result JSON. Infer completion so the pipeline can advance.
-    // Base must be the Integration branch when present — comparing to main/target
-    // falsely counts already-integrated commits as new ticket work.
-    if (event.code === 0 || event.code === null) {
-      try {
-        const active = await loadActiveWorkflow(bound);
-        const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
-        const baseRef =
-          active?.integrationBranch && active.integrationBranch.length > 0
-            ? active.integrationBranch
-            : targetBranch;
-        const ahead = await bound.workspace.hasCommitsAhead({
-          worktreePath: worker.worktreePath,
-          baseRef,
-        });
-        if (ahead.ahead) {
-          worker.receivedStageResult = true;
-          const telemetry = recordCompletedWorkerTelemetry(
-            worker,
-            "implementation",
+      // Fallback: many agents finish with exit 0 + local commits but forget the
+      // Stage result JSON. Infer completion so the pipeline can advance.
+      // Base must be the Integration branch when present — comparing to main/target
+      // falsely counts already-integrated commits as new ticket work.
+      if (event.code === 0 || event.code === null) {
+        try {
+          const active = await loadActiveWorkflow(bound);
+          const targetBranch = await resolveTargetBranch(
+            bound.preferences,
+            bound.environment,
           );
-          await persistCompletedWorkerTelemetry(
-            bound,
-            transcriptKey,
-            worker.workerId,
-            telemetry,
-          );
-          worker.summary =
-            worker.progress ??
-            `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
-              (ahead.headSha ? ` @ ${ahead.headSha.slice(0, 8)}` : "");
-          settleCompletedImplementationWorker(worker);
-          await bound.transcripts.append(transcriptKey, {
-            type: "stage-result-inferred",
-            reason:
-              "Worker exited without Stage result JSON; inferred completed from local commits ahead of Integration/base.",
-            code: event.code,
-            headSha: ahead.headSha,
-            commitCount: ahead.count,
+          const baseRef =
+            active?.integrationBranch && active.integrationBranch.length > 0
+              ? active.integrationBranch
+              : targetBranch;
+          const ahead = await bound.workspace.hasCommitsAhead({
+            worktreePath: worker.worktreePath,
             baseRef,
           });
-          return;
+          if (ahead.ahead) {
+            worker.receivedStageResult = true;
+            const telemetry = recordCompletedWorkerTelemetry(
+              worker,
+              "implementation",
+            );
+            await persistCompletedWorkerTelemetry(
+              bound,
+              transcriptKey,
+              worker.workerId,
+              telemetry,
+            );
+            worker.summary =
+              worker.progress ??
+              `Inferred completion: ${ahead.count} commit(s) ahead of ${baseRef}` +
+                (ahead.headSha ? ` @ ${ahead.headSha.slice(0, 8)}` : "");
+            settleCompletedImplementationWorker(worker);
+            await bound.transcripts.append(transcriptKey, {
+              type: "stage-result-inferred",
+              reason:
+                "Worker exited without Stage result JSON; inferred completed from local commits ahead of Integration/base.",
+              code: event.code,
+              headSha: ahead.headSha,
+              commitCount: ahead.count,
+              baseRef,
+            });
+            return;
+          }
+        } catch {
+          // Fall through to recovery.
         }
-      } catch {
-        // Fall through to recovery.
       }
-    }
 
-    // Fail closed: agent settled without a Stage result and no local commits.
-    worker.status = "compatibility-recovery";
-    activeImplementationWorkers.delete(worker.workerId);
-    // Cooldown so /matt-auto run does not immediately re-launch the same ticket.
-    const recoveryReason =
-      worker.lastError ??
-      "Implementation worker process exited without a Stage result on the Worker protocol.";
-    rememberImplementationRecovery(worker.ticketNumber, recoveryReason);
-    await bound.transcripts.append(transcriptKey, {
-      type: "compatibility-recovery",
-      reason: recoveryReason,
-      code: event.code,
-      ...(worker.lastError ? { workerError: worker.lastError } : {}),
-    });
+      // Fail closed: agent settled without a Stage result and no local commits.
+      worker.status = "compatibility-recovery";
+      activeImplementationWorkers.delete(worker.workerId);
+      // Cooldown so /matt-auto run does not immediately re-launch the same ticket.
+      const recoveryReason =
+        worker.lastError ??
+        "Implementation worker process exited without a Stage result on the Worker protocol.";
+      rememberImplementationRecovery(worker.ticketNumber, recoveryReason);
+      await bound.transcripts.append(transcriptKey, {
+        type: "compatibility-recovery",
+        reason: recoveryReason,
+        code: event.code,
+        ...(worker.lastError ? { workerError: worker.lastError } : {}),
+      });
+    } finally {
+      processExitHandling.delete(worker.workerId);
+    }
   }
 
   async function handleConflictWorkerEvent(
@@ -6129,6 +6174,9 @@ export function createWorkflowCoordinator(
       if (typeof runtime.pid === "number") {
         worker.pid = runtime.pid;
       }
+      if (runtime.alive) {
+        worker.processObservedAlive = true;
+      }
       await bound.transcripts.append(transcriptKey, {
         type: "worker-process",
         workerId,
@@ -6847,6 +6895,9 @@ export function createWorkflowCoordinator(
       );
       if (typeof runtime.pid === "number") {
         worker.pid = runtime.pid;
+      }
+      if (runtime.alive) {
+        worker.processObservedAlive = true;
       }
       await bound.transcripts.append(transcriptKey, {
         type: "worker-process",
@@ -9354,8 +9405,41 @@ export function createWorkflowCoordinator(
   }
 
   /**
+   * True when panel reconcile may treat a missing/dead runtime as process death.
+   * Requires a prior alive observation so the launch window (worker registered
+   * before WorkersPort publishes the child) is not misclassified as gone.
+   */
+  function shouldSynthesizeProcessExit(
+    worker: {
+      workerId: string;
+      processObservedAlive?: boolean;
+      receivedStageResult?: boolean;
+    },
+    runtime: { alive: boolean; pid?: number } | undefined,
+  ): boolean {
+    if (worker.receivedStageResult) return false;
+    if (processExitHandling.has(worker.workerId)) return false;
+    if (processGoneSynthesized.has(worker.workerId)) return false;
+    if (runtime?.alive) return false;
+    // Missing runtime or explicit !alive only counts after we saw the process
+    // alive — never during the launch window before WorkersPort registers it.
+    return worker.processObservedAlive === true;
+  }
+
+  function noteRuntimeObservation(
+    worker: { processObservedAlive?: boolean },
+    runtime: { alive: boolean } | undefined,
+  ): void {
+    if (runtime?.alive) {
+      worker.processObservedAlive = true;
+    }
+  }
+
+  /**
    * If panel still says running but the OS child is gone, synthesize process-exit
    * so the pipeline does not wait forever on a zombie in-memory worker.
+   * Never synthesizes during the launch window (runtime not observed alive yet)
+   * and never re-enters settlement while process-exit is already in flight.
    */
   async function reconcileDeadWorkers(bound: RootScopedPorts): Promise<void> {
     const running = [...activeImplementationWorkers.values()].filter(
@@ -9363,48 +9447,56 @@ export function createWorkflowCoordinator(
     );
     for (const worker of running) {
       const runtime = bound.workers.getRuntime(worker.workerId);
-      if (!runtime || !runtime.alive) {
-        const transcriptKey = {
-          workflowId: worker.workflowId,
-          ticketNumber: worker.ticketNumber,
-          attempt: worker.attempt,
-        };
-        await bound.transcripts.append(transcriptKey, {
-          type: "process-gone",
-          workerId: worker.workerId,
-          pid: worker.pid ?? runtime?.pid,
-          reason:
-            "Panel still marked running but the OS process is gone; synthesizing process-exit.",
-        });
-        await handleWorkerEvent(bound, {
-          type: "process-exit",
-          workerId: worker.workerId,
-          code: null,
-        });
+      noteRuntimeObservation(worker, runtime);
+      if (!shouldSynthesizeProcessExit(worker, runtime)) {
+        continue;
       }
+      // Claim before any await so concurrent panel polls skip this worker.
+      processGoneSynthesized.add(worker.workerId);
+      const transcriptKey = {
+        workflowId: worker.workflowId,
+        ticketNumber: worker.ticketNumber,
+        attempt: worker.attempt,
+      };
+      await bound.transcripts.append(transcriptKey, {
+        type: "process-gone",
+        workerId: worker.workerId,
+        pid: worker.pid ?? runtime?.pid,
+        reason:
+          "Panel still marked running but the OS process is gone; synthesizing process-exit.",
+      });
+      await handleWorkerEvent(bound, {
+        type: "process-exit",
+        workerId: worker.workerId,
+        code: null,
+      });
     }
 
     if (activeConflictWorker && activeConflictWorker.status === "running") {
-      const runtime = bound.workers.getRuntime(activeConflictWorker.workerId);
-      if (!runtime || !runtime.alive) {
-        const transcriptKey = {
-          workflowId: activeConflictWorker.workflowId,
-          ticketNumber: activeConflictWorker.ticketNumber,
-          attempt: activeConflictWorker.attempt,
-        };
-        await bound.transcripts.append(transcriptKey, {
-          type: "process-gone",
-          workerId: activeConflictWorker.workerId,
-          pid: activeConflictWorker.pid ?? runtime?.pid,
-          reason:
-            "Conflict worker still marked running but the OS process is gone; synthesizing process-exit.",
-        });
-        await handleWorkerEvent(bound, {
-          type: "process-exit",
-          workerId: activeConflictWorker.workerId,
-          code: null,
-        });
+      const conflict = activeConflictWorker;
+      const runtime = bound.workers.getRuntime(conflict.workerId);
+      noteRuntimeObservation(conflict, runtime);
+      if (!shouldSynthesizeProcessExit(conflict, runtime)) {
+        return;
       }
+      processGoneSynthesized.add(conflict.workerId);
+      const transcriptKey = {
+        workflowId: conflict.workflowId,
+        ticketNumber: conflict.ticketNumber,
+        attempt: conflict.attempt,
+      };
+      await bound.transcripts.append(transcriptKey, {
+        type: "process-gone",
+        workerId: conflict.workerId,
+        pid: conflict.pid ?? runtime?.pid,
+        reason:
+          "Conflict worker still marked running but the OS process is gone; synthesizing process-exit.",
+      });
+      await handleWorkerEvent(bound, {
+        type: "process-exit",
+        workerId: conflict.workerId,
+        code: null,
+      });
     }
   }
 
@@ -9647,11 +9739,13 @@ export function createWorkflowCoordinator(
     mode?: "full" | "local";
   }): Promise<WorkflowPanelState | undefined> {
     const bound = await requireScoped();
+    const mode = options?.mode ?? "full";
     await heartbeatHeldWorkflowCoordinatorLease(bound);
-    await heartbeatHeldWorkerSlots(bound, { verify: true });
+    // Local wait-loop polls are frequent; only full refreshes verify remote
+    // worker-slot ownership (renew still runs on interval either way).
+    await heartbeatHeldWorkerSlots(bound, { verify: mode === "full" });
     // Detect zombie running state before snapshotting the panel.
     await reconcileDeadWorkers(bound);
-    const mode = options?.mode ?? "full";
 
     let active: ActiveWorkflow | undefined;
     if (mode === "local" && cachedPanelActive) {
