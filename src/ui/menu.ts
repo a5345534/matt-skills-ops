@@ -36,7 +36,9 @@ import {
   MERGE_WORKFLOW_PR_ACTION,
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
+  RESUME_WORKFLOW_ACTION_PREFIX,
   START_FOLLOW_UP_ACTION,
+  START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   STAGE_CONFIRMATION_OPTIONS,
   TICKET_PROGRESS_ACTION,
   WORKER_CONCURRENCY_WARNING_THRESHOLD,
@@ -58,6 +60,7 @@ function log(
 }
 import type {
   AvailableModel,
+  EmergencyStopResult,
   ImplementationDispositionDecision,
   ImplementationRecoveryState,
   NextAction,
@@ -100,6 +103,14 @@ function isReworkNextAction(action: NextAction): boolean {
   return action.id.startsWith(REWORK_TICKET_ACTION_PREFIX);
 }
 
+/** Routing choices must always be chosen by the operator, never auto-picked. */
+function isWorkflowRoutingAction(action: NextAction): boolean {
+  return (
+    action.id === START_NEW_INDEPENDENT_WORKFLOW_ACTION.id ||
+    action.id.startsWith(RESUME_WORKFLOW_ACTION_PREFIX)
+  );
+}
+
 /** Human-readable Implementation recovery cooldown lines for pipeline stop/UI. */
 export function formatImplementationRecoveryLines(
   recovery: readonly ImplementationRecoveryState[],
@@ -131,6 +142,7 @@ export function selectPipelineAction(
     (a) => a.id !== TICKET_PROGRESS_ACTION.id && !isReworkNextAction(a),
   );
   if (actionable.length === 0) return undefined;
+  if (actionable.some(isWorkflowRoutingAction)) return undefined;
   if (actionable.length === 1) return actionable[0];
 
   // Do not auto-start a brand-new workflow when both Create-spec and
@@ -273,7 +285,18 @@ export type WaitForPipelineWorkersResult =
   /** Paused safely; the live brief was dismissed with Esc. */
   | { status: "paused" }
   | { status: "terminated"; result: RunTerminationResult }
+  | { status: "emergency-stopped"; result: EmergencyStopResult }
   | { status: "timeout" };
+
+function isWaitStopResult(
+  result: WaitForPipelineWorkersResult,
+): result is
+  | { status: "terminated"; result: RunTerminationResult }
+  | { status: "emergency-stopped"; result: EmergencyStopResult } {
+  return (
+    result.status === "terminated" || result.status === "emergency-stopped"
+  );
+}
 
 /** Coordinator surface required by the run-brief wait / control loop. */
 export type RunBriefCoordinator = Pick<
@@ -282,6 +305,7 @@ export type RunBriefCoordinator = Pick<
   | "pausePipeline"
   | "resumePipeline"
   | "terminateRun"
+  | "emergencyStop"
   | "isPipelinePaused"
   | "isRunTerminated"
   | "reconcileBlockedRunningWorkers"
@@ -295,17 +319,21 @@ const CONTINUE_WAITING_ITEM = "Keep waiting (refresh brief)";
 const PAUSE_PIPELINE_ITEM = "Pause pipeline…";
 const RESUME_PIPELINE_ITEM = "Resume pipeline…";
 const TERMINATE_RUN_ITEM = "Terminate run…";
+const EMERGENCY_STOP_ITEM = "Emergency stop (repository-scoped)…";
 const CONFIRM_PAUSE_ITEM = "Confirm Pause";
 const CONFIRM_RESUME_ITEM = "Confirm Resume";
 const CONFIRM_TERMINATE_ITEM = "Confirm Terminate";
+const CONFIRM_EMERGENCY_STOP_ITEM = "Confirm Emergency stop";
 const DECLINE_CONFIRM_ITEM = "Cancel";
 
-/** Pause confirmation body (GitHub untouched; workers abort). */
+/** Pause confirmation body (bound workflow only; GitHub untouched; workers abort). */
 export function pauseConfirmMessage(workflowId: number): string {
   return [
     `Confirm Pause for Workflow #${workflowId}?`,
-    "• Abort all session-owned Implementation and Conflict resolution workers now",
+    "• Abort this bound workflow's session-owned Implementation and Conflict resolution workers",
+    "• Release this workflow's worker slots and any held Target-branch lease",
     "• Stop auto-advance for this Matt Auto run",
+    "• Sibling workflows are not interrupted",
     "• GitHub issues, labels, manifests, and integrated history stay untouched",
   ].join("\n");
 }
@@ -328,7 +356,9 @@ export function terminateConfirmMessage(
   if (mode === "stop-only") {
     return [
       `Confirm Terminate for Workflow #${workflowId}? (stop-only)`,
-      "• End this Matt Auto run and abort session-owned workers",
+      "• End this Matt Auto run and abort this bound workflow's session-owned workers",
+      "• Release this workflow's worker slots and any held Target-branch lease",
+      "• Sibling workflows are not interrupted",
       "• Integrated tickets, closed history, and remote Integration state are preserved",
       "• Unintegrated work is left as-is (not discarded)",
       "• Does not rewrite integrated history or reopen closed tickets",
@@ -336,9 +366,23 @@ export function terminateConfirmMessage(
   }
   return [
     `Confirm Terminate for Workflow #${workflowId}?`,
-    "• End this Matt Auto run and abort session-owned workers",
+    "• End this Matt Auto run and abort this bound workflow's session-owned workers",
+    "• Release this workflow's worker slots and any held Target-branch lease",
+    "• Sibling workflows are not interrupted",
     "• May discard unintegrated attempt workspaces/branches (rollback unfinished work only)",
     "• No successful Integration unit yet — nothing integrated is rewritten",
+  ].join("\n");
+}
+
+/** Emergency-stop confirmation body — distinct from Pause/Terminate. */
+export function emergencyStopConfirmMessage(workflowId: number): string {
+  return [
+    `Confirm Emergency stop for Workflow #${workflowId}?`,
+    "• This is a repository-scoped emergency stop, not a normal Terminate",
+    "• Abort this home's session-owned workers and end the run",
+    "• Release this home's worker slots, any held Target-branch lease, and the Workflow coordinator lease",
+    "• Sibling homes are not directly controlled (fencing prevents releasing leases this home does not hold)",
+    "• GitHub integrated history is not rewritten",
   ].join("\n");
 }
 
@@ -380,6 +424,19 @@ export async function confirmTerminateControl(
     DECLINE_CONFIRM_ITEM,
   ]);
   return selected === CONFIRM_TERMINATE_ITEM;
+}
+
+/** Confirm Emergency stop; decline returns false with no coordinator mutation. */
+export async function confirmEmergencyStopControl(
+  ui: MattAutoUi,
+  workflowId: number,
+): Promise<boolean> {
+  ui.notify(emergencyStopConfirmMessage(workflowId), "error");
+  const selected = await ui.select("Confirm Emergency stop", [
+    CONFIRM_EMERGENCY_STOP_ITEM,
+    DECLINE_CONFIRM_ITEM,
+  ]);
+  return selected === CONFIRM_EMERGENCY_STOP_ITEM;
 }
 
 function runningWorkers(panel: WorkflowPanelState | undefined) {
@@ -436,7 +493,8 @@ function hasControlApis(
   return (
     typeof c.pausePipeline === "function" &&
     typeof c.resumePipeline === "function" &&
-    typeof c.terminateRun === "function"
+    typeof c.terminateRun === "function" &&
+    typeof c.emergencyStop === "function"
   );
 }
 
@@ -459,6 +517,7 @@ async function applyQueuedWaitControl(
   | { action: "resumed" }
   | { action: "dismissed" }
   | { action: "terminated"; result: RunTerminationResult }
+  | { action: "emergency-stopped"; result: EmergencyStopResult }
   | { action: "unchanged" }
 > {
   if (queued === "pause") {
@@ -596,7 +655,52 @@ async function applyConfirmedTerminate(
     affectedAttempts: result.affectedAttempts,
     discardedBranches: result.discardedBranches,
     discardedWorktrees: result.discardedWorktrees,
+    releasedTargetBranchLease: result.releasedTargetBranchLease,
+    releasedWorkerSlotCount: result.releasedWorkerSlotCount,
   });
+  return result;
+}
+
+async function applyConfirmedEmergencyStop(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+): Promise<EmergencyStopResult | undefined> {
+  const workflowId = panel.workflowId;
+  const confirmed = await confirmEmergencyStopControl(ui, workflowId);
+  log("info", "run-brief:operator-emergency-stop-decision", {
+    workflowId,
+    decision: confirmed ? "confirm" : "decline",
+  });
+  if (!confirmed) {
+    ui.notify(
+      "Emergency stop cancelled — pipeline and workers unchanged.",
+      "info",
+    );
+    return undefined;
+  }
+  const result = await coordinator.emergencyStop();
+  log("warn", "run-brief:operator-emergency-stop", {
+    workflowId,
+    abortedWorkerCount: result.abortedWorkerCount,
+    releasedTargetBranchLease: result.releasedTargetBranchLease,
+    releasedWorkerSlotCount: result.releasedWorkerSlotCount,
+    releasedCoordinatorLease: result.releasedCoordinatorLease,
+  });
+  ui.notify(
+    [
+      `Emergency stop complete for Workflow #${workflowId}.`,
+      `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
+      `Released worker slots: ${result.releasedWorkerSlotCount}.`,
+      result.releasedTargetBranchLease
+        ? "Released held Target-branch lease."
+        : "No Target-branch lease was held by this home.",
+      result.releasedCoordinatorLease
+        ? "Released Workflow coordinator lease."
+        : "No Workflow coordinator lease was held.",
+    ].join("\n"),
+    "error",
+  );
   return result;
 }
 
@@ -645,12 +749,18 @@ async function presentRunBriefControlMenu(
   | { action: "resumed" }
   | { action: "dismissed" }
   | { action: "terminated"; result: RunTerminationResult }
+  | { action: "emergency-stopped"; result: EmergencyStopResult }
   | { action: "unchanged" }
 > {
   const paused = panel.pipelinePaused === true;
   const options = paused
-    ? [RESUME_PIPELINE_ITEM, TERMINATE_RUN_ITEM]
-    : [CONTINUE_WAITING_ITEM, PAUSE_PIPELINE_ITEM, TERMINATE_RUN_ITEM];
+    ? [RESUME_PIPELINE_ITEM, TERMINATE_RUN_ITEM, EMERGENCY_STOP_ITEM]
+    : [
+        CONTINUE_WAITING_ITEM,
+        PAUSE_PIPELINE_ITEM,
+        TERMINATE_RUN_ITEM,
+        EMERGENCY_STOP_ITEM,
+      ];
 
   const selected = await ui.select(
     paused
@@ -679,6 +789,12 @@ async function presentRunBriefControlMenu(
   if (selected === TERMINATE_RUN_ITEM) {
     const result = await applyConfirmedTerminate(coordinator, ui, panel);
     if (result) return { action: "terminated", result };
+    return { action: "unchanged" };
+  }
+
+  if (selected === EMERGENCY_STOP_ITEM) {
+    const result = await applyConfirmedEmergencyStop(coordinator, ui, panel);
+    if (result) return { action: "emergency-stopped", result };
     return { action: "unchanged" };
   }
 
@@ -823,6 +939,20 @@ export async function waitForPipelineWorkers(
           ticks: i + 1,
           workflowId: panel.workflowId,
         });
+        if (panel.lastStopReason === "emergency-stop") {
+          return {
+            status: "emergency-stopped",
+            result: {
+              abortedWorkerCount: 0,
+              affectedAttempts: [],
+              releasedTargetBranchLease: false,
+              releasedWorkerSlotCount: 0,
+              releasedCoordinatorLease: false,
+              runTerminated: true,
+              lastStopReason: "emergency-stop",
+            },
+          };
+        }
         return {
           status: "terminated",
           result: {
@@ -832,6 +962,8 @@ export async function waitForPipelineWorkers(
             discardedBranches: [],
             discardedWorktrees: [],
             runTerminated: true,
+            releasedTargetBranchLease: false,
+            releasedWorkerSlotCount: 0,
           },
         };
       }
@@ -916,6 +1048,12 @@ export async function waitForPipelineWorkers(
           notifyRunBrief(ui, latest, "warning");
           ui.notify(formatTerminateNotify(control.result), "warning");
           return { status: "terminated", result: control.result };
+        }
+        if (control.action === "emergency-stopped") {
+          const latest =
+            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+          notifyRunBrief(ui, latest, "error");
+          return { status: "emergency-stopped", result: control.result };
         }
         if (control.action === "dismissed") {
           ui.notify(
@@ -1028,6 +1166,12 @@ export async function waitForPipelineWorkers(
             ui.notify(formatTerminateNotify(control.result), "warning");
             return { status: "terminated", result: control.result };
           }
+          if (control.action === "emergency-stopped") {
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, latest, "error");
+            return { status: "emergency-stopped", result: control.result };
+          }
           if (control.action === "paused") {
             continue;
           }
@@ -1067,6 +1211,12 @@ export async function waitForPipelineWorkers(
             notifyRunBrief(ui, latest, "warning");
             ui.notify(formatTerminateNotify(control.result), "warning");
             return { status: "terminated", result: control.result };
+          }
+          if (control.action === "emergency-stopped") {
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, latest, "error");
+            return { status: "emergency-stopped", result: control.result };
           }
           if (control.action === "paused") {
             continue;
@@ -1790,14 +1940,22 @@ export async function runPostGrillPipeline(
     // Pipeline pause keeps the brief visible until Resume or Terminate.
     if (coordinator.isPipelinePaused()) {
       const waitResult = await waitForPipelineWorkers(coordinator, ui);
-      if (waitResult.status === "terminated") {
+      if (isWaitStopResult(waitResult)) {
         log("info", "pipeline:stop", {
-          reason: "run-terminated",
+          reason:
+            waitResult.status === "emergency-stopped"
+              ? "emergency-stop"
+              : "run-terminated",
           step,
-          mode: waitResult.result.mode,
+          ...(waitResult.status === "terminated"
+            ? { mode: waitResult.result.mode }
+            : {}),
         });
         endSignal = {
-          body: "Matt Auto run terminated.",
+          body:
+            waitResult.status === "emergency-stopped"
+              ? "Matt Auto emergency stop complete."
+              : "Matt Auto run terminated.",
           warning: true,
         };
         return;
@@ -1851,11 +2009,16 @@ export async function runPostGrillPipeline(
           integration: panel?.integration,
         });
         const waitResult = await waitForPipelineWorkers(coordinator, ui);
-        if (waitResult.status === "terminated") {
+        if (isWaitStopResult(waitResult)) {
           log("info", "pipeline:stop", {
-            reason: "run-terminated",
+            reason:
+              waitResult.status === "emergency-stopped"
+                ? "emergency-stop"
+                : "run-terminated",
             step,
-            mode: waitResult.result.mode,
+            ...(waitResult.status === "terminated"
+              ? { mode: waitResult.result.mode }
+              : {}),
           });
           return;
         }
@@ -1885,14 +2048,22 @@ export async function runPostGrillPipeline(
         return;
       }
       const waitResult = await waitForPipelineWorkers(coordinator, ui);
-      if (waitResult.status === "terminated") {
+      if (isWaitStopResult(waitResult)) {
         log("info", "pipeline:stop", {
-          reason: "run-terminated",
+          reason:
+            waitResult.status === "emergency-stopped"
+              ? "emergency-stop"
+              : "run-terminated",
           step,
-          mode: waitResult.result.mode,
+          ...(waitResult.status === "terminated"
+            ? { mode: waitResult.result.mode }
+            : {}),
         });
         endSignal = {
-          body: "Matt Auto run terminated.",
+          body:
+            waitResult.status === "emergency-stopped"
+              ? "Matt Auto emergency stop complete."
+              : "Matt Auto run terminated.",
           warning: true,
         };
         return;
@@ -1932,11 +2103,16 @@ export async function runPostGrillPipeline(
               })),
             });
             const waitResult = await waitForPipelineWorkers(coordinator, ui);
-            if (waitResult.status === "terminated") {
+            if (isWaitStopResult(waitResult)) {
               log("info", "pipeline:stop", {
-                reason: "run-terminated",
+                reason:
+                  waitResult.status === "emergency-stopped"
+                    ? "emergency-stop"
+                    : "run-terminated",
                 step,
-                mode: waitResult.result.mode,
+                ...(waitResult.status === "terminated"
+                  ? { mode: waitResult.result.mode }
+                  : {}),
               });
               return;
             }
@@ -2180,6 +2356,13 @@ export async function presentTicketsStageConfirmation(
 function notifyStageResult(ui: MattAutoUi, result: StageResult): void {
   switch (result.status) {
     case "completed":
+      if (result.stage === "workflow-routing") {
+        ui.notify(
+          `Workflow home is now bound to Workflow #${result.workflowId}${result.targetBranch ? ` for ${result.targetBranch}` : ""}.`,
+          "info",
+        );
+        return;
+      }
       if (result.stage === "create-spec") {
         ui.notify(
           `Published Create-spec as Workflow ID #${result.workflowId}. Workflow manifest written. Next: Create tickets.`,

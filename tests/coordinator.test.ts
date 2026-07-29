@@ -181,6 +181,20 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
       if (!names.includes("resolving-merge-conflicts")) {
         return { ok: false, reason: "Installed skill resolving-merge-conflicts is missing." };
       }
+      if (input.kind === "target-refresh") {
+        return {
+          ok: true,
+          skillCommand: "/resolving-merge-conflicts",
+          prompt: [
+            `/resolving-merge-conflicts`,
+            "",
+            "Resolve Target-refresh conflict",
+            `Integration branch: ${input.integrationBranch}`,
+            `Target branch: ${input.targetBranch}`,
+            `Expected target SHA: ${input.targetSha}`,
+          ].join("\n"),
+        };
+      }
       return {
         ok: true,
         skillCommand: "/resolving-merge-conflicts",
@@ -371,6 +385,11 @@ function createWorkspace(
       }
       return { ok: true, mergeCommitSha: "merge-sha-1" };
     },
+    refreshIntegrationFromTarget: async () => ({
+      ok: true as const,
+      targetSha: "a".repeat(40),
+      mergeCommitSha: "refresh-sha-1",
+    }),
     listWorkflowBranches: async (workflowId) => {
       state.listBranchesCalls.push(workflowId);
       const branches = new Set<string>();
@@ -680,18 +699,40 @@ type TrackerState = {
   closeIssueComments: Array<{ number: number; comment: string }>;
   reopenIssueCalls: number[];
   createPrCalls: Array<{ head: string; base: string; title: string }>;
-  mergePrCalls: number[];
+  mergePrCalls: Array<{
+    number: number;
+    mergeMethod?: string;
+    expectedHeadSha?: string;
+    expectedTargetSha?: string;
+  }>;
+  prHeadByNumber: Map<number, { headSha: string; baseSha: string }>;
+  automationPolicy?: import("../src/workflow-pr-guard.js").ProtectedBranchAutomationPolicy;
   addBlockedByCalls: Array<{ issue: number; blocker: number }>;
   addSubIssueCalls: Array<{ parent: number; child: number }>;
   nextNumber: number;
   nextPrNumber: number;
 };
 
+const DEFAULT_AUTOMATION_POLICY: import("../src/workflow-pr-guard.js").ProtectedBranchAutomationPolicy =
+  {
+    repository: { owner: "acme", name: "widgets" },
+    targetRef: "refs/heads/main",
+    coordinationRefsWritable: true,
+    requiredStatusChecks: { strict: true, contexts: ["ci"] },
+    requiredApprovingReviewCount: 0,
+    allowedMergeMethods: ["squash", "merge"],
+    preferredMergeMethod: "squash",
+    mergeQueueRequired: false,
+    actorCanMergeWithoutApproval: true,
+    staleBaseProtectionGuaranteed: true,
+  };
+
 function createTracker(
   initial: {
     active?: ActiveWorkflow;
     failCreate?: boolean;
     failWriteManifest?: boolean;
+    automationPolicy?: import("../src/workflow-pr-guard.js").ProtectedBranchAutomationPolicy;
     /** Extra ticket issues already on GitHub (for frontier tests). */
     tickets?: Array<{
       number: number;
@@ -712,6 +753,10 @@ function createTracker(
     reopenIssueCalls: [],
     createPrCalls: [],
     mergePrCalls: [],
+    prHeadByNumber: new Map(),
+    automationPolicy: initial.automationPolicy ?? {
+      ...DEFAULT_AUTOMATION_POLICY,
+    },
     addBlockedByCalls: [],
     addSubIssueCalls: [],
     nextNumber: 100,
@@ -794,6 +839,34 @@ function createTracker(
       }
       state.manifests.set(issueNumber, manifest);
     },
+    findActiveWorkflows: async (target) => {
+      const targetBranch = target.targetRef.startsWith("refs/heads/")
+        ? target.targetRef.slice("refs/heads/".length)
+        : "";
+      const active: ActiveWorkflow[] = [];
+      for (const manifest of state.manifests.values()) {
+        if (manifest.targetBranch !== targetBranch) continue;
+        if (manifest.stage === "completed") continue;
+        const issue = state.issues.find((i) => i.number === manifest.workflowId);
+        const item: ActiveWorkflow = {
+          workflowId: manifest.workflowId,
+          targetBranch: manifest.targetBranch,
+          stage: manifest.stage,
+          workerProfile: manifest.workerProfile,
+        };
+        if (manifest.tickets) item.tickets = [...manifest.tickets];
+        if (manifest.integrationBranch) item.integrationBranch = manifest.integrationBranch;
+        if (manifest.integratedTickets) {
+          item.integratedTickets = [...manifest.integratedTickets];
+        }
+        if (manifest.workflowPr) item.workflowPr = { ...manifest.workflowPr };
+        if (manifest.version === 2) item.coordination = manifest.coordination;
+        if (manifest.followUpOf !== undefined) item.followUpOf = manifest.followUpOf;
+        if (issue?.title) item.title = issue.title;
+        active.push(item);
+      }
+      return active;
+    },
     findActiveWorkflow: async (targetBranch) => {
       for (const manifest of state.manifests.values()) {
         if (manifest.targetBranch !== targetBranch) continue;
@@ -863,6 +936,8 @@ function createTracker(
       const issue = state.issues.find((i) => i.number === issueNumber);
       if (issue) issue.state = "OPEN";
     },
+    getCanonicalRepositoryIdentity: async () =>
+      state.automationPolicy?.repository ?? { owner: "acme", name: "widgets" },
     createPullRequest: async (input) => {
       state.createPrCalls.push({
         head: input.head,
@@ -880,13 +955,55 @@ function createTracker(
         merged: false,
         url,
       });
+      if (!state.prHeadByNumber.has(number)) {
+        state.prHeadByNumber.set(number, {
+          headSha: "a".repeat(40),
+          baseSha: "b".repeat(40),
+        });
+      }
       return { number, url };
     },
+    inspectProtectedBranchAutomation: async (input) => {
+      const policy = state.automationPolicy ?? DEFAULT_AUTOMATION_POLICY;
+      return {
+        ...policy,
+        targetRef: `refs/heads/${input.targetBranch}`,
+      };
+    },
+    getPullRequestFreshness: async (input) => {
+      const recorded = state.prHeadByNumber.get(input.number);
+      if (!recorded) {
+        throw new Error(`PR #${input.number} freshness not found`);
+      }
+      return { ...recorded, mergeable: true };
+    },
     mergePullRequest: async (input) => {
-      state.mergePrCalls.push(input.number);
+      if (!input.mergeMethod) {
+        throw new Error(
+          `Cannot merge Workflow PR #${input.number}: merge method required`,
+        );
+      }
+      state.mergePrCalls.push({
+        number: input.number,
+        mergeMethod: input.mergeMethod,
+        ...(input.expectedHeadSha
+          ? { expectedHeadSha: input.expectedHeadSha }
+          : {}),
+        ...(input.expectedTargetSha
+          ? { expectedTargetSha: input.expectedTargetSha }
+          : {}),
+      });
       const pr = state.pullRequests.find((p) => p.number === input.number);
       if (!pr) {
         throw new Error(`PR #${input.number} not found`);
+      }
+      if (input.expectedHeadSha) {
+        const live = state.prHeadByNumber.get(input.number);
+        if (live && live.headSha !== input.expectedHeadSha) {
+          throw new Error(
+            `Head commit does not match expected ${input.expectedHeadSha}`,
+          );
+        }
       }
       pr.merged = true;
     },
@@ -1128,6 +1245,11 @@ describe("Workflow coordinator preflight", () => {
       "target-branch",
       "matt-skills",
       "worker-profile",
+      "canonical-repository",
+      "coordination-refs",
+      "merge-method",
+      "stale-base-protection",
+      "merge-authority",
     ]);
     expect(result.checks.every((c) => c.ok)).toBe(true);
     expect(result.workerProfile).toEqual({
@@ -1279,6 +1401,44 @@ describe("Workflow coordinator preflight", () => {
       source: "workflow-root",
     });
   });
+
+  it("fail-closes preflight when protected-branch automation is incompatible", async () => {
+    const tracker = createTracker({
+      automationPolicy: {
+        repository: { owner: "acme", name: "widgets" },
+        targetRef: "refs/heads/main",
+        coordinationRefsWritable: true,
+        requiredStatusChecks: { strict: false, contexts: ["ci"] },
+        requiredApprovingReviewCount: 2,
+        allowedMergeMethods: [],
+        mergeQueueRequired: true,
+        actorCanMergeWithoutApproval: false,
+        staleBaseProtectionGuaranteed: false,
+      },
+    });
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    const result = await coordinator.preflight();
+    expect(result.ok).toBe(false);
+    expect(result.checks.find((c) => c.id === "merge-method")?.ok).toBe(false);
+    expect(
+      result.checks.find((c) => c.id === "stale-base-protection")?.ok,
+    ).toBe(false);
+    expect(result.checks.find((c) => c.id === "merge-authority")?.ok).toBe(
+      false,
+    );
+    expect(
+      result.checks.find((c) => c.id === "merge-authority")?.guidance,
+    ).toMatch(/merge queue|approving review|human interaction/i);
+  });
+
 });
 
 describe("Workflow coordinator Worker profile precedence", () => {
@@ -4886,12 +5046,69 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
       workflowId: 42,
       workflowPrNumber: 500,
     });
-    expect(tracker.state.mergePrCalls).toEqual([500]);
+    expect(tracker.state.mergePrCalls).toEqual([
+      { number: 500, mergeMethod: "squash" },
+    ]);
     expect(tracker.state.pullRequests[0]?.merged).toBe(true);
     expect(tracker.state.manifests.get(42)?.stage).toBe("merged");
 
     const ids = (await coordinator.nextActions()).map((a) => a.id);
     expect(ids).toEqual([CLEANUP_WORKFLOW_ACTION.id]);
+  });
+
+  it("uses the repository-configured merge method rather than a hard-coded strategy", async () => {
+    const ci = createCi({ result: { status: "success", summary: "green" } });
+    const tracker = createTracker({
+      automationPolicy: {
+        repository: { owner: "acme", name: "widgets" },
+        targetRef: "refs/heads/main",
+        coordinationRefsWritable: true,
+        requiredStatusChecks: { strict: true, contexts: ["ci"] },
+        requiredApprovingReviewCount: 0,
+        allowedMergeMethods: ["rebase"],
+        preferredMergeMethod: "rebase",
+        mergeQueueRequired: false,
+        actorCanMergeWithoutApproval: true,
+        staleBaseProtectionGuaranteed: true,
+      },
+      active: {
+        workflowId: 42,
+        targetBranch: DEFAULT_TARGET_BRANCH,
+        stage: "tickets-published",
+        workerProfile: defaultWorkerProfile,
+        title: "Configured merge method",
+        tickets: [43, 44, 45],
+      },
+      tickets: [
+        { number: 43, title: "Ship core path", blockedBy: [] },
+        { number: 44, title: "Ship parallel path", blockedBy: [] },
+        { number: 45, title: "Ship dependent path", blockedBy: [43] },
+      ],
+    });
+    const workspace = createWorkspace("/repo");
+    const workers = createWorkers();
+    const remoteGit = createRemoteGit();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+          workspace,
+          workers,
+          remoteGit,
+          ci,
+        },
+      }),
+    );
+    await integrateAndClose(coordinator, workers, 43);
+    await integrateAndClose(coordinator, workers, 44);
+    await integrateAndClose(coordinator, workers, 45);
+    await coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    const merged = await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+    expect(merged).toMatchObject({ status: "completed", stage: "workflow-pr" });
+    expect(tracker.state.mergePrCalls).toEqual([
+      { number: 500, mergeMethod: "rebase" },
+    ]);
   });
 
   it("pairs local and remote matt-auto cleanup after merge and closes the parent Workflow spec", async () => {
@@ -5103,6 +5320,8 @@ describe("Workflow coordinator Pipeline pause and Run termination", () => {
         },
       ],
       pipelinePaused: true,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     });
     expect(workers.state.abortAllCount).toBe(1);
     expect(workers.state.aborts).toContain("implement-42-43-r1");

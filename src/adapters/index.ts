@@ -45,10 +45,15 @@ export {
   type SkillsHost,
 } from "./skills.js";
 export {
+  activeWorkflowFromManifest,
+  activeWorkflowsFromIssues,
+  coordinatedActiveWorkflowsFromIssues,
   createTrackerPort,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
+  workflowManifestMatchesTarget,
 } from "./tracker.js";
+export type { WorkflowManifestIssue } from "./tracker.js";
 export { createGitTopologyPort } from "./topology.js";
 export {
   createWorkspacePort,
@@ -62,7 +67,32 @@ export {
   discoverLocalVerificationCommands,
 } from "./verification.js";
 export { createRemoteGitPort } from "./remote-git.js";
+export {
+  COORDINATION_REF_PREFIX,
+  InMemoryCoordinationStore,
+  assertCoordinationLeaseKey,
+  coordinationLeaseRefName,
+  createCoordinationPort,
+  createFakeCoordinationPort,
+  createInMemoryCoordinationPort,
+  createInMemoryCoordinationStore,
+  workerCapacityPolicyRefName,
+} from "./coordination.js";
+export type {
+  CoordinationPortOptions,
+  InMemoryCoordinationPortOptions,
+} from "./coordination.js";
 export { createCiPort } from "./ci.js";
+export {
+  InMemoryWorkflowHomeLockStore,
+  createInMemoryWorkflowHomeLockPort,
+  createInMemoryWorkflowHomeLockStore,
+  createWorkflowHomeLockPort,
+} from "./workflow-home-lock.js";
+export type {
+  InMemoryWorkflowHomeLockPortOptions,
+  WorkflowHomeLockPortOptions,
+} from "./workflow-home-lock.js";
 export {
   ensureSubmoduleGitlinksPublished,
   gitlinkPublishRef,

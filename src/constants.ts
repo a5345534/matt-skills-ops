@@ -9,6 +9,23 @@ export const DEFAULT_TARGET_BRANCH = "main";
 export const DEFAULT_WORKER_CONCURRENCY = 2;
 
 /**
+ * Default lifetime for a renewable remote coordination lease. The coordinator
+ * renews well before this TTL; expiry allows a crashed Workflow home to be
+ * safely reclaimed through a fenced conditional ref update.
+ */
+export const DEFAULT_COORDINATION_LEASE_TTL_MS = 60_000;
+
+/** Recommended cadence for renewing a live coordination lease. */
+export const DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * Short lease used only while a coordinator snapshots demand and conditionally
+ * assigns repository-wide Implementation worker slots. It is intentionally
+ * shorter than a worker slot lease: scheduler ownership never spans a worker.
+ */
+export const DEFAULT_REPOSITORY_SCHEDULER_LEASE_TTL_MS = 15_000;
+
+/**
  * Concurrency warning threshold for the configure UI.
  * Setting N above this shows a one-time confirmation; run-time filling does not re-prompt.
  * Fixed for this slice (initially four).
@@ -46,6 +63,30 @@ export const CREATE_SPEC_ACTION = {
   description:
     "Run the Create-spec Planning stage in Workflow home using the installed to-spec skill.",
 } as const;
+
+/**
+ * Explicit routing choice for a checkout that has no valid Workflow-home
+ * binding. It intentionally does not select any sibling Active workflow.
+ */
+export const START_NEW_INDEPENDENT_WORKFLOW_ACTION = {
+  id: "start-new-independent-workflow",
+  label: "Start new independent workflow",
+  description:
+    "Keep this Workflow home independent and begin Create-spec instead of attaching to another Active workflow.",
+} as const;
+
+/** Prefix for explicit Workflow-home resume choices. */
+export const RESUME_WORKFLOW_ACTION_PREFIX = "resume-workflow:" as const;
+
+export function resumeWorkflowActionId(workflowId: number): string {
+  return `${RESUME_WORKFLOW_ACTION_PREFIX}${workflowId}`;
+}
+
+export function parseResumeWorkflowActionId(actionId: string): number | undefined {
+  if (!actionId.startsWith(RESUME_WORKFLOW_ACTION_PREFIX)) return undefined;
+  const workflowId = Number(actionId.slice(RESUME_WORKFLOW_ACTION_PREFIX.length));
+  return Number.isInteger(workflowId) && workflowId > 0 ? workflowId : undefined;
+}
 
 /** Next action: Create-tickets Planning stage (after a published spec). */
 export const CREATE_TICKETS_ACTION = {
@@ -116,6 +157,37 @@ export function implementationBranchName(
  */
 export function integrationBranchName(workflowId: number): string {
   return `matt-auto/${workflowId}/integration`;
+}
+
+/**
+ * True when a branch name belongs exclusively to one Workflow ID's namespace.
+ * Cleanup, terminate discard, and remote paired deletion must use this so a
+ * sibling workflow's branches can never be removed by accident.
+ *
+ * Matches `matt-auto/<id>` and `matt-auto/<id>/...` only — never a sibling id
+ * that merely shares a numeric prefix (e.g. 4 vs 42).
+ */
+export function isWorkflowOwnedBranch(
+  workflowId: number,
+  branchName: string,
+): boolean {
+  if (!Number.isInteger(workflowId) || workflowId <= 0) return false;
+  const name = branchName.trim();
+  if (!name) return false;
+  const prefix = `matt-auto/${workflowId}`;
+  return name === prefix || name.startsWith(`${prefix}/`);
+}
+
+/** Filter branch names to those owned by the given Workflow ID. */
+export function filterWorkflowOwnedBranches(
+  workflowId: number,
+  branchNames: readonly string[],
+): string[] {
+  return [
+    ...new Set(
+      branchNames.filter((branch) => isWorkflowOwnedBranch(workflowId, branch)),
+    ),
+  ].sort();
 }
 
 /** Prefix for Next actions that retry a failed Integration unit. */
@@ -241,6 +313,18 @@ export const MERGE_WORKFLOW_PR_ACTION = {
   label: "Merge Workflow PR",
   description:
     "Merge the Workflow PR as a Next action rather than requiring a manual GitHub operation.",
+} as const;
+
+/**
+ * Next action: refresh the Integration branch from the current Target branch.
+ * Coordination-aware delivery only — merges Target into Integration, never rebases
+ * or pushes the Target branch, and uses the Target-branch lease lane.
+ */
+export const REFRESH_FROM_TARGET_ACTION = {
+  id: "refresh-from-target",
+  label: "Refresh from Target branch",
+  description:
+    "Merge the latest Target branch into the Integration branch, run Local verification, push the refreshed head, and release the Target-branch lease while PR checks re-run.",
 } as const;
 
 /** Next action: paired local + remote Workflow cleanup after merge. */

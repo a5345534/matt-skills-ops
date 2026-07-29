@@ -1,14 +1,23 @@
 import type {
   ActiveWorkflow,
   AvailableModel,
+  CanonicalRepositoryIdentity,
+  CanonicalTargetIdentity,
   CiStatus,
+  CoordinationLease,
+  CoordinationLeaseKind,
   HomeModelSelection,
+  RepositoryWorkerCapacityPolicy,
   SpecDraft,
   TicketsDraft,
   WorkerProfile,
   WorkerProtocolEvent,
+  WorkflowHomeBinding,
+  WorkflowHomeLock,
   WorkflowManifest,
+  WorkflowMergeMethod,
 } from "./types.js";
+import type { ProtectedBranchAutomationPolicy } from "./workflow-pr-guard.js";
 
 /**
  * Environment facts for Workflow preflight on one Workflow root.
@@ -79,14 +88,13 @@ export type SkillsPort = {
   }): Promise<PrepareImplementOutcome>;
   /**
    * Prepare a Conflict resolution worker for the installed `resolving-merge-conflicts` skill.
+   * Supports ticket-to-Integration conflicts and Target-branch refresh conflicts.
    * Returns the prompt/command the worker process should run in the Integration workspace.
    * Does not invent a separate conflict-resolution skill; does not modify skill definitions.
    */
-  prepareResolveConflicts(input: {
-    ticketNumber: number;
-    ticketBranch: string;
-    integrationBranch: string;
-  }): Promise<PrepareResolveConflictsOutcome>;
+  prepareResolveConflicts(
+    input: PrepareResolveConflictsInput,
+  ): Promise<PrepareResolveConflictsOutcome>;
 };
 
 /** Outcome of preparing the installed `implement` skill for a worker. */
@@ -101,6 +109,38 @@ export type PrepareImplementOutcome =
   | { ok: false; reason: string };
 
 /**
+ * Ticket-to-Integration conflict context for the installed resolving-merge-conflicts skill.
+ * `kind` is optional for backward-compatible call sites; omitted means ticket-integration.
+ */
+export type TicketIntegrationConflictInput = {
+  kind?: "ticket-integration";
+  ticketNumber: number;
+  ticketBranch: string;
+  integrationBranch: string;
+};
+
+/**
+ * Target-branch refresh conflict context for the same installed skill.
+ * Identifies the Integration branch, Target branch, expected target SHA, and
+ * optional lease generation so the worker can resolve without inventing state.
+ */
+export type TargetRefreshConflictInput = {
+  kind: "target-refresh";
+  integrationBranch: string;
+  targetBranch: string;
+  /** Exact Target object ID fetched for this refresh attempt. */
+  targetSha: string;
+  /** Observed Target-branch lease generation for diagnostics, when known. */
+  targetLeaseGeneration?: number;
+  workflowId?: number;
+};
+
+/** Input for preparing either ticket-to-Integration or Target-refresh conflict resolution. */
+export type PrepareResolveConflictsInput =
+  | TicketIntegrationConflictInput
+  | TargetRefreshConflictInput;
+
+/**
  * Outcome of preparing the installed `resolving-merge-conflicts` skill for a worker.
  * Same shape as PrepareImplementOutcome; separate name for the Matt skills adapter boundary.
  */
@@ -110,6 +150,28 @@ export type PrepareResolveConflictsOutcome = PrepareImplementOutcome;
 export type IntegrationMergeResult =
   | { ok: true; mergeCommitSha?: string }
   | { ok: false; reason: "conflict" | "error"; message: string };
+
+/**
+ * Outcome of fetching the current Target branch and merging it into the Integration branch.
+ * Local only — never rebases and never pushes (especially never to the Target branch).
+ * On conflict, preserves the in-progress merge for a Conflict resolution worker.
+ */
+export type TargetRefreshResult =
+  | {
+      ok: true;
+      /** Exact Target object ID that was merged into the Integration branch. */
+      targetSha: string;
+      mergeCommitSha?: string;
+      /** True when the Integration branch already contained the Target tip. */
+      alreadyUpToDate?: boolean;
+    }
+  | {
+      ok: false;
+      reason: "conflict" | "error";
+      message: string;
+      /** Target SHA when fetch succeeded before the merge failed. */
+      targetSha?: string;
+    };
 
 /**
  * Local Implementation / Integration workspace (branch + worktree) operations.
@@ -168,6 +230,19 @@ export type WorkspacePort = {
     workflowId: number;
     ticketBranch: string;
   }): Promise<IntegrationMergeResult>;
+  /**
+   * Fetch the current Target branch and merge it into the Integration branch
+   * inside the Integration workspace. Local only — never rebases, never pushes,
+   * and never writes the Target branch. On conflict, preserves the in-progress
+   * merge for a Conflict resolution worker (does not abort).
+   */
+  refreshIntegrationFromTarget(input: {
+    workflowId: number;
+    /** Bare Target branch name or fully qualified `refs/heads/...` ref. */
+    targetBranch: string;
+    /** Remote name used to fetch the Target tip (default `origin`). */
+    remote?: string;
+  }): Promise<TargetRefreshResult>;
   /**
    * List local matt-auto branches owned by a Workflow ID
    * (Integration branch + ticket attempt branches).
@@ -281,6 +356,179 @@ export type RemoteGitPort = {
   safePullBranch(branchName: string): Promise<SafePullResult>;
 };
 
+/**
+ * Deterministic identity for one remote coordination lease record.
+ * The remote CoordinationPort derives its reserved ref name from this key.
+ */
+export type CoordinationLeaseKey =
+  | {
+      kind: "workflow-coordinator";
+      repository: CanonicalRepositoryIdentity;
+      target: CanonicalTargetIdentity;
+      workflowId: number;
+    }
+  | {
+      kind: "target-branch";
+      target: CanonicalTargetIdentity;
+    }
+  | {
+      kind: "repository-scheduler";
+      repository: CanonicalRepositoryIdentity;
+    }
+  | {
+      kind: "worker-slot";
+      repository: CanonicalRepositoryIdentity;
+      slot: number;
+    };
+
+/** Lease-acquisition request. `holderId` must identify one live Workflow home/process. */
+export type AcquireCoordinationLeaseInput =
+  | (Extract<CoordinationLeaseKey, { kind: "workflow-coordinator" }> & {
+      holderId: string;
+      /** Optional positive TTL override, primarily useful for deterministic tests. */
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "target-branch" }> & {
+      holderId: string;
+      /** Workflow currently assigned the serial delivery lane, when any. */
+      workflowId?: number;
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "repository-scheduler" }> & {
+      holderId: string;
+      ttlMs?: number;
+    })
+  | (Extract<CoordinationLeaseKey, { kind: "worker-slot" }> & {
+      holderId: string;
+      workflowId: number;
+      ticketNumber?: number;
+      ttlMs?: number;
+    });
+
+/** Result of conditionally acquiring one lease from its observed remote ref state. */
+export type AcquireCoordinationLeaseResult =
+  | { acquired: true; lease: CoordinationLease }
+  | {
+      acquired: false;
+      /** `held` is an observed live holder; `contended` changed during acquisition. */
+      reason: "held" | "contended";
+      lease?: CoordinationLease;
+    };
+
+/** Result of a conditional heartbeat/renewal. */
+export type RenewCoordinationLeaseResult =
+  | { renewed: true; lease: CoordinationLease }
+  | {
+      renewed: false;
+      reason: "not-found" | "lost" | "expired" | "contended";
+      lease?: CoordinationLease;
+    };
+
+/** Result of a conditional release. A stale holder never releases a newer generation. */
+export type ReleaseCoordinationLeaseResult =
+  | { released: true }
+  | { released: false; reason: "not-found" | "lost" | "contended" };
+
+/** Current fencing/expiry check for an already acquired lease. */
+export type VerifyCoordinationLeaseResult =
+  | { valid: true; lease: CoordinationLease }
+  | {
+      valid: false;
+      reason: "not-found" | "lost" | "expired";
+      lease?: CoordinationLease;
+    };
+
+/** Result of atomically seeding the repository-wide worker-capacity policy once. */
+export type EnsureRepositoryWorkerCapacityPolicyResult = {
+  policy: RepositoryWorkerCapacityPolicy;
+  /** True only for the contender whose exact absent-ref create succeeded. */
+  initialized: boolean;
+};
+
+/** Result of a conditional policy generation update. */
+export type UpdateRepositoryWorkerCapacityPolicyResult =
+  | { updated: true; policy: RepositoryWorkerCapacityPolicy }
+  | { updated: false; reason: "not-found" }
+  | {
+      updated: false;
+      reason: "generation-mismatch" | "contended";
+      policy: RepositoryWorkerCapacityPolicy;
+    };
+
+/**
+ * Remote coordination boundary. It owns reserved-ref names, record validation,
+ * exact conditional updates, fencing checks, expiry recovery, and the
+ * repository-wide worker-capacity policy. Workflow coordinators never issue
+ * raw coordination-ref Git commands themselves.
+ */
+export type CoordinationPort = {
+  /** Read a lease record, including expired or conditionally released tombstones a contender may reclaim. */
+  getLease(key: CoordinationLeaseKey): Promise<CoordinationLease | undefined>;
+  /** List valid lease records for one repository; expired and released tombstones are included. */
+  listLeases(input: {
+    repository: CanonicalRepositoryIdentity;
+    kind?: CoordinationLeaseKind;
+  }): Promise<readonly CoordinationLease[]>;
+  /** Conditionally acquire an absent or expired lease with a new fencing generation. */
+  acquireLease(
+    input: AcquireCoordinationLeaseInput,
+  ): Promise<AcquireCoordinationLeaseResult>;
+  /** Conditionally update heartbeat/expiry only when holder and generation still match. */
+  renewLease(input: {
+    lease: CoordinationLease;
+    ttlMs?: number;
+  }): Promise<RenewCoordinationLeaseResult>;
+  /** Conditionally mark only the exact holder/generation released, preserving its fence tombstone. */
+  releaseLease(lease: CoordinationLease): Promise<ReleaseCoordinationLeaseResult>;
+  /** Verify current holder, fencing generation, and TTL before an irreversible action. */
+  verifyLease(lease: CoordinationLease): Promise<VerifyCoordinationLeaseResult>;
+  /**
+   * Preflight probe: can this home update reserved coordination refs?
+   * Must not leave durable lease/policy mutations behind. Optional while older
+   * CoordinationPort fakes migrate; production adapters implement it.
+   */
+  canWriteCoordinationRefs?(repository: CanonicalRepositoryIdentity): Promise<
+    | { ok: true }
+    | { ok: false; reason: string }
+  >;
+  /** Read the authoritative repository-wide worker-capacity policy. */
+  getWorkerCapacityPolicy(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<RepositoryWorkerCapacityPolicy | undefined>;
+  /**
+   * Seed policy from an existing local concurrency value exactly once. Once a
+   * policy exists, every contender receives that remote authoritative value.
+   */
+  ensureWorkerCapacityPolicy(input: {
+    repository: CanonicalRepositoryIdentity;
+    seedWorkerCapacity: number;
+  }): Promise<EnsureRepositoryWorkerCapacityPolicyResult>;
+  /**
+   * Change capacity only when the caller observed the current policy generation.
+   * This is intentionally separate from first-time initialization.
+   */
+  updateWorkerCapacityPolicy(input: {
+    repository: CanonicalRepositoryIdentity;
+    workerCapacity: number;
+    expectedGeneration: number;
+  }): Promise<UpdateRepositoryWorkerCapacityPolicyResult>;
+};
+
+/** Result of attempting to own one physical Workflow-home checkout. */
+export type AcquireWorkflowHomeLockResult =
+  | { acquired: true; lock: WorkflowHomeLock }
+  | { acquired: false; holderId?: string };
+
+/**
+ * Checkout-local ownership guard. It rejects two Workflow homes in the same
+ * clone/worktree; CoordinationPort remains the cross-machine authority.
+ */
+export type WorkflowHomeLockPort = {
+  acquire(input: { holderId: string }): Promise<AcquireWorkflowHomeLockResult>;
+  renew(lock: WorkflowHomeLock): Promise<{ renewed: boolean }>;
+  release(lock: WorkflowHomeLock): Promise<{ released: boolean }>;
+};
+
 /** Launch parameters for one session-owned Implementation worker. */
 export type WorkerLaunchInput = {
   workerId: string;
@@ -382,6 +630,11 @@ export type TrackerTicket = {
  */
 export type TrackerPort = {
   /**
+   * Resolve the canonical GitHub owner/name identity for this Workflow root.
+   * Optional while legacy version-1 workflow routing remains supported.
+   */
+  getCanonicalRepositoryIdentity?(): Promise<CanonicalRepositoryIdentity | undefined>;
+  /**
    * Create a GitHub issue. For Create-spec publish, the issue number becomes the Workflow ID.
    */
   createIssue(input: {
@@ -398,9 +651,27 @@ export type TrackerPort = {
     manifest: WorkflowManifest,
   ): Promise<void>;
   /**
-   * Find the Active workflow for a Target branch, if any.
-   * Reads GitHub issues + managed Workflow manifest comments.
-   * When `hintWorkflowId` is set, only that issue is loaded (fast path).
+   * Discover every Active workflow for one canonical GitHub repository and fully
+   * qualified Target ref. Implementations must paginate all candidate issues and
+   * never select an arbitrary first match.
+   */
+  findActiveWorkflows(
+    target: CanonicalTargetIdentity,
+  ): Promise<readonly ActiveWorkflow[]>;
+  /**
+   * Discover coordination-aware Active workflows across every Target branch in
+   * one canonical repository. Repository worker scheduling uses this broader
+   * view because worker capacity is repository-scoped, not checkout- or
+   * Target-scoped. Optional while older test/third-party TrackerPorts migrate;
+   * callers fail closed or fall back to their exact Target snapshot.
+   */
+  findActiveWorkflowsForRepository?(
+    repository: CanonicalRepositoryIdentity,
+  ): Promise<readonly ActiveWorkflow[]>;
+  /**
+   * Legacy single-workflow lookup used only by version 1 coordinator routing.
+   * When no hint is available, implementations return a workflow only if exactly
+   * one matches; parallel manifests are never collapsed to an arbitrary result.
    */
   findActiveWorkflow(
     targetBranch: string,
@@ -450,9 +721,39 @@ export type TrackerPort = {
     body: string;
   }): Promise<{ number: number; url?: string }>;
   /**
-   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   * Observe protected-branch automation compatibility for one Target branch.
+   * Preflight only — never mutates branch protection, merge settings, or refs.
+   * Optional while legacy version-1 fixtures migrate; production adapters implement it.
    */
-  mergePullRequest(input: { number: number }): Promise<void>;
+  inspectProtectedBranchAutomation?(input: {
+    targetBranch: string;
+  }): Promise<ProtectedBranchAutomationPolicy>;
+  /**
+   * Live Workflow PR head/base facts used for merge-time freshness preflight.
+   * Optional while legacy version-1 fixtures migrate; production adapters implement it.
+   */
+  getPullRequestFreshness?(input: {
+    number: number;
+  }): Promise<{
+    headSha: string;
+    baseSha: string;
+    /** When known, whether GitHub currently considers the PR mergeable. */
+    mergeable?: boolean;
+  }>;
+  /**
+   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   * Automatic delivery must pass the repository-configured merge method and
+   * the expected head SHA so GitHub cannot merge a different tip.
+   */
+  mergePullRequest(input: {
+    number: number;
+    /** Repository-configured method; required for automatic delivery. */
+    mergeMethod?: WorkflowMergeMethod;
+    /** Exact expected PR head; fail closed on mismatch when provided. */
+    expectedHeadSha?: string;
+    /** Exact expected Target/base SHA observed by the caller (local guard). */
+    expectedTargetSha?: string;
+  }): Promise<void>;
 };
 
 /**
@@ -509,8 +810,9 @@ export type PreferencesPort = {
   /** Clear the Workflow-root Worker concurrency override. */
   clearRootWorkerConcurrency(): Promise<void>;
   /**
-   * Rebuildable local pointer to the Active workflow id for a Target branch.
-   * GitHub remains authoritative; this avoids scanning every open issue on each menu open.
+   * Legacy rebuildable local pointer to the Active workflow ID for a bare
+   * Target branch. New coordination-aware homes use WorkflowHomeBinding below;
+   * this remains only for version-1 compatibility and one-time migration.
    */
   getActiveWorkflowId(targetBranch: string): Promise<number | undefined>;
   setActiveWorkflowId(
@@ -518,6 +820,16 @@ export type PreferencesPort = {
     workflowId: number,
   ): Promise<void>;
   clearActiveWorkflowId(targetBranch: string): Promise<void>;
+  /**
+   * Checkout-local Workflow-home binding keyed by canonical repository + fully
+   * qualified Target ref. It is routing state only; GitHub remains authoritative.
+   * Optional while old preference files and legacy v1 routing remain supported.
+   */
+  getWorkflowHomeBinding?(
+    target: CanonicalTargetIdentity,
+  ): Promise<WorkflowHomeBinding | undefined>;
+  setWorkflowHomeBinding?(binding: WorkflowHomeBinding): Promise<void>;
+  clearWorkflowHomeBinding?(target: CanonicalTargetIdentity): Promise<void>;
 };
 
 /**
@@ -580,6 +892,10 @@ export type RootScopedPorts = {
   remoteGit: RemoteGitPort;
   /** On-demand GitHub Actions CI gate (no background polling). */
   ci: CiPort;
+  /** Remote fenced lease records for coordination-aware Workflow manifests. */
+  coordination?: CoordinationPort;
+  /** Local guard against two Workflow homes sharing this exact checkout. */
+  workflowHomeLock?: WorkflowHomeLockPort;
 };
 
 /** Ports injected into the Workflow coordinator. */

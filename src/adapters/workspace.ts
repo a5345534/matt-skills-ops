@@ -6,7 +6,11 @@ import {
   implementationBranchName,
   integrationBranchName,
 } from "../constants.js";
-import type { IntegrationMergeResult, WorkspacePort } from "../ports.js";
+import type {
+  IntegrationMergeResult,
+  TargetRefreshResult,
+  WorkspacePort,
+} from "../ports.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -313,6 +317,146 @@ export function createWorkspacePort(workflowRoot: string): WorkspacePort {
       return mergeCommitSha
         ? { ok: true, mergeCommitSha }
         : { ok: true };
+    },
+
+    async refreshIntegrationFromTarget(input): Promise<TargetRefreshResult> {
+      const branchName = integrationBranchName(input.workflowId);
+      const worktreePath = integrationWorktreePath(root, input.workflowId);
+      const remote = input.remote?.trim() || "origin";
+      // Accept bare names or fully qualified refs/heads/... without treating a
+      // remote alias as Target identity.
+      const targetBranch = input.targetBranch.startsWith("refs/heads/")
+        ? input.targetBranch.slice("refs/heads/".length)
+        : input.targetBranch;
+
+      if (!targetBranch || targetBranch.includes("..") || targetBranch.startsWith("-")) {
+        return {
+          ok: false,
+          reason: "error",
+          message: `Invalid Target branch for refresh: ${input.targetBranch}`,
+        };
+      }
+
+      if (!(await pathExists(worktreePath))) {
+        return {
+          ok: false,
+          reason: "error",
+          message: `Integration workspace missing at ${worktreePath}`,
+        };
+      }
+
+      // Ensure the Integration workspace is on the Integration branch.
+      const checkout = await run(worktreePath, "git", ["checkout", branchName]);
+      if (checkout.code !== 0) {
+        return {
+          ok: false,
+          reason: "error",
+          message:
+            checkout.stderr ||
+            checkout.stdout ||
+            `git checkout ${branchName} failed`,
+        };
+      }
+
+      // Fetch the latest Target tip into the shared object store. Never push.
+      const fetch = await run(root, "git", ["fetch", remote, targetBranch]);
+      if (fetch.code !== 0) {
+        return {
+          ok: false,
+          reason: "error",
+          message:
+            fetch.stderr ||
+            fetch.stdout ||
+            `git fetch ${remote} ${targetBranch} failed`,
+        };
+      }
+
+      const remoteTip = `${remote}/${targetBranch}`;
+      const tip = await run(worktreePath, "git", ["rev-parse", remoteTip]);
+      let mergeRef = remoteTip;
+      let targetSha = tip.stdout.trim().toLowerCase();
+      if (tip.code !== 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+        // FETCH_HEAD is a reliable fallback when the remote-tracking ref is not configured.
+        const fetchHead = await run(worktreePath, "git", [
+          "rev-parse",
+          "FETCH_HEAD",
+        ]);
+        targetSha = fetchHead.stdout.trim().toLowerCase();
+        if (
+          fetchHead.code !== 0 ||
+          !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)
+        ) {
+          return {
+            ok: false,
+            reason: "error",
+            message:
+              tip.stderr ||
+              tip.stdout ||
+              fetchHead.stderr ||
+              fetchHead.stdout ||
+              `Could not resolve Target tip ${remoteTip} after fetch`,
+          };
+        }
+        mergeRef = targetSha;
+      }
+      const merge = await run(worktreePath, "git", [
+        "merge",
+        "--no-ff",
+        mergeRef,
+        "-m",
+        `matt-auto: refresh from ${targetBranch} (${targetSha.slice(0, 12)})`,
+      ]);
+
+      if (merge.code !== 0) {
+        const detail = (merge.stderr || merge.stdout || "").toLowerCase();
+        const isConflict =
+          detail.includes("conflict") ||
+          detail.includes("merge conflict") ||
+          detail.includes("automatic merge failed");
+        const isAlreadyUpToDate =
+          detail.includes("already up to date") ||
+          detail.includes("already up-to-date");
+
+        if (isAlreadyUpToDate) {
+          const sha = await run(worktreePath, "git", ["rev-parse", "HEAD"]);
+          const mergeCommitSha =
+            sha.code === 0 ? sha.stdout.trim() || undefined : undefined;
+          return {
+            ok: true,
+            targetSha,
+            alreadyUpToDate: true,
+            ...(mergeCommitSha ? { mergeCommitSha } : {}),
+          };
+        }
+
+        if (isConflict) {
+          // Preserve the in-progress merge for a Conflict resolution worker.
+          // Never abort here — the installed resolving-merge-conflicts skill resolves it.
+          return {
+            ok: false,
+            reason: "conflict",
+            message: merge.stderr || merge.stdout || "merge conflict",
+            targetSha,
+          };
+        }
+
+        return {
+          ok: false,
+          reason: "error",
+          message: merge.stderr || merge.stdout || `merge exit ${merge.code}`,
+          targetSha,
+        };
+      }
+
+      const sha = await run(worktreePath, "git", ["rev-parse", "HEAD"]);
+      const mergeCommitSha =
+        sha.code === 0 ? sha.stdout.trim() || undefined : undefined;
+
+      return {
+        ok: true,
+        targetSha,
+        ...(mergeCommitSha ? { mergeCommitSha } : {}),
+      };
     },
 
     async hasCommitsAhead(input) {

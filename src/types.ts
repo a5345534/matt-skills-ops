@@ -4,7 +4,17 @@ export type PreflightCheckId =
   | "gh-auth"
   | "target-branch"
   | "matt-skills"
-  | "worker-profile";
+  | "worker-profile"
+  /** Canonical GitHub owner/name resolved for coordination and PR delivery. */
+  | "canonical-repository"
+  /** Write access to the reserved coordination-ref namespace. */
+  | "coordination-refs"
+  /** Repository-configured allowed merge method (never hard-coded). */
+  | "merge-method"
+  /** Strict stale-base / required-check protection on the Target branch. */
+  | "stale-base-protection"
+  /** Non-interactive merge authority without manual approval or merge queue. */
+  | "merge-authority";
 
 /** One Workflow preflight check result with corrective guidance. */
 export type PreflightCheck = {
@@ -42,9 +52,13 @@ export type StageId =
   | "integrate"
   | "ci-gate"
   | "workflow-pr"
+  /** Target-branch refresh of the Integration branch before automatic merge. */
+  | "target-refresh"
   | "cleanup"
   | "rework"
-  | "follow-up";
+  | "follow-up"
+  /** Explicit local Workflow-home binding / resume routing. */
+  | "workflow-routing";
 
 /** On-demand CI gate status for an Integration branch. Never polled in the background. */
 export type CiStatus = "pending" | "success" | "failure";
@@ -132,14 +146,117 @@ export type WorkflowPrRef = {
   baseBranch: string;
 };
 
+/** GitHub repository identity, resolved from GitHub owner/name rather than a local remote alias. */
+export type CanonicalRepositoryIdentity = {
+  owner: string;
+  name: string;
+};
+
+/** One repository Target branch, always expressed as a fully qualified Git ref. */
+export type CanonicalTargetIdentity = {
+  repository: CanonicalRepositoryIdentity;
+  /** For example, `refs/heads/main`; never a local path or remote alias. */
+  targetRef: string;
+};
+
 /**
- * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
- * Does not alter the spec body.
+ * Checkout-local routing state for one Workflow home. GitHub manifests remain
+ * authoritative; this only tells a checkout which Workflow ID it intends to
+ * resume for one canonical Target identity.
  */
-export type WorkflowManifest = {
-  schema: "matt-auto/workflow-manifest";
-  version: 1;
+export type WorkflowHomeBinding = {
+  target: CanonicalTargetIdentity;
   workflowId: number;
+};
+
+/**
+ * A locally held checkout-ownership guard. It rejects two Workflow homes in
+ * one physical checkout; remote coordination leases remain the cross-machine
+ * authority.
+ */
+export type WorkflowHomeLock = {
+  holderId: string;
+  token: string;
+  acquiredAt: string;
+};
+
+/** GitHub merge methods Matt Auto may record as repository policy. */
+export type WorkflowMergeMethod = "merge" | "squash" | "rebase";
+
+/** Exact PR and Target commit facts required to reason about freshness. */
+export type WorkflowPrFreshness = {
+  /** Exact Workflow PR head object ID observed by the coordinator. */
+  headSha: string;
+  /** Target object ID used for the most recent refresh and local validation, when available. */
+  validatedTargetSha?: string;
+  /** Repository-configured merge method; Matt Auto must not infer one. */
+  mergeMethod: WorkflowMergeMethod;
+};
+
+/** States of one workflow's reconstructed Target-branch queue candidate. */
+export type TargetBranchQueueState =
+  | "awaiting-pr-checks"
+  | "merge-ready"
+  | "refreshing"
+  | "retryable"
+  | "transient-retry"
+  | "merged";
+
+/** A deterministic retryable outcome recorded on the owning workflow manifest. */
+export type WorkflowQueueRetry = {
+  /** Stable, machine-readable failure reason supplied by the coordinator. */
+  reason: string;
+  /** Number of attempts that have produced this outcome. */
+  attempt: number;
+  /** Time at which the retryable outcome was recorded. */
+  failedAt: string;
+};
+
+/** A retry that is bounded and delayed because its cause is transient. */
+export type TransientWorkflowQueueRetry = WorkflowQueueRetry & {
+  /** The retry budget; `attempt` must not exceed this value. */
+  maxAttempts: number;
+  /** Earliest time at which the coordinator may retry. */
+  nextRetryAt: string;
+};
+
+/**
+ * Persisted queue facts. The queue itself is reconstructed from Active manifests;
+ * this object never represents a mutable central queue.
+ */
+export type TargetBranchQueueCandidate =
+  | { state: "awaiting-pr-checks" }
+  | { state: "merge-ready"; mergeReadyAt: string }
+  | { state: "refreshing"; mergeReadyAt?: string }
+  | { state: "retryable"; retry: WorkflowQueueRetry }
+  | { state: "transient-retry"; retry: TransientWorkflowQueueRetry }
+  | { state: "merged" };
+
+/** Lease generations observed by a workflow for diagnostics and fencing context. */
+export type WorkflowLeaseGenerationReferences = {
+  workflowCoordinator?: number;
+  targetBranch?: number;
+  repositoryScheduler?: number;
+  workerSlot?: number;
+};
+
+/** Coordination facts carried only by version 2 workflow manifests. */
+export type WorkflowCoordinationFacts = {
+  /** Canonical GitHub repository plus fully qualified Target ref. */
+  target: CanonicalTargetIdentity;
+  /** PR head, validation base, and merge-method facts when a Workflow PR exists. */
+  prFreshness?: WorkflowPrFreshness;
+  /** Current queue candidate facts, if the workflow has entered delivery. */
+  queueCandidate?: TargetBranchQueueCandidate;
+  /** Non-authoritative lease-generation observations for diagnostics. */
+  observedLeaseGenerations?: WorkflowLeaseGenerationReferences;
+};
+
+/** Shared fields preserved across every Workflow manifest version. */
+type WorkflowManifestBase = {
+  schema: "matt-auto/workflow-manifest";
+  workflowId: number;
+  /** Legacy unqualified branch name retained for backward-compatible workflow behavior. */
   targetBranch: string;
   stage: WorkflowStage;
   workerProfile: WorkerProfile;
@@ -153,6 +270,95 @@ export type WorkflowManifest = {
   workflowPr?: WorkflowPrRef;
   /** When this is a Follow-up workflow, the original completed Workflow ID. */
   followUpOf?: number;
+};
+
+/** Existing single-workflow manifest format. It remains supported without migration. */
+export type LegacyWorkflowManifest = WorkflowManifestBase & {
+  version: 1;
+};
+
+/** Coordination-aware manifest format for independently Active workflows. */
+export type CoordinationWorkflowManifest = WorkflowManifestBase & {
+  version: 2;
+  coordination: WorkflowCoordinationFacts;
+};
+
+/**
+ * Managed Workflow manifest stored as a structured GitHub comment on the spec issue.
+ * Does not alter the spec body. Version 1 remains on the legacy single-workflow path.
+ */
+export type WorkflowManifest =
+  | LegacyWorkflowManifest
+  | CoordinationWorkflowManifest;
+
+/** Common fields exposed by every renewable remote coordination lease. */
+type CoordinationLeaseBase = {
+  /** Unique Workflow-home/process identity that currently holds the lease. */
+  holderId: string;
+  /** Monotonically increasing fencing generation. */
+  generation: number;
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+  /** Present after an exact conditional release; tombstones preserve fencing monotonicity. */
+  releasedAt?: string;
+};
+
+/** One workflow's coordinator lease. */
+export type WorkflowCoordinatorLease = CoordinationLeaseBase & {
+  kind: "workflow-coordinator";
+  scope: {
+    repository: CanonicalRepositoryIdentity;
+    target: CanonicalTargetIdentity;
+    workflowId: number;
+  };
+};
+
+/** The serial lease for refresh and merge work on one canonical Target branch. */
+export type TargetBranchLease = CoordinationLeaseBase & {
+  kind: "target-branch";
+  scope: { target: CanonicalTargetIdentity };
+  /** Workflow currently using the delivery lane, when one is assigned. */
+  workflowId?: number;
+};
+
+/** Short-lived lease used to allocate repository-wide Implementation worker slots. */
+export type RepositorySchedulerLease = CoordinationLeaseBase & {
+  kind: "repository-scheduler";
+  scope: { repository: CanonicalRepositoryIdentity };
+};
+
+/** One repository-wide Implementation worker slot lease. */
+export type WorkerSlotLease = CoordinationLeaseBase & {
+  kind: "worker-slot";
+  scope: { repository: CanonicalRepositoryIdentity; slot: number };
+  workflowId: number;
+  ticketNumber?: number;
+};
+
+/** Lease DTO returned by the future CoordinationPort. */
+export type CoordinationLease =
+  | WorkflowCoordinatorLease
+  | TargetBranchLease
+  | RepositorySchedulerLease
+  | WorkerSlotLease;
+
+export type CoordinationLeaseKind = CoordinationLease["kind"];
+/** Alias retained for adapters that explicitly name their boundary DTOs. */
+export type CoordinationLeaseDto = CoordinationLease;
+
+/**
+ * Repository-backed worker capacity policy. It is seeded once from local settings,
+ * then becomes the authoritative cross-checkout capacity record.
+ */
+export type RepositoryWorkerCapacityPolicy = {
+  schema: "matt-auto/repository-worker-capacity-policy";
+  version: 1;
+  repository: CanonicalRepositoryIdentity;
+  workerCapacity: number;
+  generation: number;
+  initializedAt: string;
+  updatedAt: string;
 };
 
 /**
@@ -174,6 +380,8 @@ export type ActiveWorkflow = {
   integratedTickets?: readonly IntegratedTicketRef[];
   /** Single Workflow PR when opened (or after merge, until cleanup). */
   workflowPr?: WorkflowPrRef;
+  /** Coordination facts present only for a version 2 manifest. */
+  coordination?: WorkflowCoordinationFacts;
   /** When this is a Follow-up workflow, the original completed Workflow ID. */
   followUpOf?: number;
 };
@@ -322,6 +530,12 @@ export type WorkflowPanelState = {
     baseBranch: string;
     headBranch: string;
   };
+  /**
+   * Observed parallel-delivery diagnostics for coordination-aware workflows.
+   * Populated only from current manifests, coordination refs, worker processes,
+   * CI facts, and persisted transcripts — never from inferred history.
+   */
+  parallelDelivery?: ParallelDeliveryPanelState;
   /** True when Pipeline pause is active for this coordinator session. */
   pipelinePaused: boolean;
   /** True after Run termination until a new pipeline run begins. */
@@ -334,9 +548,113 @@ export type WorkflowPanelState = {
   /** Epoch ms when the current pipeline run began. */
   runStartedAtMs?: number;
   /** Last operator stop control that affected the run loop. */
-  lastStopReason?: "pipeline-pause" | "run-termination";
+  lastStopReason?:
+    | "pipeline-pause"
+    | "run-termination"
+    | "emergency-stop";
   /** T1 stop-only vs T2 discard-unintegrated, when last stop was Run termination. */
   terminationMode?: RunTerminationMode;
+};
+
+/**
+ * Distilled waiting/delivery state for a coordination-aware workflow.
+ * Derived only from currently observed queue, lease, and PR facts.
+ */
+export type ParallelDeliveryWaitingState =
+  | "queue-waiting"
+  | "ci-pending"
+  | "target-refresh"
+  | "retryable-failure"
+  | "lost-lease"
+  | "merge-ready"
+  | "merged"
+  | "not-in-delivery";
+
+/** Observed Workflow coordinator lease health for the bound workflow. */
+export type CoordinatorLeaseHealthObservation =
+  | {
+      status: "held";
+      generation: number;
+      holderId: string;
+      expiresAt: string;
+      /** True when this Workflow home holds the live lease. */
+      heldByUs: boolean;
+    }
+  | { status: "lost" }
+  | { status: "absent" }
+  | { status: "unavailable" };
+
+/** Observed Target-branch lease holder / phase for the canonical Target. */
+export type TargetBranchLeaseObservation = {
+  status: "held-by-us" | "held-by-other" | "absent" | "expired" | "lost";
+  holderId?: string;
+  workflowId?: number;
+  generation?: number;
+  expiresAt?: string;
+  /** Present only when this home is actively driving a known delivery phase. */
+  phase?: "refresh" | "validation" | "pr-update" | "merge";
+};
+
+/**
+ * Sibling Active workflow facts visible to the bound home.
+ * Delivery observations only — never grants cross-workflow action ownership.
+ */
+export type SiblingWorkflowSummary = {
+  workflowId: number;
+  title?: string;
+  queueState?: TargetBranchQueueState;
+  workflowPr?: { number: number; status: "open" | "merged" };
+  prHeadSha?: string;
+  validatedTargetSha?: string;
+  mergeReadyAt?: string;
+  /** Live repository worker slots currently held by this sibling. */
+  heldWorkerSlots: number;
+};
+
+/** One occupied repository-wide Implementation worker slot. */
+export type WorkerSlotAllocationEntry = {
+  slot: number;
+  workflowId: number;
+  ticketNumber?: number;
+  /** True when the bound workflow home holds this slot. */
+  ownedByBoundWorkflow: boolean;
+};
+
+/** Repository-wide worker-slot allocation observed from live leases + policy. */
+export type WorkerSlotAllocationSummary = {
+  capacity: number;
+  occupied: readonly WorkerSlotAllocationEntry[];
+  freeSlotCount: number;
+  boundWorkflowHeldCount: number;
+};
+
+/**
+ * Parallel-delivery panel DTO. All fields are optional observations; missing
+ * values mean "not currently observed", never invented history.
+ */
+export type ParallelDeliveryPanelState = {
+  /** Canonical repository + fully qualified Target ref for the bound workflow. */
+  target: CanonicalTargetIdentity;
+  /** Bound Workflow ID (same as panel.workflowId; repeated for delivery context). */
+  boundWorkflowId: number;
+  coordinatorLease: CoordinatorLeaseHealthObservation;
+  targetBranchLease?: TargetBranchLeaseObservation;
+  /** Observed queue candidate for the bound workflow. */
+  queueCandidate?: TargetBranchQueueCandidate;
+  /** Distilled waiting/delivery state for UI labels. */
+  waitingState: ParallelDeliveryWaitingState;
+  /** 1-based FIFO position among merge-ready candidates when applicable. */
+  queuePosition?: number;
+  /** Number of merge-ready candidates in the reconstructed Target-branch queue. */
+  queueLength?: number;
+  /** Exact PR head SHA from current freshness facts, when observed. */
+  prHeadSha?: string;
+  /** Target SHA used for the most recent refresh/validation, when observed. */
+  validatedTargetSha?: string;
+  /** Sibling Active workflows on the same Target (facts only). */
+  siblings: readonly SiblingWorkflowSummary[];
+  /** Repository-wide Implementation worker-slot allocation, when observed. */
+  workerSlots?: WorkerSlotAllocationSummary;
 };
 
 /** Run termination mode: T1 stop-only vs T2 discard unintegrated attempts. */
@@ -355,6 +673,10 @@ export type PipelinePauseResult = {
   abortedWorkerCount: number;
   affectedAttempts: readonly PipelineAffectedAttempt[];
   pipelinePaused: true;
+  /** True when this home released its held Target-branch lease during Pause. */
+  releasedTargetBranchLease: boolean;
+  /** Number of repository worker-slot leases released for the bound workflow. */
+  releasedWorkerSlotCount: number;
 };
 
 /** Outcome of resuming after Pipeline pause. */
@@ -370,6 +692,25 @@ export type RunTerminationResult = {
   discardedBranches: readonly string[];
   discardedWorktrees: readonly string[];
   runTerminated: true;
+  /** True when this home released its held Target-branch lease during Terminate. */
+  releasedTargetBranchLease: boolean;
+  /** Number of repository worker-slot leases released for the bound workflow. */
+  releasedWorkerSlotCount: number;
+};
+
+/**
+ * Outcome of a repository-scoped emergency stop.
+ * Distinct from Pause/Terminate: releases the bound workflow's coordinator lease
+ * in addition to workers, slots, and any held Target-branch lease.
+ */
+export type EmergencyStopResult = {
+  abortedWorkerCount: number;
+  affectedAttempts: readonly PipelineAffectedAttempt[];
+  releasedTargetBranchLease: boolean;
+  releasedWorkerSlotCount: number;
+  releasedCoordinatorLease: boolean;
+  runTerminated: true;
+  lastStopReason: "emergency-stop";
 };
 
 /** One ticket withheld from auto Implement after a failed worker attempt. */
@@ -488,6 +829,20 @@ export type StageResult =
       conflictResolution?: true;
     }
   | {
+      status: "running";
+      stage: "target-refresh";
+      workflowId: number;
+      attempt: number;
+      workerId: string;
+      integrationBranch: string;
+      integrationWorktreePath?: string;
+      targetBranch: string;
+      /** Exact Target SHA being merged, when known. */
+      targetSha?: string;
+      /** True when a Conflict resolution worker owns the Target-refresh merge. */
+      conflictResolution?: true;
+    }
+  | {
       status: "needs-disposition";
       stage: "implement";
       workflowId: number;
@@ -543,6 +898,10 @@ export type StageResult =
       workflowPrUrl?: string;
       /** Target branch for the Workflow PR. */
       targetBranch?: string;
+      /** Exact Target object ID used for the most recent Target-branch refresh. */
+      validatedTargetSha?: string;
+      /** Exact Integration / PR head SHA after a Target-branch refresh. */
+      headSha?: string;
       /** Branches removed by paired Workflow cleanup (local + remote). */
       removedBranches?: readonly string[];
       /** True when paired cleanup removed local workspaces/transcripts. */
@@ -737,8 +1096,8 @@ export type WorkflowCoordinator = {
    */
   confirmStage(decision: StageConfirmationDecision): Promise<StageResult>;
   /**
-   * Active workflow for the current Target branch, if any.
-   * Recovered from GitHub (Workflow ID + Workflow manifest).
+   * Active workflow bound to this Workflow home, if any. GitHub manifests are
+   * authoritative; an unbound checkout never receives an arbitrary sibling.
    */
   getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
   /**
@@ -789,7 +1148,10 @@ export type WorkflowCoordinator = {
    */
   setActiveWorkflowWorkerProfile(profile: WorkerProfile): Promise<void>;
   /**
-   * Effective Worker concurrency after Workflow-root → global → default (2) precedence.
+   * Local effective Worker concurrency after Workflow-root → global → default
+   * (2) precedence. It seeds a repository worker-capacity policy once for a
+   * coordination-aware workflow; thereafter Implementation launch capacity is
+   * the GitHub-backed repository policy, not this per-checkout value.
    * Always a positive integer; never writes to GitHub.
    */
   getEffectiveWorkerConcurrency(): Promise<number>;
@@ -868,8 +1230,16 @@ export type WorkflowCoordinator = {
    */
   abortWorkers(): Promise<void>;
   /**
+   * Release this checkout's local ownership guard and its held Workflow
+   * coordinator lease. Workflow state remains recoverable on GitHub.
+   * Called when a Workflow home session shuts down or switches roots.
+   */
+  releaseWorkflowHome(): Promise<void>;
+  /**
    * Pipeline pause: abort session-owned workers and stop auto-advance.
    * Leaves GitHub issues, labels, manifests, and integrated history untouched.
+   * Scoped to the bound workflow: releases its workers, slots, and any held
+   * Target-branch lease without interrupting sibling workflows.
    * Confirmation is owned by the UI; this method performs the operation.
    */
   pausePipeline(): Promise<PipelinePauseResult>;
@@ -883,9 +1253,20 @@ export type WorkflowCoordinator = {
    * T2 (no successful integrate and no Workflow PR): may discard unintegrated
    * attempt workspaces/branches only. T1 (integratedTickets or workflowPr):
    * stop-only — never rewrites integrated history or reopens closed tickets.
+   * Scoped to the bound workflow: releases its workers, slots, and any held
+   * Target-branch lease without interrupting sibling workflows.
    * Confirmation is owned by the UI; this method performs the operation.
    */
   terminateRun(): Promise<RunTerminationResult>;
+  /**
+   * Repository-scoped emergency stop for this Workflow home.
+   * Distinct from Pause/Terminate: aborts session-owned workers, releases the
+   * bound workflow's slots, any held Target-branch lease, and the Workflow
+   * coordinator lease. Sibling homes are not directly controlled; fencing
+   * prevents releasing leases this home does not hold.
+   * Confirmation is owned by the UI; this method performs the operation.
+   */
+  emergencyStop(): Promise<EmergencyStopResult>;
   /** True when Pipeline pause is active (auto-advance must not continue). */
   isPipelinePaused(): boolean;
   /** True after Run termination until {@link beginPipelineRun}. */

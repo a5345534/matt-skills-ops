@@ -81,16 +81,32 @@ The project-discoverable checks run in the Integration workspace after an Integr
 _Avoid_: CI-only verification
 
 **Target branch**:
-The configured branch that receives a completed workflow. Matt Auto defaults it to `main` when no project-specific target is configured.
-_Avoid_: inferred default branch
+The configured branch that receives a completed workflow. Matt Auto defaults it to `main` when no project-specific target is configured. Coordination identifies it as a fully qualified `refs/heads/...` ref.
+_Avoid_: inferred default branch, remote alias as identity
+
+**Canonical Target identity**:
+The pair of GitHub's canonical repository owner/name and one fully qualified Target ref. It is independent of a local path, checkout, or Git remote alias.
+_Avoid_: local repository identity, bare branch name as coordination scope
 
 **Workflow PR**:
 The single GitHub pull request from an Integration branch to the Target branch after all workflow tickets have integrated and passed CI. Matt Auto offers its merge as a Next action.
 _Avoid_: direct push, per-ticket final PR
 
 **Active workflow**:
-An unmerged workflow associated with one Target branch. The MVP allows at most one Active workflow for each Target branch, while its independent tickets may run in parallel.
-_Avoid_: concurrent target-branch workflows
+An unmerged workflow associated with one Canonical Target identity. Coordination-aware workflows may independently be Active for the same identity; a version 1 manifest remains on the legacy single-workflow path.
+_Avoid_: arbitrary Active-workflow selection, local-pointer authority
+
+**Target-branch queue candidate**:
+The durable delivery facts on a coordination-aware Workflow manifest: PR freshness, queue state, merge-ready time, and any retry outcome. The Target-branch queue is reconstructed from Active manifests rather than stored as one mutable central queue.
+_Avoid_: central queue comment, inferred FIFO position
+
+**Coordination lease**:
+A renewable, fenced remote record that grants one Workflow coordinator, Target branch, scheduler, or worker slot authority within its canonical scope.
+_Avoid_: local-process lock, unfenced ownership
+
+**Repository Worker capacity policy**:
+The repository-scoped authoritative limit for simultaneous Implementation workers across coordination-aware Workflow homes. It is seeded from existing local concurrency settings once, then shared through GitHub-backed coordination state.
+_Avoid_: per-checkout aggregate capacity, fixed global cap
 
 **Workflow root**:
 An independently managed Git repository scope. Packages in a monorepo share one Workflow root; a nested independent Git repository is a separate Workflow root. Git submodules are outside the MVP.
@@ -121,8 +137,8 @@ An Implementation worker whose lifetime is bound to the Workflow home Pi process
 _Avoid_: durable worker, orphan process
 
 **Worker concurrency**:
-The maximum number of simultaneous Implementation workers for a Workflow root. It resolves from a global default, then a Workflow-root override (same layering spirit as Worker profile). When unset, it defaults to two. It applies only to Implementation workers; Integration units, Conflict resolution, and Planning stages remain single-threaded. While any Implementation disposition or Integration unit is pending, Matt Auto does not open new Implementation workers (fill-slot only when those are clear); already-running workers are not aborted. `/matt-auto run` fills empty slots from the ready frontier and waits when slots are full.
-_Avoid_: fixed global worker cap, concurrent Integration units, concurrent Planning stages
+The maximum number of simultaneous Implementation workers. Legacy workflows resolve it from a global default, then a Workflow-root override (default two). Coordination-aware workflows use the Repository Worker capacity policy across Workflow homes. It applies only to Implementation workers; Integration units, Conflict resolution, and Planning stages remain single-threaded. While any Implementation disposition or Integration unit is pending, Matt Auto does not open new Implementation workers (fill-slot only when those are clear); already-running workers are not aborted. `/matt-auto run` fills empty slots from the ready frontier and waits when slots are full.
+_Avoid_: per-checkout aggregate cap, concurrent Integration units, concurrent Planning stages
 
 **Concurrency warning**:
 A non-blocking confirmation shown when the operator sets Worker concurrency above a warning threshold (initially four, fixed for the first slice). Confirming stores the value; run-time slot filling does not re-prompt per ticket. There is no hard maximum.
@@ -149,8 +165,8 @@ The local, uncommitted structured JSON event record for a Worker attempt. Matt A
 _Avoid_: GitHub-published transcript, live-only worker output
 
 **Workflow preflight**:
-The Matt Auto setup check for a GitHub Workflow root, Target branch, `gh` authentication, required Matt skills, and Worker profile. The MVP guides correction but does not initialize Git or create repositories, commits, or pushes.
-_Avoid_: automatic repository bootstrap
+The Matt Auto setup check for a GitHub Workflow root, Target branch, `gh` authentication, required Matt skills, Worker profile, canonical repository identity, coordination-ref permissions, repository-configured merge method, strict stale-base / required-check protection, and non-interactive merge authority. The MVP guides correction but does not initialize Git, alter branch protection, or create repositories, commits, or pushes.
+_Avoid_: automatic repository bootstrap, silent branch-protection mutation
 
 **Matt Auto package**:
 The reusable Pi package that supplies Matt Auto across Workflow roots. It is installed globally by default, with project-local installation available for shared team setup.
@@ -165,8 +181,8 @@ The fail-closed recovery state entered when an invoked skill omits an expected S
 _Avoid_: inferred automatic progression
 
 **Workflow manifest**:
-The Matt Auto-managed structured GitHub comment on a workflow’s spec issue. It records orchestration metadata such as branches, Worker profile snapshot, attempts, PR and CI references, and current stage without altering the spec body.
-_Avoid_: spec-body metadata, state-label proliferation
+The Matt Auto-managed structured GitHub comment on a workflow’s spec issue. Version 1 records legacy orchestration metadata; coordination-aware versions additionally record Canonical Target identity, PR freshness, queue facts, retry facts, and observed lease generations without altering the spec body.
+_Avoid_: spec-body metadata, state-label proliferation, local coordination authority
 
 **Workflow panel**:
 A persistent, passive Pi TUI surface showing the Active workflow’s live progress and diagnostics (stage, ticket/attempt, worker identity, process liveness, transcript/worktree paths, integration/PR/errors). It is read-only except for explicit pipeline controls (Pause / Resume / Terminate). It is not a general multi-action dashboard. While `/matt-auto run` is blocked on background work, the primary operator surface is a full-screen read-only brief with the same facts and controls; the compact panel remains a secondary, always-on summary when the TUI supports it.

@@ -14,6 +14,7 @@ import {
   buildCreateSpecSkillPrompt,
   buildCreateTicketsSkillPrompt,
   createCiPort,
+  createCoordinationPort,
   createEnvironmentPort,
   createGitTopologyPort,
   createMattAutoLogger,
@@ -25,6 +26,7 @@ import {
   createTrackerPort,
   createTranscriptPort,
   createVerificationPort,
+  createWorkflowHomeLockPort,
   createWorkersPort,
   createWorkspacePort,
   findLatestDraftText,
@@ -433,12 +435,12 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     }
   });
 
-  function ensureCoordinator(
+  async function ensureCoordinator(
     cwd: string,
     modelRegistry: Parameters<typeof createModelsPort>[0],
     ui: MattAutoUi,
     homeModel: typeof homeModelRef,
-  ): WorkflowCoordinator {
+  ): Promise<WorkflowCoordinator> {
     activeUi = ui;
     homeModelRef = homeModel;
 
@@ -451,7 +453,8 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     }
 
     if (coordinator) {
-      void coordinator.abortWorkers();
+      await coordinator.abortWorkers();
+      await coordinator.releaseWorkflowHome();
     }
 
     pausedRunDismissed = false;
@@ -475,6 +478,8 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           verification: createVerificationPort(),
           remoteGit: createRemoteGitPort(rootPath),
           ci: createCiPort(rootPath),
+          coordination: createCoordinationPort(rootPath),
+          workflowHomeLock: createWorkflowHomeLockPort(rootPath),
         };
       },
     });
@@ -486,6 +491,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (coordinator) {
       await coordinator.abortWorkers();
+      await coordinator.releaseWorkflowHome();
     }
     if (activeUi) {
       clearWorkflowPanel(activeUi);
@@ -711,7 +717,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
           assistantTexts.slice(Math.max(0, baseline)),
       };
 
-      const active = ensureCoordinator(
+      const active = await ensureCoordinator(
         ctx.cwd,
         ctx.modelRegistry,
         ui,
