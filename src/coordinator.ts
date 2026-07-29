@@ -7459,7 +7459,39 @@ export function createWorkflowCoordinator(
     });
 
     if (ci.status === "success") {
-      const active = await loadActiveWorkflow(bound, { force: true });
+      // Do not force-load the Active workflow or re-acquire the coordinator lease
+      // on every green CI: that path hung Workflow #53/#56 after ci-check with no
+      // ticket-closed (lease git thrash) while closeIssue never ran.
+      clog("info", "ci-gate:green", {
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+        summary: ci.summary,
+      });
+
+      let active: ActiveWorkflow | undefined =
+        cachedPanelActive?.workflowId === input.workflowId
+          ? cachedPanelActive
+          : undefined;
+      if (!active) {
+        try {
+          active = await loadActiveWorkflow(bound, { force: false });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          clog("warn", "ci-gate:load-active-failed", {
+            workflowId: input.workflowId,
+            ticketNumber: input.ticketNumber,
+            reason: message,
+          });
+          return {
+            status: "failed",
+            stage: "ci-gate",
+            reason: `CI is green but Active workflow could not be loaded to close #${input.ticketNumber}: ${message}`,
+            ticketNumber: input.ticketNumber,
+            attempt: input.attempt,
+            workflowId: input.workflowId,
+          };
+        }
+      }
       if (!active || active.workflowId !== input.workflowId) {
         return {
           status: "failed",
@@ -7471,22 +7503,75 @@ export function createWorkflowCoordinator(
           workflowId: input.workflowId,
         };
       }
-      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
-      if (!authority.ok) {
-        return {
-          status: "failed",
-          stage: "ci-gate",
-          reason: authority.reason,
-          ticketNumber: input.ticketNumber,
-          attempt: input.attempt,
-          workflowId: input.workflowId,
-        };
+
+      if (active.coordination) {
+        const alreadyHeld =
+          heldWorkflowCoordinatorLease?.workflowId === input.workflowId &&
+          !coordinatorLeaseLost;
+        if (!alreadyHeld) {
+          const authority = await ensureActiveWorkflowCoordinatorLease(
+            bound,
+            active,
+          );
+          if (!authority.ok) {
+            clog("warn", "ci-gate:lease-failed", {
+              workflowId: input.workflowId,
+              ticketNumber: input.ticketNumber,
+              reason: authority.reason,
+            });
+            return {
+              status: "failed",
+              stage: "ci-gate",
+              reason: authority.reason,
+              ticketNumber: input.ticketNumber,
+              attempt: input.attempt,
+              workflowId: input.workflowId,
+            };
+          }
+        } else {
+          // Keep the held lease warm without a full remote re-acquire dance.
+          await heartbeatHeldWorkflowCoordinatorLease(bound);
+          if (
+            coordinatorLeaseLost ||
+            heldWorkflowCoordinatorLease?.workflowId !== input.workflowId
+          ) {
+            const authority = await ensureActiveWorkflowCoordinatorLease(
+              bound,
+              active,
+            );
+            if (!authority.ok) {
+              clog("warn", "ci-gate:lease-failed", {
+                workflowId: input.workflowId,
+                ticketNumber: input.ticketNumber,
+                reason: authority.reason,
+              });
+              return {
+                status: "failed",
+                stage: "ci-gate",
+                reason: authority.reason,
+                ticketNumber: input.ticketNumber,
+                attempt: input.attempt,
+                workflowId: input.workflowId,
+              };
+            }
+          }
+        }
       }
+
+      clog("info", "ci-gate:closing-ticket", {
+        workflowId: input.workflowId,
+        ticketNumber: input.ticketNumber,
+      });
       try {
         await bound.tracker.closeIssue(input.ticketNumber);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const reason = `CI is green but closing #${input.ticketNumber} failed: ${message}`;
+        clog("warn", "ci-gate:close-failed", {
+          workflowId: input.workflowId,
+          ticketNumber: input.ticketNumber,
+          reason: message,
+        });
         pendingCiRecovery = {
           workflowId: input.workflowId,
           ticketNumber: input.ticketNumber,
@@ -7522,6 +7607,11 @@ export function createWorkflowCoordinator(
       pendingCiRecovery = undefined;
       await bound.transcripts.append(transcriptKey, {
         type: "ticket-closed",
+        ticketNumber: input.ticketNumber,
+      });
+      invalidatePanelCaches();
+      clog("info", "ci-gate:ticket-closed", {
+        workflowId: input.workflowId,
         ticketNumber: input.ticketNumber,
       });
 
