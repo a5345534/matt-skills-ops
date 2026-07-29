@@ -409,7 +409,7 @@ describe("persistent workflow dashboard surface", () => {
     // The action row disappeared after settlement, so the dashboard follows the
     // relevant newly-created Worker attempt rather than jumping to Workflow.
     expect(frame).toContain("Selected · Worker #43 r1");
-    expect(dashboardSource.preflight).toHaveBeenCalledTimes(1);
+    expect(dashboardSource.preflight).toHaveBeenCalledWith("overview");
     expect(dashboardSource.nextActions).toHaveBeenCalledTimes(1);
     expect(dashboardSource.getTicketProgress).toHaveBeenCalledTimes(1);
     expect(harness.doneValues).toEqual([]);

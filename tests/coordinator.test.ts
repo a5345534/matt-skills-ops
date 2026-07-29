@@ -1263,6 +1263,22 @@ describe("Workflow coordinator preflight", () => {
     });
   });
 
+  it("keeps the automatic overview local and defers delivery policy inspection", async () => {
+    const coordinator = createWorkflowCoordinator(createPorts());
+
+    const result = await coordinator.preflight("overview");
+
+    expect(result).toEqual({
+      ok: true,
+      targetBranch: DEFAULT_TARGET_BRANCH,
+      checks: [],
+      workerProfile: {
+        profile: defaultWorkerProfile,
+        source: "global",
+      },
+    });
+  });
+
   it("uses the configured Target branch override when present", async () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
@@ -1800,7 +1816,7 @@ describe("Workflow coordinator Worker concurrency preferences", () => {
 });
 
 describe("Workflow coordinator Next actions", () => {
-  it("returns no Next actions when preflight fails", async () => {
+  it("does not let delivery preflight failures hide available Next actions", async () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
@@ -1810,7 +1826,13 @@ describe("Workflow coordinator Next actions", () => {
       }),
     );
 
-    await expect(coordinator.nextActions()).resolves.toEqual([]);
+    await expect(coordinator.nextActions()).resolves.toEqual([
+      {
+        id: CREATE_SPEC_ACTION.id,
+        label: CREATE_SPEC_ACTION.label,
+        description: CREATE_SPEC_ACTION.description,
+      },
+    ]);
   });
 
   it("offers Create spec when preflight passes and there is no Active workflow", async () => {
@@ -2073,7 +2095,7 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
     }
   });
 
-  it("fails closed when Create-spec is requested while preflight is incomplete", async () => {
+  it("allows local Create-spec planning while remote delivery setup is incomplete", async () => {
     const tracker = createTracker();
     const coordinator = createWorkflowCoordinator(
       createPorts({
@@ -2087,9 +2109,35 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
 
     const result = await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
 
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.reason).toMatch(/preflight/i);
+    expect(result).toMatchObject({
+      status: "needs-confirmation",
+      stage: "create-spec",
+    });
+    // Planning remains local; Publish is where remote prerequisites apply.
+    expect(tracker.state.createIssueCalls).toBe(0);
+  });
+
+  it("checks the Target branch only when Create-spec is published", async () => {
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          environment: { targetBranchExists: async () => false },
+          preferences: { globalWorkerProfile: defaultWorkerProfile },
+          tracker,
+        },
+      }),
+    );
+
+    await expect(coordinator.runNextAction(CREATE_SPEC_ACTION.id)).resolves.toMatchObject({
+      status: "needs-confirmation",
+      stage: "create-spec",
+    });
+    const published = await coordinator.confirmStage("publish");
+
+    expect(published).toMatchObject({ status: "failed", stage: "create-spec" });
+    if (published.status === "failed") {
+      expect(published.reason).toMatch(/Target branch/i);
     }
     expect(tracker.state.createIssueCalls).toBe(0);
   });
@@ -5282,6 +5330,38 @@ describe("Workflow coordinator Workflow PR, paired cleanup, rework, and follow-u
 
     const ids = (await coordinator.nextActions()).map((a) => a.id);
     expect(ids).toEqual([CLEANUP_WORKFLOW_ACTION.id]);
+  });
+
+  it("checks protected-branch policy only at the automatic merge boundary", async () => {
+    const { coordinator, tracker } = await driveAllTicketsComplete();
+    await expect(coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id)).resolves.toMatchObject({
+      status: "completed",
+      stage: "workflow-pr",
+    });
+
+    // A delivery-policy change after PR creation must not retroactively hide
+    // earlier work, but must still fail closed before the remote merge.
+    tracker.state.automationPolicy = {
+      repository: { owner: "acme", name: "widgets" },
+      targetRef: "refs/heads/main",
+      coordinationRefsWritable: true,
+      requiredStatusChecks: { strict: false, contexts: ["ci"] },
+      requiredApprovingReviewCount: 1,
+      allowedMergeMethods: [],
+      mergeQueueRequired: true,
+      actorCanMergeWithoutApproval: false,
+      staleBaseProtectionGuaranteed: false,
+    };
+
+    const merged = await coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+
+    expect(merged).toMatchObject({ status: "failed", stage: "workflow-pr" });
+    if (merged.status === "failed") {
+      expect(merged.reason).toMatch(/Automatic Workflow PR merge readiness/i);
+      expect(merged.reason).toMatch(/merge-method/i);
+      expect(merged.reason).toMatch(/merge-authority/i);
+    }
+    expect(tracker.state.mergePrCalls).toEqual([]);
   });
 
   it("uses the repository-configured merge method rather than a hard-coded strategy", async () => {
