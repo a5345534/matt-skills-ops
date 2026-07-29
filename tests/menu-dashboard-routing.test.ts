@@ -195,6 +195,7 @@ describe("manual menu dashboard routing", () => {
           "Settings…",
           "--- Unfinished (local) ---",
           "Workflow #38 · bound [#38]",
+          "Start new workflow",
         ]),
       );
       expect(mainHarness.ui.selects).toHaveBeenCalledWith(
@@ -235,6 +236,65 @@ describe("manual menu dashboard routing", () => {
     expect(nextHarness.ui.selects).not.toHaveBeenCalled();
     dismiss(next);
     await expect(nextOpening).resolves.toBeUndefined();
+  });
+
+  it("always offers Start new workflow when unfinished list is non-empty", async () => {
+    const coordinator = coordinatorHarness();
+    const selects = vi.fn(async () => undefined);
+    const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+    await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+    expect(selects).toHaveBeenCalledWith("Matt Auto", [
+      "Settings…",
+      "--- Unfinished (local) ---",
+      "Workflow #38 · bound [#38]",
+      "Start new workflow",
+    ]);
+    // Home render stays local-only — no tracker/preflight reads yet.
+    expect(coordinator.listLocalUnfinishedWorkflows).toHaveBeenCalled();
+    expect(coordinator.preflight).not.toHaveBeenCalled();
+    expect(coordinator.getActiveWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("offers Start new workflow and empty hint when unfinished list is empty", async () => {
+    const coordinator = coordinatorHarness();
+    coordinator.listLocalUnfinishedWorkflows.mockResolvedValueOnce([]);
+    const selects = vi.fn(async () => undefined);
+    const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+    await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+    expect(selects).toHaveBeenCalledWith("Matt Auto", [
+      "Settings…",
+      "No local unfinished workflows",
+      "Start new workflow",
+    ]);
+  });
+
+  it("routes Start new workflow into the post-grill pipeline, not an unfinished id", async () => {
+    const coordinator = {
+      ...coordinatorHarness(),
+      beginPipelineRun: vi.fn(),
+      isRunTerminated: vi.fn(() => false),
+      isPipelinePaused: vi.fn(() => false),
+      isAutoAdvanceBlocked: vi.fn(() => false),
+      // Empty next-actions ends the pipeline after preflight without more UI.
+      nextActions: vi.fn(async () => []),
+      getPanelState: vi.fn(async () => undefined),
+    };
+    const selects = vi
+      .fn()
+      .mockResolvedValueOnce("Start new workflow")
+      .mockResolvedValueOnce(undefined);
+    const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+    await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+    // Start new enters the pipeline path (preflight) without binding a local unfinished id.
+    expect(coordinator.selectLocalUnfinishedWorkflow).not.toHaveBeenCalled();
+    expect(coordinator.preflight).toHaveBeenCalled();
+    expect(coordinator.beginPipelineRun).toHaveBeenCalled();
   });
 
   it("retains blocking select menus when custom is absent or rejects", async () => {
