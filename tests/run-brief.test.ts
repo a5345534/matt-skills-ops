@@ -493,6 +493,72 @@ describe("buildRunBriefViewModel", () => {
     expect(workerLines).not.toContain("I'll start by reading");
   });
 
+  it("shows integrating READY/BLOCK and live Integration elapsed, not stale fail reason", () => {
+    const panel = basePanel({
+      integration: {
+        ticketNumber: 55,
+        attempt: 1,
+        status: "running",
+        branchName: "matt-auto/53/ticket-55/r1",
+        reason:
+          "Local verification failed in the Integration workspace: typecheck failed",
+        runtimeMs: 33_000,
+      },
+      ticketProgress: {
+        workflowId: 53,
+        total: 3,
+        open: 2,
+        closed: 1,
+        ready: [
+          { number: 55, title: "Tests" },
+          { number: 56, title: "README" },
+        ],
+        blocked: [],
+        awaitingCi: [],
+        items: [
+          {
+            number: 54,
+            title: "Always show",
+            state: "CLOSED",
+            status: "closed",
+          },
+          {
+            number: 55,
+            title: "Tests",
+            state: "OPEN",
+            status: "ready",
+          },
+          {
+            number: 56,
+            title: "README",
+            state: "OPEN",
+            status: "ready",
+          },
+        ],
+      },
+    });
+
+    expect(deriveContextLabel(panel)).toBe("Integrating #55 r1");
+    expect(freeReadyFrontierTickets(panel).map((t) => t.number)).toEqual([56]);
+
+    const brief = buildRunBriefViewModel(panel);
+    const integration = brief.sections
+      .find((s) => s.id === "integration")
+      ?.lines.join("\n") ?? "";
+    expect(integration).toContain("running");
+    expect(integration).toContain("elapsed:");
+    expect(integration).toContain("33s");
+    // Prior attempt failure must not freeze under a running unit.
+    expect(integration).not.toContain("typecheck failed");
+
+    const row55 = brief.sections
+      .find((s) => s.id === "tickets")
+      ?.lines.find((l) => l.includes("#55"));
+    expect(row55).toMatch(/integrating/);
+    expect(row55).toMatch(/33s/);
+    expect(row55).not.toMatch(/\bready\b/);
+  });
+
   it("lists only free ready tickets when context falls through to frontier", () => {
     // No live workers needing disposition — but if we only had ready tickets
     // with no workers, frontier shows all. When one is running, exclude it.

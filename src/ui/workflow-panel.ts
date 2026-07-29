@@ -133,7 +133,14 @@ export function buildCompactWorkflowPanel(
             : item.status === "ready" || item.status === "awaiting-ci"
               ? "ready"
               : "—";
-        if (worker?.status === "needs-disposition") ready = "needs-d";
+        const integrating =
+          panel.integration?.ticketNumber === item.number
+            ? panel.integration
+            : undefined;
+        if (integrating?.status === "running") ready = "integrating";
+        else if (integrating?.status === "pending-retry") ready = "int-retry";
+        else if (integrating?.status === "conflict-resolution") ready = "conflict";
+        else if (worker?.status === "needs-disposition") ready = "needs-d";
         else if (worker?.status === "running") ready = "running";
         else if (worker?.status === "compatibility-recovery") ready = "recovery";
         else if (worker?.status === "failed") ready = "failed";

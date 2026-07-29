@@ -558,6 +558,8 @@ export type WorkflowPanelState = {
     status: "pending-retry" | "conflict-resolution" | "running";
     branchName: string;
     reason?: string;
+    /** Live elapsed while status is running (ticks on local panel polls). */
+    runtimeMs?: number;
   };
   /** Compact CI gate status for open integrated tickets (no background polling). */
   ci?: readonly {

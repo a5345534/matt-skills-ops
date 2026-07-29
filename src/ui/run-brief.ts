@@ -313,7 +313,14 @@ export function freeReadyFrontierTickets(
 ): readonly { number: number; title: string }[] {
   const ready = panel.ticketProgress?.ready ?? [];
   if (ready.length === 0) return [];
+  const integratingTicket = panel.integration?.ticketNumber;
   return ready.filter((ticket) => {
+    if (
+      integratingTicket !== undefined &&
+      ticket.number === integratingTicket
+    ) {
+      return false;
+    }
     const worker = panel.workers.find((w) => w.ticketNumber === ticket.number);
     if (!worker) return true;
     return !sessionOccupiesReadySlot(worker.status);
@@ -446,7 +453,25 @@ function integrationSection(
     `#${integration.ticketNumber} r${integration.attempt}: ${integration.status}`,
     `  branch: ${integration.branchName}`,
   ];
-  if (integration.reason) {
+  // Live elapsed while the unit is running (matches Pipeline Elapsed cadence).
+  if (
+    integration.status === "running" &&
+    typeof integration.runtimeMs === "number"
+  ) {
+    lines.push(`  elapsed: ${formatRuntimeMs(integration.runtimeMs)}`);
+  }
+  // Only show reason for retry/conflict surfaces — not while a fresh unit runs
+  // (stale lastFailure freezes the brief as if the current attempt already failed).
+  if (integration.reason && integration.status !== "running") {
+    lines.push(
+      `  reason: ${formatIntegrationReasonForBrief(integration.reason)}`,
+    );
+  } else if (
+    integration.reason &&
+    integration.status === "running" &&
+    !integration.reason.includes("failed")
+  ) {
+    // Informational running labels (e.g. "Target-branch refresh") stay visible.
     lines.push(
       `  reason: ${formatIntegrationReasonForBrief(integration.reason)}`,
     );
@@ -654,9 +679,14 @@ export function formatTicketTableRow(
   const telemetry = liveWorker ?? completedRun ?? worker;
 
   // READY/BLOCK: session lifecycle overlays tracker frontier so the column
-  // never says "ready" while STATUS is needs-disp / running / recovery.
+  // never says "ready" while STATUS is needs-disp / running / integrating.
   let readyBlock = "—";
-  if (worker && sessionOccupiesReadySlot(worker.status)) {
+  if (integration) {
+    if (integration.status === "running") readyBlock = "integrating";
+    else if (integration.status === "pending-retry") readyBlock = "int-retry";
+    else if (integration.status === "conflict-resolution") readyBlock = "conflict";
+    else readyBlock = integration.status;
+  } else if (worker && sessionOccupiesReadySlot(worker.status)) {
     if (worker.status === "needs-disposition") readyBlock = "needs-disp";
     else if (worker.status === "running") readyBlock = "running";
     else if (worker.status === "compatibility-recovery") readyBlock = "recovery";
@@ -672,7 +702,12 @@ export function formatTicketTableRow(
     readyBlock = "ready"; // integrated open tickets were ready to implement
   }
 
-  const runtime = formatRuntimeMs(telemetry?.runtimeMs);
+  // Prefer live Integration elapsed while that ticket's unit is running.
+  const runtimeMs =
+    integration?.status === "running" && typeof integration.runtimeMs === "number"
+      ? integration.runtimeMs
+      : telemetry?.runtimeMs;
+  const runtime = formatRuntimeMs(runtimeMs);
   const turns =
     typeof telemetry?.turnCount === "number" ? String(telemetry.turnCount) : "—";
   const attempt = telemetry?.attempt;

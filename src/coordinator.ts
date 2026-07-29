@@ -657,6 +657,8 @@ export function createWorkflowCoordinator(
   let pendingIntegration: PendingIntegration | undefined;
   /** Guard against re-entrant Integration unit execution. */
   let integrationInProgress = false;
+  /** Epoch ms when the current Integration unit (or Target-refresh) entered running. */
+  let integrationUnitStartedAtMs: number | undefined;
   /**
    * Session-owned Conflict resolution worker for a preserved in-progress merge.
    * Lifetime is bound to Workflow home; never durable across processes.
@@ -10095,16 +10097,19 @@ export function createWorkflowCoordinator(
             : {}),
       };
     } else if (pendingTargetRefresh && targetRefreshInProgress) {
+      if (integrationUnitStartedAtMs === undefined) {
+        integrationUnitStartedAtMs = Date.now();
+      }
       state.integration = {
         ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
         attempt: pendingTargetRefresh.attempt,
         status: "running",
         branchName: pendingTargetRefresh.integrationBranch,
-        ...(pendingTargetRefresh.lastFailure
-          ? { reason: pendingTargetRefresh.lastFailure }
-          : { reason: "Target-branch refresh" }),
+        reason: "Target-branch refresh",
+        runtimeMs: Math.max(0, Date.now() - integrationUnitStartedAtMs),
       };
     } else if (pendingTargetRefresh) {
+      integrationUnitStartedAtMs = undefined;
       state.integration = {
         ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
         attempt: pendingTargetRefresh.attempt,
@@ -10116,6 +10121,11 @@ export function createWorkflowCoordinator(
       };
     } else if (pendingIntegration && integrationInProgress) {
       // Unit is actively finishing (merge/verify/push) — wait must not P1-settle.
+      // Do not surface lastFailure while running: that is a prior attempt's fact
+      // and freezes the brief as if the unit is still failed.
+      if (integrationUnitStartedAtMs === undefined) {
+        integrationUnitStartedAtMs = Date.now();
+      }
       state.integration = {
         ticketNumber: pendingIntegration.ticketNumber,
         attempt: pendingIntegration.attempt,
@@ -10123,11 +10133,10 @@ export function createWorkflowCoordinator(
         branchName: pendingIntegration.conflict
           ? pendingIntegration.conflict.integrationBranch
           : pendingIntegration.branchName,
-        ...(pendingIntegration.lastFailure
-          ? { reason: pendingIntegration.lastFailure }
-          : {}),
+        runtimeMs: Math.max(0, Date.now() - integrationUnitStartedAtMs),
       };
     } else if (pendingIntegration) {
+      integrationUnitStartedAtMs = undefined;
       state.integration = {
         ticketNumber: pendingIntegration.ticketNumber,
         attempt: pendingIntegration.attempt,
@@ -10139,6 +10148,8 @@ export function createWorkflowCoordinator(
           ? { reason: pendingIntegration.lastFailure }
           : {}),
       };
+    } else {
+      integrationUnitStartedAtMs = undefined;
     }
 
     const ciEntries: NonNullable<WorkflowPanelState["ci"]>[number][] = [];
