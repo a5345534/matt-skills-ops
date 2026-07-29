@@ -13,6 +13,7 @@ import {
   DEFAULT_TARGET_BRANCH,
   dispositionActionId,
   IMPLEMENTATION_DISPOSITION_OPTIONS,
+  filterWorkflowOwnedBranches,
   implementTicketActionId,
   implementationBranchName,
   integrateTicketActionId,
@@ -8039,14 +8040,14 @@ export function createWorkflowCoordinator(
     }
 
     // Pair remote cleanup with local — same branch set (local list + any already-known).
-    const remoteBranches = [
-      ...new Set([
-        ...branches,
-        ...removedLocalBranches,
-        ...(active.integrationBranch ? [active.integrationBranch] : []),
-        ...(active.integratedTickets ?? []).map((t) => t.branchName),
-      ]),
-    ].sort();
+    // Always re-filter to this Workflow ID's namespace so a corrupt manifest or
+    // stray branch name can never delete a sibling workflow's branches.
+    const remoteBranches = filterWorkflowOwnedBranches(active.workflowId, [
+      ...branches,
+      ...removedLocalBranches,
+      ...(active.integrationBranch ? [active.integrationBranch] : []),
+      ...(active.integratedTickets ?? []).map((t) => t.branchName),
+    ]);
 
     const remoteCleanupAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
@@ -8289,6 +8290,12 @@ export function createWorkflowCoordinator(
         // GitHub state is already completed; a stale local pointer routes back
         // through explicit selection on the next Workflow-home open.
       }
+    }
+    // Release only this home's held capacity and Target-branch lease. Shared
+    // repository worker-capacity policy and sibling leases/slots stay intact.
+    await releaseAllHeldWorkerSlots(bound);
+    if (active.coordination) {
+      await releaseBoundTargetBranchLease(bound, active.coordination.target);
     }
     await releaseHeldWorkflowCoordinatorLease(bound);
     invalidatePanelCaches();
@@ -8987,7 +8994,8 @@ export function createWorkflowCoordinator(
       }
     }
 
-    return [...candidates].sort();
+    // Never discard a sibling workflow's namespace even if session state is corrupt.
+    return filterWorkflowOwnedBranches(active.workflowId, [...candidates]);
   }
 
   async function terminateRun(): Promise<RunTerminationResult> {

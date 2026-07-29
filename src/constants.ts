@@ -159,6 +159,37 @@ export function integrationBranchName(workflowId: number): string {
   return `matt-auto/${workflowId}/integration`;
 }
 
+/**
+ * True when a branch name belongs exclusively to one Workflow ID's namespace.
+ * Cleanup, terminate discard, and remote paired deletion must use this so a
+ * sibling workflow's branches can never be removed by accident.
+ *
+ * Matches `matt-auto/<id>` and `matt-auto/<id>/...` only — never a sibling id
+ * that merely shares a numeric prefix (e.g. 4 vs 42).
+ */
+export function isWorkflowOwnedBranch(
+  workflowId: number,
+  branchName: string,
+): boolean {
+  if (!Number.isInteger(workflowId) || workflowId <= 0) return false;
+  const name = branchName.trim();
+  if (!name) return false;
+  const prefix = `matt-auto/${workflowId}`;
+  return name === prefix || name.startsWith(`${prefix}/`);
+}
+
+/** Filter branch names to those owned by the given Workflow ID. */
+export function filterWorkflowOwnedBranches(
+  workflowId: number,
+  branchNames: readonly string[],
+): string[] {
+  return [
+    ...new Set(
+      branchNames.filter((branch) => isWorkflowOwnedBranch(workflowId, branch)),
+    ),
+  ].sort();
+}
+
 /** Prefix for Next actions that retry a failed Integration unit. */
 export const INTEGRATE_TICKET_ACTION_PREFIX = "integrate-ticket:" as const;
 
