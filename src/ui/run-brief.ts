@@ -530,7 +530,8 @@ function workflowPrSection(
 const COL = {
   num: 6,
   ready: 18,
-  runtime: 8,
+  // Wide enough for `10m30s(59s)` / `1h05m(12m00s)` live turn suffix.
+  runtime: 14,
   turns: 8,
   status: 16,
   title: 32,
@@ -590,6 +591,28 @@ export function formatRuntimeMs(ms: number | undefined): string {
   const h = Math.floor(m / 60);
   const rm = m % 60;
   return `${h}h${String(rm).padStart(2, "0")}m`;
+}
+
+/**
+ * Total attempt runtime, optionally with the current turn duration in parens.
+ * Example: `10m30s(30s)` = 10m30s wall clock, 30s since latest turn_start.
+ */
+export function formatRuntimeWithTurnMs(
+  runtimeMs: number | undefined,
+  lastTurnStartedAtMs: number | undefined,
+  nowMs = Date.now(),
+): string {
+  const total = formatRuntimeMs(runtimeMs);
+  if (total === "—") return total;
+  if (
+    typeof lastTurnStartedAtMs !== "number" ||
+    !Number.isFinite(lastTurnStartedAtMs) ||
+    lastTurnStartedAtMs < 0
+  ) {
+    return total;
+  }
+  const turnMs = Math.max(0, nowMs - lastTurnStartedAtMs);
+  return `${total}(${formatRuntimeMs(turnMs)})`;
 }
 
 function padCell(value: string, width: number): string {
@@ -720,7 +743,13 @@ export function formatTicketTableRow(
     integration?.status === "running" && typeof integration.runtimeMs === "number"
       ? integration.runtimeMs
       : telemetry?.runtimeMs;
-  const runtime = formatRuntimeMs(runtimeMs);
+  // Current-turn suffix only while Implementation is still running (live turn_start).
+  const lastTurnStartedAtMs =
+    worker?.status === "running" &&
+    typeof worker.lastTurnStartedAtMs === "number"
+      ? worker.lastTurnStartedAtMs
+      : undefined;
+  const runtime = formatRuntimeWithTurnMs(runtimeMs, lastTurnStartedAtMs);
   const turns =
     typeof telemetry?.turnCount === "number" ? String(telemetry.turnCount) : "—";
   const attempt = telemetry?.attempt;

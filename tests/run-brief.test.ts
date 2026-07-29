@@ -5,6 +5,7 @@ import {
   formatLastTurnStartedAt,
   formatRunBriefLines,
   formatRuntimeMs,
+  formatRuntimeWithTurnMs,
   freeReadyFrontierTickets,
   predictRunTerminationMode,
 } from "../src/ui/run-brief.js";
@@ -341,6 +342,55 @@ describe("buildRunBriefViewModel", () => {
     expect(formatLastTurnStartedAt(1_700_000_000_000, 1_700_000_065_000)).toBe(
       "22:13:20Z (1m05s ago)",
     );
+  });
+
+  it("formats RUNTIME with current-turn duration in parentheses", () => {
+    expect(formatRuntimeWithTurnMs(630_000, 1_700_000_000_000, 1_700_000_030_000)).toBe(
+      "10m30s(30s)",
+    );
+    expect(formatRuntimeWithTurnMs(71_000, undefined)).toBe("1m11s");
+    expect(formatRuntimeWithTurnMs(undefined, 1_700_000_000_000)).toBe("—");
+  });
+
+  it("shows live turn suffix on the ticket RUNTIME column while running", () => {
+    const now = Date.now();
+    const panel = basePanel({
+      workers: [
+        {
+          ticketNumber: 56,
+          attempt: 1,
+          status: "running",
+          branchName: "matt-auto/53/ticket-56/r1",
+          turnCount: 3,
+          startedAtMs: now - 630_000,
+          runtimeMs: 630_000,
+          lastTurnStartedAtMs: now - 30_000,
+        },
+      ],
+      ticketProgress: {
+        workflowId: 53,
+        total: 1,
+        open: 1,
+        closed: 0,
+        ready: [{ number: 56, title: "README" }],
+        blocked: [],
+        awaitingCi: [],
+        items: [
+          {
+            number: 56,
+            title: "README",
+            state: "OPEN",
+            status: "ready",
+          },
+        ],
+      },
+    });
+    const row = buildRunBriefViewModel(panel)
+      .sections.find((s) => s.id === "tickets")
+      ?.lines.find((l) => l.includes("#56"));
+    // Total ~10m30s with current-turn ~30s: `10m30s(30s)` (seconds may drift 1).
+    expect(row).toMatch(/10m3\ds\(3\ds\)/);
+    expect(row).toMatch(/running r1/);
   });
 
   it("shows total run elapsed on the Pipeline section", () => {
