@@ -33,6 +33,12 @@ export const DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS = 15_000;
 export const DEFAULT_COORDINATION_GIT_TIMEOUT_MS = 60_000;
 
 /**
+ * Timeout for tracker `gh` / git execFile calls (discovery, createIssue, links).
+ * Create-tickets publish and Pause must not hang forever on a stuck gh process.
+ */
+export const DEFAULT_TRACKER_GH_TIMEOUT_MS = 60_000;
+
+/**
  * Short lease used only while a coordinator snapshots demand and conditionally
  * assigns repository-wide Implementation worker slots. It is intentionally
  * shorter than a worker slot lease: scheduler ownership never spans a worker.

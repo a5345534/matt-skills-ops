@@ -493,6 +493,14 @@ describe("buildRunBriefViewModel", () => {
     expect(workerLines).not.toContain("I'll start by reading");
   });
 
+  it("surfaces Publishing tickets context while Create-tickets publish is in flight", () => {
+    expect(
+      deriveContextLabel(
+        basePanel({ createTicketsPublishInProgress: true }),
+      ),
+    ).toBe("Publishing tickets…");
+  });
+
   it("keeps needs-disposition RUNTIME live instead of frozen completed telemetry", () => {
     const panel = basePanel({
       workers: [

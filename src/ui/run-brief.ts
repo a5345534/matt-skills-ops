@@ -238,6 +238,9 @@ function contextSection(
  * Prefer concrete worker/integration/CI/PR state over generic pipeline flags.
  */
 export function deriveContextLabel(panel: WorkflowPanelState): string | undefined {
+  if (panel.createTicketsPublishInProgress) {
+    return "Publishing tickets…";
+  }
   const running = panel.workers.filter((w) => w.status === "running");
   if (running.length > 0) {
     const first = running[0]!;

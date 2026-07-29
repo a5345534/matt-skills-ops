@@ -659,6 +659,8 @@ export function createWorkflowCoordinator(
   let integrationInProgress = false;
   /** Epoch ms when the current Integration unit (or Target-refresh) entered running. */
   let integrationUnitStartedAtMs: number | undefined;
+  /** True while Create-tickets publish loop is creating issues / writing manifest. */
+  let createTicketsPublishInProgress = false;
   /**
    * Session-owned Conflict resolution worker for a preserved in-progress merge.
    * Lifetime is bound to Workflow home; never durable across processes.
@@ -4579,7 +4581,30 @@ export function createWorkflowCoordinator(
     }
 
     // decision === "publish"
-    const active = await loadActiveWorkflow(bound);
+    // Log before any tracker/lease I/O so hangs after auto-publish are localizable.
+    clog("info", "create-tickets:publish-begin", {
+      workflowId: current.workflowId,
+      ticketCount: current.draft.tickets.length,
+    });
+    createTicketsPublishInProgress = true;
+    try {
+    let active: ActiveWorkflow | undefined;
+    try {
+      active = await loadActiveWorkflow(bound);
+    } catch (error) {
+      pending = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-load-active-failed", {
+        workflowId: current.workflowId,
+        reason: message,
+      });
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: `Could not load Active workflow before Create-tickets publish: ${message}`,
+        workflowId: current.workflowId,
+      };
+    }
     if (!active || active.workflowId !== current.workflowId) {
       pending = undefined;
       return {
@@ -4819,6 +4844,9 @@ export function createWorkflowCoordinator(
       tickets: createdNumbers,
       ticketProgress: progress,
     };
+    } finally {
+      createTicketsPublishInProgress = false;
+    }
   }
 
   async function getActiveWorkflow(): Promise<ActiveWorkflow | undefined> {
@@ -9308,9 +9336,10 @@ export function createWorkflowCoordinator(
 
   async function pausePipeline(): Promise<PipelinePauseResult> {
     const bound = scoped ?? (await requireScoped());
-    const active = await loadActiveWorkflow(bound, { force: true });
     const slotsBefore = heldWorkerSlots.size;
 
+    // Abort workers first — never block Pause on tracker discovery while
+    // Create-tickets publish (or other force-load paths) is wedged on gh.
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: false,
       transcriptEvent: {
@@ -9324,9 +9353,14 @@ export function createWorkflowCoordinator(
     // Abort releases per-worker slots; drain any remaining bound capacity.
     const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
     const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    // Best-effort Target lease release from session memory only (no force load).
+    const targetForRelease =
+      cachedPanelActive?.coordination?.target ??
+      heldWorkflowCoordinatorLease?.target ??
+      heldTargetBranchLease?.target;
     const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
       bound,
-      active?.coordination?.target,
+      targetForRelease,
     );
 
     pipelinePaused = true;
@@ -9402,8 +9436,17 @@ export function createWorkflowCoordinator(
 
   async function terminateRun(): Promise<RunTerminationResult> {
     const bound = scoped ?? (await requireScoped());
-    // Need fresh integratedTickets / workflowPr for T1 vs T2 (not a TTL snapshot).
-    const active = await loadActiveWorkflow(bound, { force: true });
+    // Prefer session cache so Terminate cannot hang on tracker force-load while
+    // Create-tickets publish is blocked on the same gh path. Soft load only if
+    // cache is empty; gh timeout still bounds the wait.
+    let active: ActiveWorkflow | undefined = cachedPanelActive;
+    if (!active) {
+      try {
+        active = await loadActiveWorkflow(bound, { force: false });
+      } catch {
+        active = undefined;
+      }
+    }
     const mode = resolveTerminationMode(active);
     const slotsBefore = heldWorkerSlots.size;
 
@@ -9548,10 +9591,10 @@ export function createWorkflowCoordinator(
 
   async function emergencyStop(): Promise<EmergencyStopResult> {
     const bound = scoped ?? (await requireScoped());
-    const active = await loadActiveWorkflow(bound, { force: true });
     const slotsBefore = heldWorkerSlots.size;
     const hadCoordinatorLease = Boolean(heldWorkflowCoordinatorLease);
 
+    // Abort and release from session memory first — do not await force tracker load.
     const affectedAttempts = await abortSessionWorkers({
       setCooldown: true,
       transcriptEvent: {
@@ -9564,9 +9607,13 @@ export function createWorkflowCoordinator(
 
     const releasedRemaining = await releaseAllHeldWorkerSlots(bound);
     const releasedWorkerSlotCount = Math.max(slotsBefore, releasedRemaining);
+    const targetForRelease =
+      cachedPanelActive?.coordination?.target ??
+      heldWorkflowCoordinatorLease?.target ??
+      heldTargetBranchLease?.target;
     const releasedTargetBranchLease = await releaseBoundTargetBranchLease(
       bound,
-      active?.coordination?.target,
+      targetForRelease,
     );
     await releaseHeldWorkflowCoordinatorLease(bound);
     coordinatorLeaseLost = false;
@@ -10041,6 +10088,9 @@ export function createWorkflowCoordinator(
       workers,
       pipelinePaused,
     };
+    if (createTicketsPublishInProgress) {
+      state.createTicketsPublishInProgress = true;
+    }
     if (completedWorkerRuns.length > 0) {
       state.completedWorkerRuns = completedWorkerRuns;
     }

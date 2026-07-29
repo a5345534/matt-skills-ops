@@ -9,7 +9,10 @@ import {
   isCanonicalTargetIdentity,
   targetRefFromBranch,
 } from "../coordination.js";
-import { WORKFLOW_MANIFEST_MARKER } from "../constants.js";
+import {
+  DEFAULT_TRACKER_GH_TIMEOUT_MS,
+  WORKFLOW_MANIFEST_MARKER,
+} from "../constants.js";
 import type { TrackerPort, TrackerTicket } from "../ports.js";
 import {
   buildBatchedListTicketsQuery,
@@ -83,6 +86,7 @@ async function run(
   cwd: string,
   command: string,
   args: string[],
+  timeoutMs: number = DEFAULT_TRACKER_GH_TIMEOUT_MS,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const isGraphql =
     command === "gh" && args.includes("api") && args.includes("graphql");
@@ -97,15 +101,32 @@ async function run(
       cwd,
       encoding: "utf8",
       maxBuffer: 4 * 1024 * 1024,
+      ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
     });
     return { code: 0, stdout: stdout ?? "", stderr: stderr ?? "" };
   } catch (error) {
     const err = error as {
-      code?: number | string;
+      code?: number | string | null;
+      killed?: boolean;
+      signal?: NodeJS.Signals | number | null;
       stdout?: string;
       stderr?: string;
       message?: string;
     };
+    const timedOut =
+      err.killed === true ||
+      err.signal === "SIGTERM" ||
+      err.signal === "SIGKILL" ||
+      (typeof err.message === "string" && /timed?\s*out/i.test(err.message));
+    if (timedOut) {
+      return {
+        code: 124,
+        stdout: err.stdout ?? "",
+        stderr:
+          (err.stderr ?? "").trim() ||
+          `${command} ${args.join(" ")} timed out after ${timeoutMs}ms`,
+      };
+    }
     const stderr = err.stderr ?? err.message ?? "";
     const stdout = err.stdout ?? "";
     const detail = `${stderr}
@@ -121,6 +142,12 @@ ${stdout}`;
     };
   }
 }
+
+/** Test seam for tracker gh/git timeouts. */
+export const __trackerRunTestables = {
+  run,
+  timeoutMs: DEFAULT_TRACKER_GH_TIMEOUT_MS,
+};
 
 async function resolveRepoFullName(
   cwd: string,

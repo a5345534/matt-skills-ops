@@ -550,6 +550,11 @@ export type WorkflowPanelState = {
    */
   implementationRecovery?: readonly ImplementationRecoveryState[];
   ticketProgress?: TicketProgressSummary;
+  /**
+   * True while Create-tickets publish is in flight (session-local).
+   * Live brief should show this instead of a healthy idle lease-only view.
+   */
+  createTicketsPublishInProgress?: boolean;
   /** Compact Integration unit status when one is pending retry or resolving conflicts. */
   integration?: {
     ticketNumber: number;
