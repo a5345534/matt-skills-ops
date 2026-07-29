@@ -62,6 +62,7 @@ export {
   MERGE_WORKFLOW_PR_ACTION,
   NO_GIT_REPOSITORY_REASON,
   OPEN_WORKFLOW_PR_ACTION,
+  REFRESH_FROM_TARGET_ACTION,
   parseCheckCiActionId,
   parseCiRecoveryActionId,
   parseDispositionActionId,
@@ -166,6 +167,23 @@ export type {
   TargetBranchQueueStore,
 } from "./target-branch-queue.js";
 export {
+  TARGET_REFRESH_FAILURE_REASONS,
+  TARGET_REFRESH_TRANSCRIPT_TICKET,
+  classifyTargetRefreshResult,
+  mergeTargetIntoIntegration,
+  recordTargetRefreshFailure,
+  refreshedWorkflowPrFreshness,
+  releaseTargetRefreshForPrChecks,
+  targetRefreshConflictSkillInput,
+  ticketIntegrationConflictSkillInput,
+} from "./target-refresh.js";
+export type {
+  TargetRefreshConflict,
+  TargetRefreshFailureReason,
+  TargetRefreshMergePhaseResult,
+  TargetRefreshMerged,
+} from "./target-refresh.js";
+export {
   isLiveWorkerSlotLease,
   planRepositoryWorkerSlots,
 } from "./worker-capacity.js";
@@ -191,6 +209,10 @@ export type {
   GitTopologyPort,
   IntegrationMergeResult,
   LocalVerificationResult,
+  PrepareResolveConflictsInput,
+  TargetRefreshConflictInput,
+  TargetRefreshResult,
+  TicketIntegrationConflictInput,
   ModelsPort,
   NestedGitRepository,
   PreferencesPort,

@@ -284,6 +284,18 @@ export const MERGE_WORKFLOW_PR_ACTION = {
     "Merge the Workflow PR as a Next action rather than requiring a manual GitHub operation.",
 } as const;
 
+/**
+ * Next action: refresh the Integration branch from the current Target branch.
+ * Coordination-aware delivery only — merges Target into Integration, never rebases
+ * or pushes the Target branch, and uses the Target-branch lease lane.
+ */
+export const REFRESH_FROM_TARGET_ACTION = {
+  id: "refresh-from-target",
+  label: "Refresh from Target branch",
+  description:
+    "Merge the latest Target branch into the Integration branch, run Local verification, push the refreshed head, and release the Target-branch lease while PR checks re-run.",
+} as const;
+
 /** Next action: paired local + remote Workflow cleanup after merge. */
 export const CLEANUP_WORKFLOW_ACTION = {
   id: "cleanup-workflow",

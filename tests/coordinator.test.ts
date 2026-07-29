@@ -181,6 +181,20 @@ function createSkills(fixture: SkillsFixture = {}): SkillsPort {
       if (!names.includes("resolving-merge-conflicts")) {
         return { ok: false, reason: "Installed skill resolving-merge-conflicts is missing." };
       }
+      if (input.kind === "target-refresh") {
+        return {
+          ok: true,
+          skillCommand: "/resolving-merge-conflicts",
+          prompt: [
+            `/resolving-merge-conflicts`,
+            "",
+            "Resolve Target-refresh conflict",
+            `Integration branch: ${input.integrationBranch}`,
+            `Target branch: ${input.targetBranch}`,
+            `Expected target SHA: ${input.targetSha}`,
+          ].join("\n"),
+        };
+      }
       return {
         ok: true,
         skillCommand: "/resolving-merge-conflicts",
@@ -371,6 +385,11 @@ function createWorkspace(
       }
       return { ok: true, mergeCommitSha: "merge-sha-1" };
     },
+    refreshIntegrationFromTarget: async () => ({
+      ok: true as const,
+      targetSha: "a".repeat(40),
+      mergeCommitSha: "refresh-sha-1",
+    }),
     listWorkflowBranches: async (workflowId) => {
       state.listBranchesCalls.push(workflowId);
       const branches = new Set<string>();

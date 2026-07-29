@@ -86,14 +86,13 @@ export type SkillsPort = {
   }): Promise<PrepareImplementOutcome>;
   /**
    * Prepare a Conflict resolution worker for the installed `resolving-merge-conflicts` skill.
+   * Supports ticket-to-Integration conflicts and Target-branch refresh conflicts.
    * Returns the prompt/command the worker process should run in the Integration workspace.
    * Does not invent a separate conflict-resolution skill; does not modify skill definitions.
    */
-  prepareResolveConflicts(input: {
-    ticketNumber: number;
-    ticketBranch: string;
-    integrationBranch: string;
-  }): Promise<PrepareResolveConflictsOutcome>;
+  prepareResolveConflicts(
+    input: PrepareResolveConflictsInput,
+  ): Promise<PrepareResolveConflictsOutcome>;
 };
 
 /** Outcome of preparing the installed `implement` skill for a worker. */
@@ -108,6 +107,38 @@ export type PrepareImplementOutcome =
   | { ok: false; reason: string };
 
 /**
+ * Ticket-to-Integration conflict context for the installed resolving-merge-conflicts skill.
+ * `kind` is optional for backward-compatible call sites; omitted means ticket-integration.
+ */
+export type TicketIntegrationConflictInput = {
+  kind?: "ticket-integration";
+  ticketNumber: number;
+  ticketBranch: string;
+  integrationBranch: string;
+};
+
+/**
+ * Target-branch refresh conflict context for the same installed skill.
+ * Identifies the Integration branch, Target branch, expected target SHA, and
+ * optional lease generation so the worker can resolve without inventing state.
+ */
+export type TargetRefreshConflictInput = {
+  kind: "target-refresh";
+  integrationBranch: string;
+  targetBranch: string;
+  /** Exact Target object ID fetched for this refresh attempt. */
+  targetSha: string;
+  /** Observed Target-branch lease generation for diagnostics, when known. */
+  targetLeaseGeneration?: number;
+  workflowId?: number;
+};
+
+/** Input for preparing either ticket-to-Integration or Target-refresh conflict resolution. */
+export type PrepareResolveConflictsInput =
+  | TicketIntegrationConflictInput
+  | TargetRefreshConflictInput;
+
+/**
  * Outcome of preparing the installed `resolving-merge-conflicts` skill for a worker.
  * Same shape as PrepareImplementOutcome; separate name for the Matt skills adapter boundary.
  */
@@ -117,6 +148,28 @@ export type PrepareResolveConflictsOutcome = PrepareImplementOutcome;
 export type IntegrationMergeResult =
   | { ok: true; mergeCommitSha?: string }
   | { ok: false; reason: "conflict" | "error"; message: string };
+
+/**
+ * Outcome of fetching the current Target branch and merging it into the Integration branch.
+ * Local only — never rebases and never pushes (especially never to the Target branch).
+ * On conflict, preserves the in-progress merge for a Conflict resolution worker.
+ */
+export type TargetRefreshResult =
+  | {
+      ok: true;
+      /** Exact Target object ID that was merged into the Integration branch. */
+      targetSha: string;
+      mergeCommitSha?: string;
+      /** True when the Integration branch already contained the Target tip. */
+      alreadyUpToDate?: boolean;
+    }
+  | {
+      ok: false;
+      reason: "conflict" | "error";
+      message: string;
+      /** Target SHA when fetch succeeded before the merge failed. */
+      targetSha?: string;
+    };
 
 /**
  * Local Implementation / Integration workspace (branch + worktree) operations.
@@ -175,6 +228,19 @@ export type WorkspacePort = {
     workflowId: number;
     ticketBranch: string;
   }): Promise<IntegrationMergeResult>;
+  /**
+   * Fetch the current Target branch and merge it into the Integration branch
+   * inside the Integration workspace. Local only — never rebases, never pushes,
+   * and never writes the Target branch. On conflict, preserves the in-progress
+   * merge for a Conflict resolution worker (does not abort).
+   */
+  refreshIntegrationFromTarget(input: {
+    workflowId: number;
+    /** Bare Target branch name or fully qualified `refs/heads/...` ref. */
+    targetBranch: string;
+    /** Remote name used to fetch the Target tip (default `origin`). */
+    remote?: string;
+  }): Promise<TargetRefreshResult>;
   /**
    * List local matt-auto branches owned by a Workflow ID
    * (Integration branch + ticket attempt branches).
