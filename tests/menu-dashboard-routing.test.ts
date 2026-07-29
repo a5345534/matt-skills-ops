@@ -6,6 +6,7 @@ import {
   type MattAutoUi,
 } from "../src/ui/menu.js";
 import type {
+  LocalUnfinishedWorkflow,
   NextAction,
   PreflightResult,
   TicketProgressSummary,
@@ -94,14 +95,16 @@ function coordinatorHarness() {
     getHomeModel: vi.fn(async () => undefined),
     getGlobalWorkerConcurrency: vi.fn(async () => undefined),
     getRootWorkerConcurrency: vi.fn(async () => undefined),
-    listLocalUnfinishedWorkflows: vi.fn(async () => [
-      {
-        workflowId: 38,
-        sources: ["legacy-pointer" as const],
-        bound: true,
-        label: "Workflow #38 · bound",
-      },
-    ]),
+    listLocalUnfinishedWorkflows: vi.fn(
+      async (): Promise<LocalUnfinishedWorkflow[]> => [
+        {
+          workflowId: 38,
+          sources: ["legacy-pointer"],
+          bound: true,
+          label: "Workflow #38 · bound",
+        },
+      ],
+    ),
     selectLocalUnfinishedWorkflow: vi.fn(async () => undefined),
   };
 }
@@ -261,20 +264,21 @@ describe("manual menu dashboard routing", () => {
 
     it("offers Start new alongside every unfinished entry when the list has multiple items", async () => {
       const coordinator = coordinatorHarness();
-      coordinator.listLocalUnfinishedWorkflows.mockResolvedValueOnce([
+      const unfinished: LocalUnfinishedWorkflow[] = [
         {
           workflowId: 38,
-          sources: ["legacy-pointer" as const],
+          sources: ["legacy-pointer"],
           bound: true,
           label: "Workflow #38 · bound",
         },
         {
           workflowId: 41,
-          sources: ["transcripts" as const],
+          sources: ["transcripts"],
           bound: false,
           label: "Workflow #41 · unbound",
         },
-      ]);
+      ];
+      coordinator.listLocalUnfinishedWorkflows.mockResolvedValueOnce(unfinished);
       const selects = vi.fn(async () => undefined);
       const ui: MattAutoUi = { select: selects, notify: () => {} };
 
