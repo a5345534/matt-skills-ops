@@ -177,9 +177,10 @@ describe("manual menu dashboard routing", () => {
   it("opens a local-only home first, then drills into the GitHub dashboard", async () => {
     const coordinator = coordinatorHarness();
     const mainHarness = customHarness();
-    // 1) Home select unfinished · 2) after dashboard Esc, home select cancel
+    // 1) Home select unfinished · 2) Open this workflow · 3) after Esc, cancel home
     mainHarness.ui.selects
       .mockResolvedValueOnce("Workflow #38 · bound [#38]")
+      .mockResolvedValueOnce("Open this workflow")
       .mockResolvedValueOnce(undefined);
 
     const mainOpening = presentMainMenu(
@@ -194,6 +195,14 @@ describe("manual menu dashboard routing", () => {
           "Settings…",
           "--- Unfinished (local) ---",
           "Workflow #38 · bound [#38]",
+        ]),
+      );
+      expect(mainHarness.ui.selects).toHaveBeenCalledWith(
+        "Workflow #38",
+        expect.arrayContaining([
+          "Open this workflow",
+          "Take over this workflow…",
+          "Switch / take over another Active workflow…",
         ]),
       );
     });
