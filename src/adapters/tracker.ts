@@ -144,14 +144,106 @@ async function resolveRepoFullName(
   }
 }
 
-function parsePaginatedApiArray(stdout: string): unknown[] | undefined {
+/**
+ * Normalize `gh api --paginate` JSON stdout into one flat item list.
+ * Supports:
+ * - single merged array of items (common without `--slurp`)
+ * - array of pages from `--slurp` (`[[...],[...]]`)
+ * - empty stdout / `[]` (no items)
+ * - concatenated top-level JSON values (some older paginate modes)
+ */
+export function parsePaginatedApiArray(stdout: string): unknown[] | undefined {
+  const trimmed = stdout.trim();
+  if (trimmed.length === 0) return [];
+
   try {
-    const parsed: unknown = JSON.parse(stdout);
+    const parsed: unknown = JSON.parse(trimmed);
     if (!Array.isArray(parsed)) return undefined;
     return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
   } catch {
+    // Fall through to multi-value parse.
+  }
+
+  // Concatenated JSON values: successive page arrays from some paginate modes.
+  try {
+    const values = parseConcatenatedJsonValues(trimmed);
+    if (values === undefined) return undefined;
+    return values.flatMap((page) => (Array.isArray(page) ? page : [page]));
+  } catch {
     return undefined;
   }
+}
+
+function parseConcatenatedJsonValues(text: string): unknown[] | undefined {
+  const values: unknown[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    while (offset < text.length && /\s/.test(text[offset]!)) offset += 1;
+    if (offset >= text.length) break;
+    const slice = text.slice(offset);
+    let parsed: unknown;
+    let consumed = 0;
+    // Find the shortest prefix that parses as JSON by walking brackets/braces.
+    const end = findJsonValueEnd(slice);
+    if (end === undefined) return undefined;
+    try {
+      parsed = JSON.parse(slice.slice(0, end));
+      consumed = end;
+    } catch {
+      return undefined;
+    }
+    values.push(parsed);
+    offset += consumed;
+  }
+  return values;
+}
+
+function findJsonValueEnd(text: string): number | undefined {
+  const start = text[0];
+  if (start !== "[" && start !== "{") {
+    // Primitive — not expected for paginated REST list endpoints.
+    return undefined;
+  }
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "[" || ch === "{") depth += 1;
+    if (ch === "]" || ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `gh api --paginate` without `--slurp`.
+ * Older Ubuntu-packaged gh (e.g. 2.45) rejects `--slurp`; modern gh still
+ * merges REST list pages into one JSON array without it.
+ */
+async function runGhApiPaginated(
+  cwd: string,
+  endpoint: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return run(cwd, "gh", ["api", "--paginate", endpoint]);
 }
 
 function repositoryEndpoint(repository: CanonicalRepositoryIdentity): string {
@@ -219,12 +311,10 @@ export function createTrackerPort(cwd: string): TrackerPort {
     repository: CanonicalRepositoryIdentity,
     issueNumber: number,
   ): Promise<Array<{ id?: unknown; body?: unknown }> | undefined> {
-    const viewed = await run(cwd, "gh", [
-      "api",
-      "--paginate",
-      "--slurp",
+    const viewed = await runGhApiPaginated(
+      cwd,
       `${repositoryEndpoint(repository)}/issues/${issueNumber}/comments?per_page=100`,
-    ]);
+    );
     if (viewed.code !== 0) return undefined;
     const entries = parsePaginatedApiArray(viewed.stdout);
     if (!entries) return undefined;
@@ -242,14 +332,13 @@ export function createTrackerPort(cwd: string): TrackerPort {
   ): Promise<
     Array<{ number: number; title?: string; state?: string }> | undefined
   > {
-    const listed = await run(cwd, "gh", [
-      "api",
-      "--paginate",
-      "--slurp",
+    const listed = await runGhApiPaginated(
+      cwd,
       `${repositoryEndpoint(repository)}/issues?state=open&per_page=100`,
-    ]);
+    );
     if (listed.code !== 0) return undefined;
     const entries = parsePaginatedApiArray(listed.stdout);
+    // Empty repo / empty page is success (`[]`), not discovery failure.
     if (!entries) return undefined;
 
     const issues = new Map<

@@ -2,7 +2,11 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createTrackerPort, formatWorkflowManifestComment } from "../src/adapters/tracker.js";
+import {
+  createTrackerPort,
+  formatWorkflowManifestComment,
+  parsePaginatedApiArray,
+} from "../src/adapters/tracker.js";
 import type {
   CanonicalTargetIdentity,
   CoordinationWorkflowManifest,
@@ -43,7 +47,94 @@ function coordinatedManifest(workflowId: number): CoordinationWorkflowManifest {
   };
 }
 
+describe("parsePaginatedApiArray", () => {
+  it("accepts a flat merged page (gh without --slurp)", () => {
+    expect(
+      parsePaginatedApiArray(
+        JSON.stringify([{ number: 1 }, { number: 2 }]),
+      ),
+    ).toEqual([{ number: 1 }, { number: 2 }]);
+  });
+
+  it("flattens slurp-shaped array-of-pages", () => {
+    expect(
+      parsePaginatedApiArray(
+        JSON.stringify([[{ number: 1 }], [{ number: 2 }, { number: 3 }]]),
+      ),
+    ).toEqual([{ number: 1 }, { number: 2 }, { number: 3 }]);
+  });
+
+  it("treats empty stdout and empty array as success", () => {
+    expect(parsePaginatedApiArray("")).toEqual([]);
+    expect(parsePaginatedApiArray("[]")).toEqual([]);
+  });
+
+  it("parses concatenated page arrays", () => {
+    expect(
+      parsePaginatedApiArray(
+        `${JSON.stringify([{ number: 1 }])}${JSON.stringify([{ number: 2 }])}`,
+      ),
+    ).toEqual([{ number: 1 }, { number: 2 }]);
+  });
+});
+
 describe("TrackerPort.findActiveWorkflows", () => {
+  it("succeeds when gh rejects --slurp and returns a flat empty list", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "matt-auto-fake-gh-noslurp-"));
+    const executablePath = path.join(directory, "gh");
+    const callLogPath = path.join(directory, "calls.jsonl");
+    await writeFile(
+      executablePath,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+fs.appendFileSync(path.join(__dirname, "calls.jsonl"), JSON.stringify(args) + "\\n");
+if (args.includes("--slurp")) {
+  process.stderr.write("unknown flag: --slurp\\n");
+  process.exit(1);
+}
+if (args[0] === "repo" && args[1] === "view") {
+  process.stdout.write(JSON.stringify({ nameWithOwner: "Acme/workflow-tools" }));
+  process.exit(0);
+}
+const endpoint = args.find((arg) => typeof arg === "string" && arg.startsWith("repos/"));
+if (endpoint === "repos/Acme/workflow-tools/issues?state=open&per_page=100") {
+  process.stdout.write("[]");
+  process.exit(0);
+}
+process.stderr.write("Unexpected: " + JSON.stringify(args));
+process.exit(1);
+`,
+      "utf8",
+    );
+    await chmod(executablePath, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${directory}${path.delimiter}${originalPath ?? ""}`;
+    try {
+      const tracker = createTrackerPort(process.cwd());
+      await expect(tracker.findActiveWorkflows(target)).resolves.toEqual([]);
+      const calls = (await readFile(callLogPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      expect(calls.some((call) => call.includes("--slurp"))).toBe(false);
+      expect(
+        calls.some(
+          (call) =>
+            call.includes("--paginate") &&
+            call.some((part) =>
+              part.includes("issues?state=open&per_page=100"),
+            ),
+        ),
+      ).toBe(true);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("paginates every open issue and returns all manifests for the canonical Target", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "matt-auto-fake-gh-"));
     const responses = {
@@ -126,8 +217,9 @@ process.exit(1);
         call.includes("repos/Acme/workflow-tools/issues?state=open&per_page=100"),
       );
       expect(listCall).toEqual(
-        expect.arrayContaining(["api", "--paginate", "--slurp"]),
+        expect.arrayContaining(["api", "--paginate"]),
       );
+      expect(listCall).not.toEqual(expect.arrayContaining(["--slurp"]));
       expect(
         calls.filter((call) => call.some((part) => part.includes("/comments?"))),
       ).toHaveLength(3);
