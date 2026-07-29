@@ -39,6 +39,7 @@ import {
   OPEN_WORKFLOW_PR_ACTION,
   REWORK_TICKET_ACTION_PREFIX,
   RESUME_WORKFLOW_ACTION_PREFIX,
+  resumeWorkflowActionId,
   START_FOLLOW_UP_ACTION,
   START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   STAGE_CONFIRMATION_OPTIONS,
@@ -1439,18 +1440,13 @@ async function presentDashboardIfAvailable(
   if (!canPresentWorkflowDashboard(ui)) return false;
 
   try {
-    // Settings rows leave the custom surface so the existing blocking model
-    // selectors can run, then reopen the dashboard with the updated prefs.
     for (;;) {
       const result = await presentWorkflowDashboard(coordinator, ui, {
         ...(scope ? { scope } : {}),
       });
-      if (result.status === "configure-worker-profile") {
-        await presentWorkerProfileMenu(coordinator, ui);
-        continue;
-      }
-      if (result.status === "configure-worker-concurrency") {
-        await presentWorkerConcurrencyMenu(coordinator, ui);
+      if (result.status === "switch-workflow") {
+        await presentTakeOverWorkflowMenu(coordinator, ui);
+        // Re-open dashboard for the newly bound workflow (if any).
         continue;
       }
       return true;
@@ -1644,6 +1640,7 @@ export function buildMainMenuItems(
 
 const HOME_SETTINGS_ITEM = "Settings…";
 const HOME_START_NEW_ITEM = "Start new workflow";
+const HOME_TAKE_OVER_ITEM = "Take over Active workflow…";
 const HOME_UNFINISHED_HEADER = "--- Unfinished (local) ---";
 const HOME_EMPTY_ITEM = "No local unfinished workflows";
 
@@ -1671,7 +1668,7 @@ export async function presentMattAutoHome(
     // Local root resolution is filesystem/git only; no tracker reads.
     await coordinator.currentRoot();
     const unfinished = await coordinator.listLocalUnfinishedWorkflows();
-    const items: string[] = [HOME_SETTINGS_ITEM];
+    const items: string[] = [HOME_SETTINGS_ITEM, HOME_TAKE_OVER_ITEM];
     if (unfinished.length === 0) {
       items.push(HOME_EMPTY_ITEM, HOME_START_NEW_ITEM);
     } else {
@@ -1690,6 +1687,10 @@ export async function presentMattAutoHome(
     }
     if (selected === HOME_SETTINGS_ITEM) {
       await presentHomeSettingsMenu(coordinator, ui);
+      continue;
+    }
+    if (selected === HOME_TAKE_OVER_ITEM) {
+      await presentTakeOverWorkflowMenu(coordinator, ui, pipelineOptions);
       continue;
     }
     if (selected === HOME_START_NEW_ITEM) {
@@ -1711,6 +1712,67 @@ export async function presentMattAutoHome(
     }
     await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
   }
+}
+
+/**
+ * List Active workflows on the current Target (GitHub) and Resume/take over one.
+ * Used from local home and from the workflow dashboard routing row.
+ */
+export async function presentTakeOverWorkflowMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  pipelineOptions: RunPostGrillPipelineOptions = {},
+): Promise<void> {
+  let candidates: Awaited<
+    ReturnType<WorkflowCoordinator["listResumableActiveWorkflows"]>
+  >;
+  try {
+    candidates = await coordinator.listResumableActiveWorkflows();
+  } catch (error) {
+    ui.notify(errorMessage(error), "error");
+    return;
+  }
+  if (candidates.length === 0) {
+    ui.notify(
+      "No Active workflows found on this Target branch. Start a new workflow when ready.",
+      "info",
+    );
+    return;
+  }
+
+  const current = await coordinator.getActiveWorkflow();
+  const options = candidates.map((workflow) => {
+    const title = workflow.title?.trim() || workflow.stage;
+    const bound =
+      current?.workflowId === workflow.workflowId ? " (this home)" : "";
+    return `#${workflow.workflowId} — ${title} · ${workflow.stage}${bound}`;
+  });
+  options.push(BACK_ITEM);
+  const selected = await ui.select(
+    "Take over Active workflow",
+    options,
+  );
+  if (selected === undefined || selected === BACK_ITEM) return;
+  const match = /^#(\d+)/.exec(selected);
+  if (!match) return;
+  const workflowId = Number(match[1]);
+  if (!Number.isInteger(workflowId) || workflowId <= 0) return;
+
+  const result = await coordinator.runNextAction(
+    resumeWorkflowActionId(workflowId),
+  );
+  if (result.status === "failed") {
+    ui.notify(result.reason, "error");
+    return;
+  }
+  ui.notify(
+    `This home is bound to Workflow #${workflowId}. Opening workflow surface…`,
+    "info",
+  );
+  if (await presentDashboardIfAvailable(coordinator, ui)) {
+    return;
+  }
+  await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
 }
 
 async function presentHomeSettingsMenu(

@@ -7,8 +7,7 @@ import type {
 } from "../src/types.js";
 import {
   buildWorkflowDashboardViewModel,
-  configureWorkerConcurrencyRowKey,
-  configureWorkerProfileRowKey,
+  switchWorkflowRowKey,
   nextActionRowKey,
   preflightRowKey,
   ticketRowKey,
@@ -218,8 +217,7 @@ describe("buildWorkflowDashboardViewModel", () => {
       preflightRowKey("target-branch"),
       preflightRowKey("matt-skills"),
       preflightRowKey("worker-profile"),
-      configureWorkerProfileRowKey(),
-      configureWorkerConcurrencyRowKey(),
+      switchWorkflowRowKey(),
       nextActionRowKey("implement:43"),
       nextActionRowKey("check-ci:45"),
     ]);
@@ -363,34 +361,25 @@ describe("buildWorkflowDashboardViewModel", () => {
     expect(removed.selectedKey).toBe(WORKFLOW_DASHBOARD_WORKFLOW_ROW_KEY);
   });
 
-  it("exposes Configure Worker profile and concurrency settings with current profile facts", () => {
+  it("exposes Switch/take-over routing instead of Worker settings", () => {
     const vm = buildWorkflowDashboardViewModel(
       { panel: fullPanel(), preflight: preflight(), nextActions: actions() },
       { nowMs: 1_700_000_065_000 },
     );
 
-    const profileRow = vm.rows.find(
-      (row) => row.key === configureWorkerProfileRowKey(),
-    );
-    const concurrencyRow = vm.rows.find(
-      (row) => row.key === configureWorkerConcurrencyRowKey(),
-    );
-
-    expect(profileRow?.kind).toBe("settings");
-    expect(profileRow?.label).toBe("Configure Worker profile…");
-    expect(profileRow?.detail.lines).toContain(
-      "Effective Worker profile: openai-codex/gpt-5.6-terra (thinking max) [workflow-snapshot]",
-    );
-    expect(concurrencyRow?.kind).toBe("settings");
-    expect(concurrencyRow?.label).toBe("Configure Worker concurrency…");
+    const switchRow = vm.rows.find((row) => row.key === switchWorkflowRowKey());
+    expect(switchRow?.kind).toBe("routing");
+    expect(switchRow?.label).toBe("Switch / take over workflow…");
+    expect(switchRow?.detail.lines.join("\n")).toMatch(/take over/i);
+    expect(vm.rows.some((row) => row.label.includes("Configure Worker"))).toBe(false);
 
     const nextOnly = buildWorkflowDashboardViewModel(
       { panel: fullPanel(), preflight: preflight(), nextActions: actions() },
       { scope: "next-actions" },
     );
-    expect(
-      nextOnly.rows.some((row) => row.key === configureWorkerProfileRowKey()),
-    ).toBe(false);
+    expect(nextOnly.rows.some((row) => row.key === switchWorkflowRowKey())).toBe(
+      false,
+    );
   });
 
   it("preserves an action selection by action id when its rendered copy changes", () => {

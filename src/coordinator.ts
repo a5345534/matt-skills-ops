@@ -3512,6 +3512,31 @@ export function createWorkflowCoordinator(
     return result;
   }
 
+
+  async function listResumableActiveWorkflows(): Promise<readonly ActiveWorkflow[]> {
+    const bound = await requireScoped();
+    const context = await resolveCoordinationRoutingContext(bound);
+    if (!context.supported) {
+      const targetBranch = await resolveTargetBranch(
+        bound.preferences,
+        bound.environment,
+      );
+      const active = await bound.tracker.findActiveWorkflow(targetBranch);
+      return active ? [active] : [];
+    }
+    if (!context.ok) {
+      throw new Error(context.reason);
+    }
+    try {
+      return await bound.tracker.findActiveWorkflows(context.target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Could not list Active workflows for take-over: ${message}`,
+      );
+    }
+  }
+
   function getNextActionsDiagnostic(): NextActionsDiagnostic | undefined {
     return lastNextActionsDiagnostic
       ? { ...lastNextActionsDiagnostic }
@@ -10106,6 +10131,7 @@ export function createWorkflowCoordinator(
     runNextAction,
     confirmStage,
     getActiveWorkflow,
+    listResumableActiveWorkflows,
     getTicketProgress,
     currentRoot,
     listLocalUnfinishedWorkflows,

@@ -1152,6 +1152,11 @@ export type WorkflowCoordinator = {
    */
   getActiveWorkflow(): Promise<ActiveWorkflow | undefined>;
   /**
+   * Active workflows for the current Target (GitHub), for Resume / take-over UI.
+   * Does not bind this home; call resume / runNextAction to take over.
+   */
+  listResumableActiveWorkflows(): Promise<readonly ActiveWorkflow[]>;
+  /**
    * Ticket progress and ready frontier for the Active workflow.
    * `undefined` when there is no Active workflow or tickets are not published yet.
    */

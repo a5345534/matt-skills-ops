@@ -188,8 +188,8 @@ describe("persistent workflow dashboard surface", () => {
     expect(initial).toContain("Workflow summary");
     expect(initial).toContain("Tickets · #43 — Dashboard ticket");
     expect(initial).toContain("Worker attempts · #43 r1 — running");
-    expect(initial).toContain("Settings · Configure Worker profile…");
-    expect(initial).toContain("Settings · Configure Worker concurrency…");
+    expect(initial).toContain("Routing · Switch / take over workflow…");
+    expect(initial).not.toContain("Settings · Configure Worker profile…");
     expect(initial).toContain("Next actions · Implement #43");
     expect(initial).toContain("Esc return to chat");
 
@@ -209,13 +209,11 @@ describe("persistent workflow dashboard surface", () => {
     expect(harness.doneValues).toEqual([]);
     expect(notify).not.toHaveBeenCalled();
 
-    // Worker → settings → Next action. A read-only data source has no
-    // coordinator action seam, so action rows remain safely inspectable.
+    // Worker → routing → Next action.
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(
-      "Selected · Settings: Configure Worker profile",
+      "Selected · Routing: Switch / take over workflow",
     );
-    send(component, "\u001b[B");
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(
       "Selected · Next action: Implement #43",
@@ -232,7 +230,7 @@ describe("persistent workflow dashboard surface", () => {
     expect(harness.doneValues).toEqual([{ status: "dismissed" }]);
   });
 
-  it("leaves the dashboard to open Worker profile settings", async () => {
+  it("leaves the dashboard to switch / take over another workflow", async () => {
     const dashboardSource = source();
     const harness = dashboardHarness();
     const opening = presentWorkflowDashboard(dashboardSource, harness.ui, {
@@ -241,21 +239,19 @@ describe("persistent workflow dashboard surface", () => {
     });
     const component = await capturedComponent(harness);
 
-    // Workflow → ticket → worker → Configure Worker profile…
+    // Workflow → ticket → worker → Switch / take over workflow…
     send(component, "\u001b[B");
     send(component, "\u001b[B");
     send(component, "\u001b[B");
     expect(component.render(120).join("\n")).toContain(
-      "Selected · Settings: Configure Worker profile",
+      "Selected · Routing: Switch / take over workflow",
     );
 
     send(component, "\r");
     await expect(opening).resolves.toEqual({
-      status: "configure-worker-profile",
+      status: "switch-workflow",
     });
-    expect(harness.doneValues).toEqual([
-      { status: "configure-worker-profile" },
-    ]);
+    expect(harness.doneValues).toEqual([{ status: "switch-workflow" }]);
   });
 
   it("polls only local panel telemetry and retains the selected worker key", async () => {
@@ -391,8 +387,7 @@ describe("persistent workflow dashboard surface", () => {
     );
     const component = await capturedComponent(harness);
 
-    // Workflow → ticket → settings → settings → explicit Next action.
-    send(component, "\u001b[B");
+    // Workflow → ticket → routing → explicit Next action.
     send(component, "\u001b[B");
     send(component, "\u001b[B");
     send(component, "\u001b[B");
