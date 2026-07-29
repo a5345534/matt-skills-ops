@@ -1640,9 +1640,12 @@ export function buildMainMenuItems(
 
 const HOME_SETTINGS_ITEM = "Settings…";
 const HOME_START_NEW_ITEM = "Start new workflow";
-const HOME_TAKE_OVER_ITEM = "Take over Active workflow…";
 const HOME_UNFINISHED_HEADER = "--- Unfinished (local) ---";
 const HOME_EMPTY_ITEM = "No local unfinished workflows";
+const WORKFLOW_OPEN_ITEM = "Open this workflow";
+const WORKFLOW_TAKE_OVER_THIS_ITEM = "Take over this workflow…";
+const WORKFLOW_SWITCH_ANOTHER_ITEM =
+  "Switch / take over another Active workflow…";
 
 function homeUnfinishedItem(label: string, workflowId: number): string {
   return `${label} [#${workflowId}]`;
@@ -1668,7 +1671,7 @@ export async function presentMattAutoHome(
     // Local root resolution is filesystem/git only; no tracker reads.
     await coordinator.currentRoot();
     const unfinished = await coordinator.listLocalUnfinishedWorkflows();
-    const items: string[] = [HOME_SETTINGS_ITEM, HOME_TAKE_OVER_ITEM];
+    const items: string[] = [HOME_SETTINGS_ITEM];
     if (unfinished.length === 0) {
       items.push(HOME_EMPTY_ITEM, HOME_START_NEW_ITEM);
     } else {
@@ -1689,10 +1692,6 @@ export async function presentMattAutoHome(
       await presentHomeSettingsMenu(coordinator, ui);
       continue;
     }
-    if (selected === HOME_TAKE_OVER_ITEM) {
-      await presentTakeOverWorkflowMenu(coordinator, ui, pipelineOptions);
-      continue;
-    }
     if (selected === HOME_START_NEW_ITEM) {
       // Network begins here: Create-spec / pipeline needs tracker + skills host.
       await runPostGrillPipeline(coordinator, ui, pipelineOptions);
@@ -1700,23 +1699,77 @@ export async function presentMattAutoHome(
     }
     const workflowId = parseHomeUnfinishedItem(selected);
     if (workflowId === undefined) continue;
+    await presentSelectedWorkflowMenu(
+      coordinator,
+      ui,
+      workflowId,
+      pipelineOptions,
+    );
+  }
+}
+
+/**
+ * Per-workflow menu after picking a local unfinished entry on home.
+ * Take-over / switch live here — not as bare top-level home actions.
+ */
+async function presentSelectedWorkflowMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+  workflowId: number,
+  pipelineOptions: RunPostGrillPipelineOptions,
+): Promise<void> {
+  for (;;) {
+    const selected = await ui.select(`Workflow #${workflowId}`, [
+      WORKFLOW_OPEN_ITEM,
+      WORKFLOW_TAKE_OVER_THIS_ITEM,
+      WORKFLOW_SWITCH_ANOTHER_ITEM,
+      BACK_ITEM,
+    ]);
+    if (selected === undefined || selected === BACK_ITEM) return;
+
+    if (selected === WORKFLOW_SWITCH_ANOTHER_ITEM) {
+      await presentTakeOverWorkflowMenu(coordinator, ui, pipelineOptions);
+      return;
+    }
+
+    if (selected === WORKFLOW_TAKE_OVER_THIS_ITEM) {
+      const result = await coordinator.runNextAction(
+        resumeWorkflowActionId(workflowId),
+      );
+      if (result.status === "failed") {
+        ui.notify(result.reason, "error");
+        continue;
+      }
+      ui.notify(
+        `This home took over Workflow #${workflowId}. Opening workflow surface…`,
+        "info",
+      );
+      if (await presentDashboardIfAvailable(coordinator, ui)) {
+        return;
+      }
+      await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
+      return;
+    }
+
+    if (selected !== WORKFLOW_OPEN_ITEM) continue;
     try {
       await coordinator.selectLocalUnfinishedWorkflow(workflowId);
     } catch (error) {
       ui.notify(errorMessage(error), "error");
-      continue;
+      return;
     }
     // Drill-in: full workflow surface may read GitHub.
     if (await presentDashboardIfAvailable(coordinator, ui)) {
-      continue;
+      return;
     }
     await presentWorkflowBlockingMenu(coordinator, ui, pipelineOptions);
+    return;
   }
 }
 
 /**
  * List Active workflows on the current Target (GitHub) and Resume/take over one.
- * Used from local home and from the workflow dashboard routing row.
+ * Used from a selected-workflow menu and from the dashboard routing row.
  */
 export async function presentTakeOverWorkflowMenu(
   coordinator: WorkflowCoordinator,
