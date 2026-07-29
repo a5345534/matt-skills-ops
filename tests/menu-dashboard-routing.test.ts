@@ -6,6 +6,7 @@ import {
   type MattAutoUi,
 } from "../src/ui/menu.js";
 import type {
+  LocalUnfinishedWorkflow,
   NextAction,
   PreflightResult,
   TicketProgressSummary,
@@ -94,14 +95,16 @@ function coordinatorHarness() {
     getHomeModel: vi.fn(async () => undefined),
     getGlobalWorkerConcurrency: vi.fn(async () => undefined),
     getRootWorkerConcurrency: vi.fn(async () => undefined),
-    listLocalUnfinishedWorkflows: vi.fn(async () => [
-      {
-        workflowId: 38,
-        sources: ["legacy-pointer" as const],
-        bound: true,
-        label: "Workflow #38 · bound",
-      },
-    ]),
+    listLocalUnfinishedWorkflows: vi.fn(
+      async (): Promise<LocalUnfinishedWorkflow[]> => [
+        {
+          workflowId: 38,
+          sources: ["legacy-pointer"],
+          bound: true,
+          label: "Workflow #38 · bound",
+        },
+      ],
+    ),
     selectLocalUnfinishedWorkflow: vi.fn(async () => undefined),
   };
 }
@@ -202,6 +205,7 @@ describe("manual menu dashboard routing", () => {
         "Settings…",
         "--- Unfinished (local) ---",
         "Workflow #38 · bound [#38]",
+        "Start new workflow",
       ]),
     );
     expect(mainHarness.ui.selects).toHaveBeenCalledWith(
@@ -237,6 +241,124 @@ describe("manual menu dashboard routing", () => {
     expect(nextHarness.ui.selects).not.toHaveBeenCalled();
     dismiss(next);
     await expect(nextOpening).resolves.toBeUndefined();
+  });
+
+  // Issue #55: Start new remains visible with and without local unfinished entries.
+  describe("home Start new workflow visibility", () => {
+    it("always offers Start new workflow when unfinished list is non-empty", async () => {
+      const coordinator = coordinatorHarness();
+      const selects = vi.fn(async () => undefined);
+      const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+      await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+      expect(selects).toHaveBeenCalledWith("Matt Auto", [
+        "Settings…",
+        "--- Unfinished (local) ---",
+        "Workflow #38 · bound [#38]",
+        "Start new workflow",
+      ]);
+      // Home render stays local-only — no tracker/preflight reads yet.
+      expect(coordinator.listLocalUnfinishedWorkflows).toHaveBeenCalled();
+      expect(coordinator.preflight).not.toHaveBeenCalled();
+      expect(coordinator.getActiveWorkflow).not.toHaveBeenCalled();
+    });
+
+    it("offers Start new alongside every unfinished entry when the list has multiple items", async () => {
+      const coordinator = coordinatorHarness();
+      const unfinished: LocalUnfinishedWorkflow[] = [
+        {
+          workflowId: 38,
+          sources: ["legacy-pointer"],
+          bound: true,
+          label: "Workflow #38 · bound",
+        },
+        {
+          workflowId: 41,
+          sources: ["transcripts"],
+          bound: false,
+          label: "Workflow #41 · unbound",
+        },
+      ];
+      coordinator.listLocalUnfinishedWorkflows.mockResolvedValueOnce(unfinished);
+      const selects = vi.fn(async () => undefined);
+      const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+      await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+      expect(selects).toHaveBeenCalledWith("Matt Auto", [
+        "Settings…",
+        "--- Unfinished (local) ---",
+        "Workflow #38 · bound [#38]",
+        "Workflow #41 · unbound [#41]",
+        "Start new workflow",
+      ]);
+    });
+
+    it("offers Start new workflow and empty hint when unfinished list is empty", async () => {
+      const coordinator = coordinatorHarness();
+      coordinator.listLocalUnfinishedWorkflows.mockResolvedValueOnce([]);
+      const selects = vi.fn(async () => undefined);
+      const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+      await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+      expect(selects).toHaveBeenCalledWith("Matt Auto", [
+        "Settings…",
+        "No local unfinished workflows",
+        "Start new workflow",
+      ]);
+    });
+
+    it("routes Start new workflow into the post-grill pipeline, not an unfinished id", async () => {
+      const coordinator = {
+        ...coordinatorHarness(),
+        beginPipelineRun: vi.fn(),
+        isRunTerminated: vi.fn(() => false),
+        isPipelinePaused: vi.fn(() => false),
+        isAutoAdvanceBlocked: vi.fn(() => false),
+        // Empty next-actions ends the pipeline after preflight without more UI.
+        nextActions: vi.fn(async () => []),
+        getPanelState: vi.fn(async () => undefined),
+      };
+      const selects = vi
+        .fn()
+        .mockResolvedValueOnce("Start new workflow")
+        .mockResolvedValueOnce(undefined);
+      const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+      await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+      // Start new enters the pipeline without binding an unfinished id. Its
+      // first action owns readiness; Home does not restore a global preflight.
+      expect(coordinator.selectLocalUnfinishedWorkflow).not.toHaveBeenCalled();
+      expect(coordinator.preflight).not.toHaveBeenCalled();
+      expect(coordinator.beginPipelineRun).toHaveBeenCalled();
+    });
+
+    it("drills unfinished selection into the workflow submenu without binding yet", async () => {
+      const coordinator = coordinatorHarness();
+      const selects = vi
+        .fn()
+        .mockResolvedValueOnce("Workflow #38 · bound [#38]")
+        .mockResolvedValueOnce(undefined); // leave workflow submenu
+      const ui: MattAutoUi = { select: selects, notify: () => {} };
+
+      await presentMainMenu(coordinator as unknown as WorkflowCoordinator, ui);
+
+      expect(selects).toHaveBeenCalledWith(
+        "Workflow #38",
+        expect.arrayContaining([
+          "Open this workflow (run)",
+          "Open Workflow dashboard…",
+          "Take over this workflow…",
+          "Switch / take over another Active workflow…",
+        ]),
+      );
+      // Binding only happens on Open; merely picking the unfinished row must not bind.
+      expect(coordinator.selectLocalUnfinishedWorkflow).not.toHaveBeenCalled();
+      expect(coordinator.preflight).not.toHaveBeenCalled();
+    });
   });
 
   it("opens the Workflow dashboard only from the explicit dashboard menu item", async () => {

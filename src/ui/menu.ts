@@ -1783,9 +1783,11 @@ export async function presentMattAutoHome(
     // Local root resolution is filesystem/git only; no tracker reads.
     await coordinator.currentRoot();
     const unfinished = await coordinator.listLocalUnfinishedWorkflows();
+    // Always offer create — unfinished entries resume existing work; they do not
+    // replace the Start-new affordance (see issue #54 / parent #53).
     const items: string[] = [HOME_SETTINGS_ITEM];
     if (unfinished.length === 0) {
-      items.push(HOME_EMPTY_ITEM, HOME_START_NEW_ITEM);
+      items.push(HOME_EMPTY_ITEM);
     } else {
       items.push(
         HOME_UNFINISHED_HEADER,
@@ -1794,6 +1796,7 @@ export async function presentMattAutoHome(
         ),
       );
     }
+    items.push(HOME_START_NEW_ITEM);
 
     const selected = await ui.select("Matt Auto", items);
     if (selected === undefined) return;
