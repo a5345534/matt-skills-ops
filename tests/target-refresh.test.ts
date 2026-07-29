@@ -80,6 +80,13 @@ async function createRefreshFixture(): Promise<{
   await git(bare, ["init", "--bare", "-b", "main"]);
   await mkdir(work, { recursive: true });
   await git(work, ["init", "-b", "main"]);
+  // WorkspacePort spawns its own git commands, so fixture-only exec env is
+  // insufficient in a clean CI container. Make the root fixture a complete
+  // repository: permit its local bare remote and give adapter-created merge
+  // commits an identity without changing process/global Git policy.
+  await git(work, ["config", "protocol.file.allow", "always"]);
+  await git(work, ["config", "user.name", "test"]);
+  await git(work, ["config", "user.email", "test@example.com"]);
   await writeFile(path.join(work, "base.txt"), "base\n");
   await git(work, ["add", "base.txt"]);
   await git(work, ["commit", "-m", "base"]);

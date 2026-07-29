@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  createTrackerPort,
+  createGitHubTrackerPort,
   extractGhApiErrorMessage,
   formatWorkflowManifestComment,
   parsePaginatedApiArray,
@@ -137,7 +137,7 @@ process.exit(1);
     const originalPath = process.env.PATH;
     process.env.PATH = `${directory}${path.delimiter}${originalPath ?? ""}`;
     try {
-      const tracker = createTrackerPort(process.cwd());
+      const tracker = createGitHubTrackerPort(process.cwd());
       await expect(tracker.findActiveWorkflows(target)).resolves.toEqual([]);
       const calls = (await readFile(callLogPath, "utf8"))
         .trim()
@@ -228,7 +228,7 @@ process.exit(1);
     const originalPath = process.env.PATH;
     process.env.PATH = `${directory}${path.delimiter}${originalPath ?? ""}`;
     try {
-      const tracker = createTrackerPort(process.cwd());
+      const tracker = createGitHubTrackerPort(process.cwd());
       const active = await tracker.findActiveWorkflows(target);
 
       expect(active.map((workflow) => workflow.workflowId)).toEqual([39, 40]);
@@ -287,7 +287,7 @@ process.exit(1);
     const originalPath = process.env.PATH;
     process.env.PATH = `${directory}${path.delimiter}${originalPath ?? ""}`;
     try {
-      const tracker = createTrackerPort(process.cwd());
+      const tracker = createGitHubTrackerPort(process.cwd());
       await expect(tracker.findActiveWorkflows(target)).rejects.toThrow(
         /rate limit exceeded/i,
       );
