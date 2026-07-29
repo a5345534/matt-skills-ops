@@ -32,7 +32,7 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 
 ## Manual Workflow dashboard
 
-When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** only to run a selected Next action; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
+When Pi exposes `ctx.ui.custom()`, `/matt-auto` opens one persistent dashboard instead of rebuilding blocking menus. Use arrow keys to browse workflow, ticket, worker, preflight, settings, and action rows; the selected row's detail changes inline without chat notifications. Press **Enter** to run a selected Next action or open Configure Worker profile / concurrency; stage confirmation and Implementation disposition choices remain inline. `Esc` returns to chat without changing workflow state (while an action is awaiting a choice, use its visible choice or dismissal instead).
 
 Press `r` for **Refresh**. Opening the dashboard, Refresh, and an action settlement take a full coordinator snapshot; normal browsing and periodic updates read only local worker/process/turn telemetry. After an action settles, the dashboard refreshes in place and keeps the relevant selected ticket or Worker attempt when it remains available.
 

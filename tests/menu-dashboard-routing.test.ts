@@ -85,6 +85,11 @@ function coordinatorHarness() {
     })),
     currentRoot: vi.fn(async () => root),
     listRoots: vi.fn(async () => [root]),
+    getWorkerProfile: vi.fn(async () => undefined),
+    getGlobalWorkerProfile: vi.fn(async () => undefined),
+    getRootWorkerProfile: vi.fn(async () => undefined),
+    listAvailableModels: vi.fn(async () => []),
+    getHomeModel: vi.fn(async () => undefined),
     getGlobalWorkerConcurrency: vi.fn(async () => undefined),
     getRootWorkerConcurrency: vi.fn(async () => undefined),
   };
@@ -170,6 +175,9 @@ describe("manual menu dashboard routing", () => {
     expect(main.render(120).join("\n")).toContain(
       "Matt Auto · Workflow dashboard",
     );
+    expect(main.render(120).join("\n")).toContain(
+      "Settings · Configure Worker profile…",
+    );
     expect(mainHarness.ui.selects).not.toHaveBeenCalled();
     expect(coordinator.currentRoot).not.toHaveBeenCalled();
 
@@ -177,7 +185,29 @@ describe("manual menu dashboard routing", () => {
     main.handleInput!("\u001b[B");
     expect(main.render(120).join("\n")).toContain("Selected · Ticket #43");
     expect(mainHarness.ui.notices).toEqual([]);
-    dismiss(main);
+
+    // Ticket → settings: Configure Worker profile…
+    main.handleInput!("\u001b[B");
+    expect(main.render(120).join("\n")).toContain(
+      "Selected · Settings: Configure Worker profile",
+    );
+
+    // Enter leaves the dashboard into the blocking Worker profile menu, then
+    // reopens the dashboard after that menu is cancelled.
+    mainHarness.ui.selects.mockResolvedValueOnce(undefined);
+    main.handleInput!("\r");
+    await vi.waitFor(() => {
+      expect(mainHarness.ui.selects).toHaveBeenCalledWith(
+        "Worker profile",
+        expect.any(Array),
+      );
+    });
+    const reopened = await capturedComponent(mainHarness);
+    expect(reopened.render(120).join("\n")).toContain(
+      "Matt Auto · Workflow dashboard",
+    );
+
+    dismiss(reopened);
     await expect(mainOpening).resolves.toBeUndefined();
 
     const nextHarness = customHarness();

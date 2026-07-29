@@ -1255,10 +1255,22 @@ async function presentDashboardIfAvailable(
   if (!canPresentWorkflowDashboard(ui)) return false;
 
   try {
-    await presentWorkflowDashboard(coordinator, ui, {
-      ...(scope ? { scope } : {}),
-    });
-    return true;
+    // Settings rows leave the custom surface so the existing blocking model
+    // selectors can run, then reopen the dashboard with the updated prefs.
+    for (;;) {
+      const result = await presentWorkflowDashboard(coordinator, ui, {
+        ...(scope ? { scope } : {}),
+      });
+      if (result.status === "configure-worker-profile") {
+        await presentWorkerProfileMenu(coordinator, ui);
+        continue;
+      }
+      if (result.status === "configure-worker-concurrency") {
+        await presentWorkerConcurrencyMenu(coordinator, ui);
+        continue;
+      }
+      return true;
+    }
   } catch (error) {
     // A host can expose a partial/RPC `custom` method that rejects at runtime.
     // Keep its established blocking-select menu usable rather than stranding

@@ -44,6 +44,14 @@ import {
 /** Stable identity for the one workflow-summary inspection row. */
 export const WORKFLOW_DASHBOARD_WORKFLOW_ROW_KEY = "workflow";
 
+/** Stable identity for the Configure Worker profile settings row. */
+export const WORKFLOW_DASHBOARD_CONFIGURE_WORKER_PROFILE_ROW_KEY =
+  "settings:worker-profile";
+
+/** Stable identity for the Configure Worker concurrency settings row. */
+export const WORKFLOW_DASHBOARD_CONFIGURE_WORKER_CONCURRENCY_ROW_KEY =
+  "settings:worker-concurrency";
+
 /** A stable, presentation-independent dashboard row key. */
 export type WorkflowDashboardRowKey = string;
 
@@ -53,6 +61,7 @@ export type WorkflowDashboardRowKind =
   | "ticket"
   | "worker-attempt"
   | "preflight"
+  | "settings"
   | "next-action";
 
 /** Dashboard list sections, in their deterministic presentation order. */
@@ -61,6 +70,7 @@ export type WorkflowDashboardSectionId =
   | "tickets"
   | "workers"
   | "preflight"
+  | "settings"
   | "next-actions";
 
 /** Detail content for a selected inspection target. */
@@ -167,6 +177,16 @@ export function nextActionRowKey(actionId: string): WorkflowDashboardRowKey {
   return `action:${actionId}`;
 }
 
+/** Stable key for the Configure Worker profile settings row. */
+export function configureWorkerProfileRowKey(): WorkflowDashboardRowKey {
+  return WORKFLOW_DASHBOARD_CONFIGURE_WORKER_PROFILE_ROW_KEY;
+}
+
+/** Stable key for the Configure Worker concurrency settings row. */
+export function configureWorkerConcurrencyRowKey(): WorkflowDashboardRowKey {
+  return WORKFLOW_DASHBOARD_CONFIGURE_WORKER_CONCURRENCY_ROW_KEY;
+}
+
 /**
  * Keep a prior selection when its stable key survives a refresh. Otherwise the
  * first row in the fixed section order is the deterministic fallback.
@@ -217,6 +237,13 @@ export function buildWorkflowDashboardViewModel(
   const actionRows = uniqueRows(
     inputs.nextActions.map((action) => buildNextActionRow(action)),
   );
+  const settingsRows =
+    options.scope === "next-actions"
+      ? []
+      : [
+          buildConfigureWorkerProfileRow(inputs.preflight),
+          buildConfigureWorkerConcurrencyRow(),
+        ];
 
   const sections: WorkflowDashboardSection[] = [
     { id: "workflow", title: "Workflow", rows: workflowRows },
@@ -229,6 +256,9 @@ export function buildWorkflowDashboardViewModel(
   }
   if (options.scope !== "next-actions" && preflightRows.length > 0) {
     sections.push({ id: "preflight", title: "Preflight", rows: preflightRows });
+  }
+  if (settingsRows.length > 0) {
+    sections.push({ id: "settings", title: "Settings", rows: settingsRows });
   }
   if (actionRows.length > 0) {
     sections.push({ id: "next-actions", title: "Next actions", rows: actionRows });
@@ -412,6 +442,56 @@ function buildNextActionRow(action: NextAction): WorkflowDashboardRow {
     detail: {
       key,
       title: `Next action: ${label}`,
+      lines,
+    },
+  });
+}
+
+function buildConfigureWorkerProfileRow(
+  preflight: PreflightResult,
+): WorkflowDashboardRow {
+  const key = configureWorkerProfileRowKey();
+  const profile = preflight.workerProfile;
+  const profileLine = profile
+    ? `${profile.profile.provider}/${profile.profile.modelId} (thinking ${profile.profile.thinkingLevel}) [${profile.source}]`
+    : "(not configured)";
+  const lines = [
+    "Open the Worker profile menus to set the global default or Workflow-root override model and thinking level.",
+    `Effective Worker profile: ${profileLine}`,
+    "Configuring Worker profile does not change the Workflow home model.",
+  ];
+
+  return makeRow({
+    key,
+    kind: "settings",
+    label: "Configure Worker profile…",
+    description: profile
+      ? `Effective: ${profile.profile.provider}/${profile.profile.modelId}:${profile.profile.thinkingLevel}`
+      : "Worker profile not configured",
+    detail: {
+      key,
+      title: "Settings: Configure Worker profile",
+      lines,
+    },
+  });
+}
+
+function buildConfigureWorkerConcurrencyRow(): WorkflowDashboardRow {
+  const key = configureWorkerConcurrencyRowKey();
+  const lines = [
+    "Open the Worker concurrency menus to set the global default or Workflow-root override.",
+    "Worker concurrency is local preferences only; it is never written to GitHub.",
+    "Values above the warning threshold require a one-time confirmation before saving.",
+  ];
+
+  return makeRow({
+    key,
+    kind: "settings",
+    label: "Configure Worker concurrency…",
+    description: "Global default / Workflow-root override",
+    detail: {
+      key,
+      title: "Settings: Configure Worker concurrency",
       lines,
     },
   });
@@ -797,9 +877,10 @@ export type WorkflowDashboardTheme = {
 };
 
 /** Lifecycle returned when the operator leaves the passive dashboard. */
-export type WorkflowDashboardResult = {
-  status: "dismissed";
-};
+export type WorkflowDashboardResult =
+  | { status: "dismissed" }
+  | { status: "configure-worker-profile" }
+  | { status: "configure-worker-concurrency" };
 
 /** Pi custom component shape, kept structural for test and partial-host support. */
 export type WorkflowDashboardComponent = {
@@ -939,8 +1020,34 @@ export function createWorkflowDashboardComponent(
     tui.requestRender();
   };
 
+  const leaveForSettings = (
+    status: Extract<
+      WorkflowDashboardResult,
+      { status: "configure-worker-profile" | "configure-worker-concurrency" }
+    >["status"],
+  ) => {
+    if (finished) return;
+    if (actionController?.getState().inputDisabled) {
+      refreshStatus = "Finish the current action before opening settings";
+      tui.requestRender();
+      return;
+    }
+    actionController?.dispose();
+    finished = true;
+    if (interval) clearInterval(interval);
+    done({ status });
+  };
+
   const activateRow = (key: WorkflowDashboardRowKey) => {
     selectRow(key);
+    if (key === configureWorkerProfileRowKey()) {
+      leaveForSettings("configure-worker-profile");
+      return;
+    }
+    if (key === configureWorkerConcurrencyRowKey()) {
+      leaveForSettings("configure-worker-concurrency");
+      return;
+    }
     const action = actionForDashboardRow(snapshot, key);
     if (!action || isPassiveDashboardAction(action) || !actionController) return;
 
@@ -1237,8 +1344,8 @@ function makeWorkflowDashboardSelectList(
   );
   const selectedIndex = items.findIndex((item) => item.value === selectedKey);
   list.setSelectedIndex(selectedIndex);
-  // Arrow navigation is inspection only. Enter activates only explicit Next
-  // action rows; every passive row remains in the current custom surface.
+  // Arrow navigation is inspection only. Enter activates Next actions or
+  // settings rows; every other row remains passive in this custom surface.
   list.onSelectionChange = (item) => onSelectionChange(item.value);
   list.onSelect = (item) => onActivate(item.value);
   list.onCancel = onCancel;
@@ -1401,7 +1508,7 @@ function dashboardHelp(
     return `action input disabled until it settles · ${refreshStatus}`;
   }
   const dismissResult = actionState?.result ? "x dismiss result · " : "";
-  return `↑↓ browse · Enter run action / inspect · ${dismissResult}r full refresh · Esc return to chat · ${refreshStatus}`;
+  return `↑↓ browse · Enter run action / open settings · ${dismissResult}r full refresh · Esc return to chat · ${refreshStatus}`;
 }
 
 function replaceDashboardPanel(
