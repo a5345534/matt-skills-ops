@@ -2096,13 +2096,19 @@ export async function runPostGrillPipeline(
 
     const nextStarted = Date.now();
     const nextActions = await coordinator.nextActions();
+    const nextDiagnostic =
+      typeof coordinator.getNextActionsDiagnostic === "function"
+        ? coordinator.getNextActionsDiagnostic()
+        : undefined;
     log("info", "pipeline:nextActions", {
       step,
       ms: Date.now() - nextStarted,
       ids: nextActions.map((a) => a.id),
       labels: nextActions.map((a) => a.label),
+      ...(nextDiagnostic ? { diagnostic: nextDiagnostic } : {}),
     });
     if (nextActions.length === 0) {
+      const diagnostic = nextDiagnostic;
       const panel = await coordinator.getPanelState();
       // Slots full (or no ready launch) while workers / conflict / pause live → wait.
       // waitForPipelineWorkers settles early on P1 (needs-disposition / pending-retry)
@@ -2116,6 +2122,7 @@ export async function runPostGrillPipeline(
           pipelinePaused: panel?.pipelinePaused,
           runTerminated: panel?.runTerminated,
           integration: panel?.integration,
+          ...(diagnostic ? { nextActionsDiagnostic: diagnostic } : {}),
         });
         const waitResult = await waitForPipelineWorkers(coordinator, ui);
         if (isWaitStopResult(waitResult)) {
@@ -2137,11 +2144,48 @@ export async function runPostGrillPipeline(
         }
         continue;
       }
+      if (diagnostic?.routeKind === "unavailable" || diagnostic?.reason) {
+        const reason =
+          diagnostic.reason ??
+          "Workflow home routing is unavailable after a green preflight.";
+        ui.notify(
+          [
+            "Pipeline stopped: Workflow home cannot produce Next actions.",
+            reason,
+            diagnostic.routeKind
+              ? `Route: ${diagnostic.routeKind}`
+              : undefined,
+            diagnostic.workflowId !== undefined
+              ? `Workflow #${diagnostic.workflowId}`
+              : undefined,
+          ]
+            .filter((line): line is string => Boolean(line))
+            .join("\n"),
+          "warning",
+        );
+        log("warn", "pipeline:stop", {
+          reason:
+            diagnostic.routeKind === "unavailable"
+              ? "workflow-home-unavailable"
+              : "next-actions-empty",
+          step,
+          nextActionsDiagnostic: diagnostic,
+        });
+        endSignal = {
+          body: reason,
+          warning: true,
+        };
+        return;
+      }
       ui.notify(
         "Pipeline idle — no actionable Next steps (ready frontier may be empty or all tickets blocked).",
         "info",
       );
-      log("info", "pipeline:stop", { reason: "idle", step });
+      log("info", "pipeline:stop", {
+        reason: "idle",
+        step,
+        ...(diagnostic ? { nextActionsDiagnostic: diagnostic } : {}),
+      });
       return;
     }
 

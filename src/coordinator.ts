@@ -37,6 +37,7 @@ import {
   START_FOLLOW_UP_ACTION,
   START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   TICKET_ISSUE_LABEL,
+  REWORK_TICKET_ACTION_PREFIX,
   TICKET_PROGRESS_ACTION,
   UNSUPPORTED_TRACKER_REASON,
   WORKFLOW_MANIFEST_SCHEMA,
@@ -115,6 +116,7 @@ import type {
   IntegratedTicketRef,
   LocalUnfinishedWorkflow,
   NextAction,
+  NextActionsDiagnostic,
   ParallelDeliveryPanelState,
   PipelineAffectedAttempt,
   PipelinePauseResult,
@@ -637,6 +639,9 @@ export function createWorkflowCoordinator(
    * Session pointer to the most recently cleaned-up workflow on this Target branch.
    * Enables Start Follow-up without mutating the completed workflow.
    */
+  /** Last nextActions() routing diagnostic for pipeline idle logging. */
+  let lastNextActionsDiagnostic: NextActionsDiagnostic | undefined;
+
   let lastCompletedWorkflow:
     | { workflowId: number; title?: string; targetBranch: string }
     | undefined;
@@ -2004,15 +2009,13 @@ export function createWorkflowCoordinator(
           return { ok: true };
         }
       } catch {
-        // Treat a local-lock transport/filesystem failure as lost ownership.
+        // Session-sticky lock memory can outlive the on-disk record after a
+        // failed run; drop it and re-acquire rather than permanent unavailable.
       }
+      // Lost renew: clear sticky memory and fall through to a fresh acquire so
+      // same-session /matt-auto run can continue when the checkout is free.
       heldWorkflowHomeLock = undefined;
       lastWorkflowHomeLockHeartbeatAtMs = 0;
-      return {
-        ok: false,
-        reason:
-          "This Workflow home no longer owns the local checkout guard. Open or resume it from a separate checkout.",
-      };
     }
 
     try {
@@ -3507,6 +3510,12 @@ export function createWorkflowCoordinator(
     return result;
   }
 
+  function getNextActionsDiagnostic(): NextActionsDiagnostic | undefined {
+    return lastNextActionsDiagnostic
+      ? { ...lastNextActionsDiagnostic }
+      : undefined;
+  }
+
   function workflowRoutingActions(route: WorkflowHomeRoute): NextAction[] {
     if (route.kind === "selection-required") {
       const resume = route.candidates.map((candidate) => ({
@@ -3557,8 +3566,13 @@ export function createWorkflowCoordinator(
   }
 
   async function nextActions(): Promise<NextAction[]> {
+    lastNextActionsDiagnostic = undefined;
     const result = await preflight();
     if (!result.ok) {
+      lastNextActionsDiagnostic = {
+        routeKind: "preflight-failed",
+        reason: "Workflow preflight is incomplete.",
+      };
       return [];
     }
 
@@ -3568,9 +3582,30 @@ export function createWorkflowCoordinator(
       route.kind === "selection-required" ||
       route.kind === "lease-held"
     ) {
-      return workflowRoutingActions(route);
+      const actions = workflowRoutingActions(route);
+      lastNextActionsDiagnostic = {
+        routeKind: route.kind,
+        ...(route.kind === "lease-held"
+          ? {
+              workflowId: route.active.workflowId,
+              reason: route.holderId
+                ? `Workflow coordinator lease held by ${route.holderId}.`
+                : "Workflow coordinator lease held by another Workflow home.",
+            }
+          : {
+              reason:
+                route.candidates.length === 0
+                  ? "No Active workflow is bound to this checkout; choose Start new independent workflow or create a Follow-up."
+                  : `Choose Resume among ${route.candidates.length} Active workflow(s) or Start new independent workflow.`,
+            }),
+      };
+      return actions;
     }
     if (route.kind === "unavailable") {
+      lastNextActionsDiagnostic = {
+        routeKind: "unavailable",
+        reason: route.reason,
+      };
       return [];
     }
     const active = route.active;
@@ -3594,8 +3629,17 @@ export function createWorkflowCoordinator(
           description: `${START_FOLLOW_UP_ACTION.description} References completed Workflow #${lastCompletedWorkflow.workflowId}.`,
         });
       }
+      lastNextActionsDiagnostic = {
+        routeKind: route.kind,
+        reason: "No Active workflow; startup actions are available.",
+      };
       return actions;
     }
+
+    lastNextActionsDiagnostic = {
+      routeKind: route.kind,
+      workflowId: active.workflowId,
+    };
 
     await recoverCompletedWorkerTelemetryFromTranscripts(bound, active);
 
@@ -3853,12 +3897,44 @@ export function createWorkflowCoordinator(
         actions.push(formatTicketProgressAction(progress));
       } else if (actions.length === 0) {
         // Running workers, free slots, but no launchable ready ticket left.
+        lastNextActionsDiagnostic = {
+          routeKind: route.kind,
+          workflowId: active.workflowId,
+          readyCount: progress.ready.length,
+          openCount: progress.open,
+          reason:
+            "Implementation workers are running; no additional ready ticket can launch yet.",
+        };
         return [];
       }
+      lastNextActionsDiagnostic = {
+        routeKind: route.kind,
+        workflowId: active.workflowId,
+        readyCount: progress.ready.length,
+        openCount: progress.open,
+        ...(actions.every(
+          (action) =>
+            action.id === TICKET_PROGRESS_ACTION.id || isReworkActionId(action.id),
+        )
+          ? {
+              reason:
+                "No auto-advanceable Next action (ready frontier empty or only Rework/ticket-progress remain).",
+            }
+          : {}),
+      };
       return actions;
     }
 
+    lastNextActionsDiagnostic = {
+      routeKind: route.kind,
+      workflowId: active.workflowId,
+      reason: "No Next actions for this Active workflow stage.",
+    };
     return [];
+  }
+
+  function isReworkActionId(actionId: string): boolean {
+    return actionId.startsWith(REWORK_TICKET_ACTION_PREFIX);
   }
 
   async function runNextAction(actionId: string): Promise<StageResult> {
@@ -10015,6 +10091,7 @@ export function createWorkflowCoordinator(
     getPanelState,
     getCompletedWorkerTelemetry,
     getImplementationRecoveryStates,
+    getNextActionsDiagnostic,
     getPipelineRunElapsedMs,
     confirmDisposition,
     abortWorkers,

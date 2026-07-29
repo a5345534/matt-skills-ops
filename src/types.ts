@@ -49,6 +49,30 @@ export type NextAction = {
   description: string;
 };
 
+/**
+ * Why nextActions was empty (or routing-blocked) after a green preflight.
+ * Surfaces silent-idle failures without inventing GitHub state.
+ */
+export type NextActionsDiagnostic = {
+  /** Workflow-home route kind when known. */
+  routeKind?:
+    | "legacy"
+    | "bound"
+    | "selection-required"
+    | "lease-held"
+    | "unavailable"
+    | "preflight-failed"
+    | "unknown";
+  /** Operator-visible reason when routing/home cannot produce actions. */
+  reason?: string;
+  /** Bound or candidate Active workflow id when known. */
+  workflowId?: number;
+  /** Ready frontier size when ticket progress was loaded. */
+  readyCount?: number;
+  /** Open ticket count when ticket progress was loaded. */
+  openCount?: number;
+};
+
 /** Planning / orchestration stage identifiers known to the coordinator. */
 export type StageId =
   | "create-spec"
@@ -1107,6 +1131,11 @@ export type WorkflowCoordinator = {
    * Empty when preflight fails or no stage is available yet.
    */
   nextActions(): Promise<NextAction[]>;
+  /**
+   * Compact diagnostic from the most recent nextActions() call.
+   * Used so /matt-auto run never reports bare idle when routing failed.
+   */
+  getNextActionsDiagnostic(): NextActionsDiagnostic | undefined;
   /**
    * Run a Next action by id (for example Create-spec Planning stage).
    * Planning stages execute in Workflow home and never publish silently.

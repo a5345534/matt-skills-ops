@@ -460,6 +460,73 @@ describe("Workflow-home bindings and coordinator leases", () => {
     });
   });
 
+  it("re-acquires a lost session lock instead of silent unavailable idle", async () => {
+    const tracker = createTracker([]);
+    const lockStore = createInMemoryWorkflowHomeLockStore();
+    const home = createCoordinator({
+      tracker: tracker.port,
+      coordination: createFakeCoordinationPort({
+        store: createInMemoryCoordinationStore(),
+      }),
+      workflowHomeLock: createInMemoryWorkflowHomeLockPort({ store: lockStore }),
+      path: "/checkout-sticky-lock",
+    });
+
+    // First call acquires the local checkout guard (selection-required / start-new path).
+    const first = await home.coordinator.nextActions();
+    expect(first.map((action) => action.id)).toEqual(
+      expect.arrayContaining([START_NEW_INDEPENDENT_WORKFLOW_ACTION.id]),
+    );
+
+    // Simulate disk lock disappearing while session still holds sticky memory.
+    lockStore.lock = undefined;
+
+    const second = await home.coordinator.nextActions();
+    expect(second.map((action) => action.id)).toEqual(
+      expect.arrayContaining([START_NEW_INDEPENDENT_WORKFLOW_ACTION.id]),
+    );
+    expect(home.coordinator.getNextActionsDiagnostic()?.routeKind).not.toBe(
+      "unavailable",
+    );
+  });
+
+  it("surfaces unavailable routing diagnostics instead of bare empty actions", async () => {
+    const brokenLock: WorkflowHomeLockPort = {
+      acquire: async () => {
+        throw new Error("lock filesystem offline");
+      },
+      renew: async () => ({ renewed: false }),
+      release: async () => ({ released: false }),
+    };
+    // Bound legacy (non-coordination) Active still requires the local checkout guard.
+    const home = createCoordinator({
+      tracker: createTracker([
+        {
+          workflowId: 41,
+          targetBranch: "main",
+          stage: "tickets-published",
+          workerProfile: {
+            provider: "anthropic",
+            modelId: "claude-sonnet-4",
+            thinkingLevel: "medium",
+          },
+          tickets: [42],
+        },
+      ]).port,
+      coordination: createFakeCoordinationPort({
+        store: createInMemoryCoordinationStore(),
+      }),
+      workflowHomeLock: brokenLock,
+      path: "/checkout-broken-lock",
+      preferences: { binding: { target, workflowId: 41 } },
+    });
+    await expect(home.coordinator.nextActions()).resolves.toEqual([]);
+    expect(home.coordinator.getNextActionsDiagnostic()).toMatchObject({
+      routeKind: "unavailable",
+      reason: expect.stringMatching(/lock filesystem offline|Workflow-home guard/i),
+    });
+  });
+
   it("clears a stale binding and creates new workflows as coordination-aware manifests", async () => {
     const tracker = createTracker([coordinatedWorkflow(41)]);
     const coordination = createFakeCoordinationPort({

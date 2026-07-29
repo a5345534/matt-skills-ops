@@ -1818,6 +1818,10 @@ describe("Workflow coordinator Next actions", () => {
         description: CREATE_SPEC_ACTION.description,
       },
     ]);
+    expect(coordinator.getNextActionsDiagnostic()).toMatchObject({
+      routeKind: "legacy",
+      reason: expect.stringMatching(/No Active workflow/i),
+    });
   });
 
   it("offers Create tickets after a published Create-spec workflow", async () => {
