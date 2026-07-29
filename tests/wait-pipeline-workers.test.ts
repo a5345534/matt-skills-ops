@@ -84,6 +84,9 @@ function controlCoordinator(
     pausePipeline?: () => Promise<PipelinePauseResult>;
     resumePipeline?: () => Promise<PipelineResumeResult>;
     terminateRun?: () => Promise<RunTerminationResult>;
+    emergencyStop?: () => Promise<
+      import("../src/types.js").EmergencyStopResult
+    >;
     isPipelinePaused?: () => boolean;
     isRunTerminated?: () => boolean;
   } = {},
@@ -124,6 +127,8 @@ function controlCoordinator(
           },
         ],
         pipelinePaused: true,
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
       };
     },
     resumePipeline: async () => {
@@ -149,6 +154,29 @@ function controlCoordinator(
         discardedBranches: ["matt-auto/42/ticket-19/r1"],
         discardedWorktrees: ["/workspaces/42/ticket-19/r1"],
         runTerminated: true,
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
+      };
+    },
+    emergencyStop: async () => {
+      if (handlers.emergencyStop) return handlers.emergencyStop();
+      terminated = true;
+      paused = false;
+      return {
+        abortedWorkerCount: 1,
+        affectedAttempts: [
+          {
+            workflowId: 42,
+            ticketNumber: 19,
+            attempt: 1,
+            kind: "implementation",
+          },
+        ],
+        releasedTargetBranchLease: false,
+        releasedWorkerSlotCount: 0,
+        releasedCoordinatorLease: false,
+        runTerminated: true,
+        lastStopReason: "emergency-stop",
       };
     },
     isPipelinePaused: () =>
@@ -748,6 +776,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       abortedWorkerCount: 1,
       affectedAttempts: [],
       pipelinePaused: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     let calls = 0;
     const coordinator = controlCoordinator(
@@ -794,6 +824,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
         },
       ],
       pipelinePaused: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     let paused = false;
     const coordinator = controlCoordinator(
@@ -854,6 +886,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       abortedWorkerCount: 0,
       affectedAttempts: [],
       pipelinePaused: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     const coordinator = controlCoordinator(
       () => {
@@ -905,6 +939,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       discardedBranches: [],
       discardedWorktrees: [],
       runTerminated: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     const coordinator = controlCoordinator(
       () => basePanel({ workers: [runningWorker()] }),
@@ -945,6 +981,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       discardedBranches: [],
       discardedWorktrees: [],
       runTerminated: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     const panel = basePanel({
       workers: [runningWorker()],
@@ -997,6 +1035,8 @@ describe("run brief Pause / Resume / Terminate confirms", () => {
       discardedBranches: ["matt-auto/42/ticket-19/r1"],
       discardedWorktrees: ["/workspaces/42/ticket-19/r1"],
       runTerminated: true as const,
+      releasedTargetBranchLease: false,
+      releasedWorkerSlotCount: 0,
     }));
     const panel = basePanel({ workers: [runningWorker()] });
     expect(predictRunTerminationMode(panel)).toBe("discard-unintegrated");

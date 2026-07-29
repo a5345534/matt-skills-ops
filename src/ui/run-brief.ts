@@ -1,3 +1,7 @@
+import {
+  formatParallelDeliveryBriefLines,
+  formatParallelDeliveryWaitingState,
+} from "../parallel-delivery-state.js";
 import type {
   RunTerminationMode,
   WorkflowPanelState,
@@ -25,6 +29,7 @@ export type RunBriefSectionId =
   | "workflow"
   | "pipeline"
   | "context"
+  | "parallel-delivery"
   | "workers"
   | "integration"
   | "ci"
@@ -127,6 +132,9 @@ export function buildRunBriefViewModel(
 
   const context = contextSection(panel);
   if (context) sections.push(context);
+
+  const parallelDelivery = parallelDeliverySection(panel);
+  if (parallelDelivery) sections.push(parallelDelivery);
 
   const hasTicketTable = Boolean(
     panel.ticketProgress &&
@@ -260,6 +268,17 @@ export function deriveContextLabel(panel: WorkflowPanelState): string | undefine
     return `Awaiting CI: ${list}`;
   }
 
+  // Prefer observed parallel-delivery waiting state over generic PR labels
+  // so queue / refresh / retry / lost-lease remain distinguishable.
+  if (
+    panel.parallelDelivery &&
+    panel.parallelDelivery.waitingState !== "not-in-delivery"
+  ) {
+    return formatParallelDeliveryWaitingState(
+      panel.parallelDelivery.waitingState,
+    );
+  }
+
   if (panel.workflowPr?.status === "merged") {
     return `Workflow PR #${panel.workflowPr.number} merged (cleanup pending)`;
   }
@@ -278,6 +297,17 @@ export function deriveContextLabel(panel: WorkflowPanelState): string | undefine
   }
 
   return undefined;
+}
+
+function parallelDeliverySection(
+  panel: WorkflowPanelState,
+): RunBriefSection | undefined {
+  if (!panel.parallelDelivery) return undefined;
+  return {
+    id: "parallel-delivery",
+    title: "Parallel delivery",
+    lines: formatParallelDeliveryBriefLines(panel.parallelDelivery),
+  };
 }
 
 function workersSection(
@@ -621,8 +651,9 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
       id: "controls",
       title: "Controls",
       lines: [
-        "Paused — Resume pipeline… / Terminate run…; Esc returns to chat",
+        "Paused — Resume pipeline… / Terminate run… (bound workflow only); Esc returns to chat",
         "Resume later: /matt-auto resume",
+        "Emergency stop (repository-scoped) is a separate confirmed control",
         "Shell fallback: echo terminate-now > .pi/matt-auto/run-control",
       ],
     };
@@ -631,7 +662,8 @@ function controlsSection(panel: WorkflowPanelState): RunBriefSection | undefined
     id: "controls",
     title: "Controls",
     lines: [
-      "Live: ↑↓ / Enter on Pause or Terminate (brief keeps refreshing)",
+      "Live: ↑↓ / Enter on Pause or Terminate (bound workflow only; brief keeps refreshing)",
+      "Emergency stop (repository-scoped) is a separate confirmed control",
       "Shell fallback: echo terminate-now > .pi/matt-auto/run-control",
     ],
   };
@@ -648,6 +680,8 @@ function stopSection(
     lines.push("Last stop: pipeline pause");
   } else if (panel.lastStopReason === "run-termination") {
     lines.push("Last stop: run termination");
+  } else if (panel.lastStopReason === "emergency-stop") {
+    lines.push("Last stop: emergency stop (repository-scoped)");
   }
   if (panel.terminationMode === "stop-only") {
     lines.push("Termination mode: stop-only (integrated history preserved)");

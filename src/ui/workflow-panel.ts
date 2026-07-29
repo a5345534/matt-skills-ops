@@ -1,3 +1,4 @@
+import { formatParallelDeliveryCompactLines } from "../parallel-delivery-state.js";
 import type { WorkflowPanelState } from "../types.js";
 import {
   deriveContextLabel,
@@ -104,6 +105,10 @@ export function buildCompactWorkflowPanel(
     );
   }
 
+  if (panel.parallelDelivery) {
+    lines.push(...formatParallelDeliveryCompactLines(panel.parallelDelivery));
+  }
+
   // Compact issue table (same columns as full brief, narrower title via shared formatter).
   if (panel.ticketProgress) {
     const progress = panel.ticketProgress;
@@ -159,6 +164,7 @@ export function buildCompactWorkflowPanel(
     Boolean(panel.integration) ||
     Boolean(panel.ci && panel.ci.length > 0) ||
     Boolean(panel.workflowPr) ||
+    Boolean(panel.parallelDelivery) ||
     Boolean(panel.ticketProgress && panel.ticketProgress.total > 0);
 
   return { lines, statusLine, visible };

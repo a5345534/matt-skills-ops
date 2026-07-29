@@ -23,6 +23,7 @@ import type {
   WorkflowCoordinator,
   WorkflowPanelState,
 } from "../types.js";
+import { formatParallelDeliveryBriefLines } from "../parallel-delivery-state.js";
 import {
   deriveContextLabel,
   formatIntegrationReasonForBrief,
@@ -268,6 +269,14 @@ function buildWorkflowRow(
     const label = deriveContextLabel(context.panel);
     if (label && !lines.includes(label)) {
       lines.push(`Context: ${label}`);
+    }
+    if (context.panel.parallelDelivery) {
+      // Sibling summaries stay facts-only; never attach action ownership here.
+      for (const line of formatParallelDeliveryBriefLines(
+        context.panel.parallelDelivery,
+      )) {
+        if (!lines.includes(line)) lines.push(line);
+      }
     }
   } else {
     lines.push(
