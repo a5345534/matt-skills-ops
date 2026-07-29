@@ -26,6 +26,13 @@ export const DEFAULT_COORDINATION_LEASE_TTL_MS = 60_000;
 export const DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS = 15_000;
 
 /**
+ * Timeout for coordination-port Git remote I/O (ls-remote / fetch / push).
+ * Prevents Create-tickets publish (and other lease ops) from hanging forever
+ * when git HTTP/credential helpers stall.
+ */
+export const DEFAULT_COORDINATION_GIT_TIMEOUT_MS = 60_000;
+
+/**
  * Short lease used only while a coordinator snapshots demand and conditionally
  * assigns repository-wide Implementation worker slots. It is intentionally
  * shorter than a worker slot lease: scheduler ownership never spans a worker.

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import type { MattAutoLogger } from "./adapters/logger.js";
 import {
   checkCiActionId,
   CI_RECOVERY_OPTIONS,
@@ -575,6 +576,23 @@ type PendingCiRecovery = {
  * actions, later stages) live here. Adapters are injected as ports and are not
  * part of this interface.
  */
+let coordinatorLogger: MattAutoLogger | undefined;
+
+/** Attach the Workflow-root Matt Auto logger for coordinator diagnostics. */
+export function setCoordinatorLogger(
+  logger: MattAutoLogger | undefined,
+): void {
+  coordinatorLogger = logger;
+}
+
+function clog(
+  level: "debug" | "info" | "warn" | "error",
+  message: string,
+  data?: unknown,
+): void {
+  coordinatorLogger?.[level](message, data);
+}
+
 export function createWorkflowCoordinator(
   ports: WorkflowCoordinatorPorts,
 ): WorkflowCoordinator {
@@ -1893,11 +1911,13 @@ export function createWorkflowCoordinator(
         attempt,
       );
 
-      // Prefer retrying a failed / conflicted Integration over re-Implementing.
+      // Prefer retrying Integration over re-Implementing when Close already
+      // ran for a completed attempt. Covers failed/conflicted units and also
+      // mid-unit interruption (pause after merge, before completed) where no
+      // integration-unit-failed event was written.
       if (
         history.disposition === "close" &&
         history.implementCompleted &&
-        history.integrationFailedReason &&
         !history.integrationComplete
       ) {
         pendingIntegration = {
@@ -1906,7 +1926,9 @@ export function createWorkflowCoordinator(
           attempt,
           branchName,
           worktreePath,
-          lastFailure: history.integrationFailedReason,
+          lastFailure:
+            history.integrationFailedReason ??
+            "Close disposition is pending Integration for this attempt.",
           ...(history.integrationConflict
             ? { conflict: history.integrationConflict }
             : {}),
@@ -4574,17 +4596,24 @@ export function createWorkflowCoordinator(
       };
     }
 
+    // Capture after guards so nested refreshPublishAuthority keeps a definite ActiveWorkflow.
+    const publishWorkflow = active;
+
     const initialAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
-      active,
+      publishWorkflow,
     );
     if (!initialAuthority.ok) {
       pending = undefined;
+      clog("warn", "create-tickets:publish-lease-failed", {
+        workflowId: publishWorkflow.workflowId,
+        reason: initialAuthority.reason,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
         reason: initialAuthority.reason,
-        workflowId: active.workflowId,
+        workflowId: publishWorkflow.workflowId,
       };
     }
 
@@ -4594,9 +4623,52 @@ export function createWorkflowCoordinator(
       current.draft.tickets.map((t) => [t.localId, t.title]),
     );
     const createdNumbers: number[] = [];
+    let lastAuthorityAtMs = Date.now();
+
+    /**
+     * Hold one coordinator lease for the publish batch. Re-ensure only on the
+     * heartbeat interval (or when the in-memory hold was lost) — not before
+     * every createIssue / sub-issue / blockedBy call.
+     */
+    async function refreshPublishAuthority(force = false): Promise<void> {
+      const due =
+        force ||
+        Date.now() - lastAuthorityAtMs >=
+          DEFAULT_COORDINATION_LEASE_HEARTBEAT_INTERVAL_MS;
+      if (!due) {
+        await heartbeatHeldWorkflowCoordinatorLease(bound);
+        // Heartbeat may clear a lost remote lease without throwing.
+        if (
+          publishWorkflow.coordination &&
+          !heldWorkflowCoordinatorLease
+        ) {
+          const recovered = await ensureActiveWorkflowCoordinatorLease(
+            bound,
+            publishWorkflow,
+          );
+          if (!recovered.ok) throw new Error(recovered.reason);
+          lastAuthorityAtMs = Date.now();
+        }
+        return;
+      }
+      const authority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        publishWorkflow,
+      );
+      if (!authority.ok) throw new Error(authority.reason);
+      lastAuthorityAtMs = Date.now();
+    }
+
+    clog("info", "create-tickets:publish-start", {
+      workflowId: publishWorkflow.workflowId,
+      ticketCount: ordered.length,
+    });
 
     try {
-      for (const ticket of ordered) {
+      for (let index = 0; index < ordered.length; index += 1) {
+        const ticket = ordered[index]!;
+        await refreshPublishAuthority(index === 0);
+
         const blockers = ticket.blockedBy.map((localId) => {
           const number = localToNumber.get(localId);
           if (number === undefined) {
@@ -4617,13 +4689,13 @@ export function createWorkflowCoordinator(
           blockers,
         );
 
-        const authority = await ensureActiveWorkflowCoordinatorLease(
-          bound,
-          active,
-        );
-        if (!authority.ok) {
-          throw new Error(authority.reason);
-        }
+        clog("info", "create-tickets:publish-ticket", {
+          workflowId: active.workflowId,
+          index: index + 1,
+          total: ordered.length,
+          localId: ticket.localId,
+          title: ticket.title,
+        });
 
         const created = await bound.tracker.createIssue({
           title: ticket.title,
@@ -4633,21 +4705,17 @@ export function createWorkflowCoordinator(
         localToNumber.set(ticket.localId, created.number);
         createdNumbers.push(created.number);
 
-        const linkAuthority = await ensureActiveWorkflowCoordinatorLease(
-          bound,
-          active,
-        );
-        if (!linkAuthority.ok) throw new Error(linkAuthority.reason);
         await bound.tracker.addSubIssue(current.workflowId, created.number);
 
         for (const blocker of blockers) {
-          const blockerAuthority = await ensureActiveWorkflowCoordinatorLease(
-            bound,
-            active,
-          );
-          if (!blockerAuthority.ok) throw new Error(blockerAuthority.reason);
           await bound.tracker.addBlockedBy(created.number, blocker.number);
         }
+
+        clog("info", "create-tickets:publish-ticket-linked", {
+          workflowId: active.workflowId,
+          issueNumber: created.number,
+          blockers: blockers.map((b) => b.number),
+        });
       }
     } catch (error) {
       pending = undefined;
@@ -4656,6 +4724,11 @@ export function createWorkflowCoordinator(
         createdNumbers.length > 0
           ? ` Created ticket issues: ${createdNumbers.map((n) => `#${n}`).join(", ")}.`
           : "";
+      clog("warn", "create-tickets:publish-failed", {
+        workflowId: active.workflowId,
+        createdNumbers,
+        reason: message,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
@@ -4667,6 +4740,24 @@ export function createWorkflowCoordinator(
       stage: "tickets-published",
       tickets: createdNumbers,
     });
+
+    try {
+      await refreshPublishAuthority(true);
+    } catch (error) {
+      pending = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-lease-failed", {
+        workflowId: active.workflowId,
+        phase: "manifest",
+        reason: message,
+      });
+      return {
+        status: "failed",
+        stage: "create-tickets",
+        reason: message,
+        workflowId: active.workflowId,
+      };
+    }
 
     const finalAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
@@ -4682,6 +4773,11 @@ export function createWorkflowCoordinator(
       };
     }
 
+    clog("info", "create-tickets:publish-manifest", {
+      workflowId: active.workflowId,
+      tickets: createdNumbers,
+    });
+
     try {
       await bound.tracker.writeWorkflowManifest(
         current.workflowId,
@@ -4691,6 +4787,11 @@ export function createWorkflowCoordinator(
     } catch (error) {
       pending = undefined;
       const message = error instanceof Error ? error.message : String(error);
+      clog("warn", "create-tickets:publish-manifest-failed", {
+        workflowId: active.workflowId,
+        createdNumbers,
+        reason: message,
+      });
       return {
         status: "failed",
         stage: "create-tickets",
@@ -4703,6 +4804,11 @@ export function createWorkflowCoordinator(
     // Re-read ticket state from GitHub for the frontier snapshot.
     const listed = await bound.tracker.listTickets(createdNumbers);
     const progress = computeTicketProgress(current.workflowId, listed);
+
+    clog("info", "create-tickets:publish-ok", {
+      workflowId: current.workflowId,
+      tickets: createdNumbers,
+    });
 
     return {
       status: "completed",

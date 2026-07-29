@@ -35,7 +35,10 @@ import {
   type MattAutoLogger,
   type SkillsHost,
 } from "../src/adapters/index.js";
-import { createWorkflowCoordinator } from "../src/coordinator.js";
+import {
+  createWorkflowCoordinator,
+  setCoordinatorLogger,
+} from "../src/coordinator.js";
 import {
   appendImplementationRoutingPolicy,
   isMattAutoWorkerProcess,
@@ -460,6 +463,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
     pausedRunDismissed = false;
     logger = createMattAutoLogger(cwd);
     setMenuLogger(logger);
+    setCoordinatorLogger(logger);
     logger.info("coordinator:bind", { cwd });
 
     coordinator = createWorkflowCoordinator({

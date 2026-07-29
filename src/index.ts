@@ -1,4 +1,7 @@
-export { createWorkflowCoordinator } from "./coordinator.js";
+export {
+  createWorkflowCoordinator,
+  setCoordinatorLogger,
+} from "./coordinator.js";
 export {
   activeWorkflowFromManifest,
   activeWorkflowsFromIssues,
