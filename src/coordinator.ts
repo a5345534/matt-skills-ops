@@ -102,6 +102,7 @@ import { buildParallelDeliveryPanelState } from "./parallel-delivery-state.js";
 import {
   evaluateMergeFreshness,
   evaluateProtectedBranchAutomation,
+  policyRequiresStatusChecks,
   type ProtectedBranchAutomationPolicy,
 } from "./workflow-pr-guard.js";
 import type {
@@ -3924,10 +3925,28 @@ export function createWorkflowCoordinator(
           } else if (active.stage === "pr-opened") {
             if (active.coordination) {
               const candidate = active.coordination.queueCandidate;
+              const missingValidatedTarget =
+                !active.coordination.prFreshness?.validatedTargetSha;
+              // Refresh must be available as soon as a Workflow PR is open when
+              // Target freshness is missing — do not hide it behind merge-ready
+              // (which never arrives if PR checks never start).
               const refreshable =
+                missingValidatedTarget ||
                 candidate?.state === "merge-ready" ||
                 candidate?.state === "refreshing" ||
+                candidate?.state === "awaiting-pr-checks" ||
                 pendingTargetRefresh !== undefined;
+              // Offer Merge only when a validated Target SHA is on record so
+              // Merge is never the sole Next action that always fail-closes.
+              const mergeable = !missingValidatedTarget;
+              // unshift order: last unshift is first in the list.
+              if (mergeable) {
+                actions.unshift({
+                  id: MERGE_WORKFLOW_PR_ACTION.id,
+                  label: MERGE_WORKFLOW_PR_ACTION.label,
+                  description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+                });
+              }
               if (refreshable && !targetRefreshInProgress) {
                 actions.unshift({
                   id: REFRESH_FROM_TARGET_ACTION.id,
@@ -3935,12 +3954,13 @@ export function createWorkflowCoordinator(
                   description: `${REFRESH_FROM_TARGET_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
                 });
               }
+            } else {
+              actions.unshift({
+                id: MERGE_WORKFLOW_PR_ACTION.id,
+                label: MERGE_WORKFLOW_PR_ACTION.label,
+                description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+              });
             }
-            actions.unshift({
-              id: MERGE_WORKFLOW_PR_ACTION.id,
-              label: MERGE_WORKFLOW_PR_ACTION.label,
-              description: `${MERGE_WORKFLOW_PR_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
-            });
           }
         }
       }
@@ -6729,10 +6749,23 @@ export function createWorkflowCoordinator(
         });
       }
 
+      let admitMergeReady = false;
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: pending.targetBranch,
+          });
+          admitMergeReady = !policyRequiresStatusChecks(policy);
+        } catch {
+          admitMergeReady = false;
+        }
+      }
+
       const released = await releaseTargetRefreshForPrChecks({
         queue: queueResult.queue,
         workflowCoordinatorLease: releaseAuthority.lease,
         prFreshness,
+        ...(admitMergeReady ? { admitMergeReady: true } : {}),
       });
       if (!released.ok) {
         return failTargetRefresh(bound, {
@@ -7758,6 +7791,28 @@ export function createWorkflowCoordinator(
       headSha &&
       manifest.coordination
     ) {
+      // With no required status checks, skip the awaiting-pr-checks stall and
+      // admit refresh/merge eligibility immediately (still require Target refresh
+      // to record validatedTargetSha before Merge).
+      let queueCandidate: { state: "awaiting-pr-checks" } | {
+        state: "merge-ready";
+        mergeReadyAt: string;
+      } = { state: "awaiting-pr-checks" };
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: base,
+          });
+          if (!policyRequiresStatusChecks(policy)) {
+            queueCandidate = {
+              state: "merge-ready",
+              mergeReadyAt: new Date().toISOString(),
+            };
+          }
+        } catch {
+          // Keep awaiting-pr-checks when policy cannot be observed.
+        }
+      }
       manifest = {
         ...manifest,
         coordination: {
@@ -7766,7 +7821,7 @@ export function createWorkflowCoordinator(
             headSha,
             mergeMethod,
           },
-          queueCandidate: { state: "awaiting-pr-checks" },
+          queueCandidate,
         },
       };
     }
@@ -8054,9 +8109,29 @@ export function createWorkflowCoordinator(
         };
       }
 
-      const ci = await bound.ci.checkStatus({
-        branchName: active.workflowPr.headBranch,
-      });
+      // Optional/non-required CI must not stall merge when Target policy has no
+      // required status checks (billing-blocked runners, informational Actions).
+      let requireStatusChecks = true;
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        try {
+          const policy = await bound.tracker.inspectProtectedBranchAutomation({
+            targetBranch: active.targetBranch,
+          });
+          requireStatusChecks = policyRequiresStatusChecks(policy);
+        } catch {
+          // Fail closed: if policy cannot be observed, keep required-check gate.
+          requireStatusChecks = true;
+        }
+      }
+
+      const ci = requireStatusChecks
+        ? await bound.ci.checkStatus({
+            branchName: active.workflowPr.headBranch,
+          })
+        : {
+            status: "success" as const,
+            summary: "No required status checks on Target branch.",
+          };
 
       const freshness = evaluateMergeFreshness({
         heldLease: heldTargetLease,
@@ -8070,6 +8145,7 @@ export function createWorkflowCoordinator(
           headSha: livePr.headSha,
           status: ci.status,
         },
+        requireStatusChecks,
       });
 
       if (!freshness.ok) {

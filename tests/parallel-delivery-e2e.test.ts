@@ -155,6 +155,8 @@ type SharedTrackerState = {
   /** Mutable tip of the Target branch (simulates external advancement). */
   targetSha: string;
   ciStatus: "pending" | "success" | "failure";
+  /** Target-branch required status checks (empty = no required CI gate). */
+  requiredStatusChecks: { strict: boolean; contexts: string[] };
 };
 
 function createSharedTracker(
@@ -173,6 +175,7 @@ function createSharedTracker(
     nextPrNumber: 700,
     targetSha: sha("b"),
     ciStatus: "success",
+    requiredStatusChecks: { strict: true, contexts: ["ci"] },
   };
 
   const port: TrackerPort = {
@@ -257,13 +260,15 @@ function createSharedTracker(
       repository: { ...repository },
       targetRef: target.targetRef,
       coordinationRefsWritable: true,
-      requiredStatusChecks: { strict: true, contexts: ["ci"] },
+      requiredStatusChecks: { ...state.requiredStatusChecks },
       requiredApprovingReviewCount: 0,
       allowedMergeMethods: ["squash", "merge"],
       preferredMergeMethod: "squash",
       mergeQueueRequired: false,
       actorCanMergeWithoutApproval: true,
-      staleBaseProtectionGuaranteed: true,
+      staleBaseProtectionGuaranteed:
+        state.requiredStatusChecks.strict === true &&
+        state.requiredStatusChecks.contexts.length > 0,
     }),
     getPullRequestFreshness: async (input) => {
       const recorded = state.prHeadByNumber.get(input.number);
@@ -1851,5 +1856,129 @@ describe("target-refresh, CI pending, retries, external advancement, controls", 
     });
     expect(recovered.ok).toBe(true);
     expect(recovered.lease?.holderId).toBe("home-42");
+  });
+});
+
+describe("issue #57: no required checks must not stall on awaiting-pr-checks", () => {
+  it("offers Refresh after open PR and completes Refresh → Merge without CI", async () => {
+    const clock = testClock();
+    const store = createInMemoryCoordinationStore();
+    const coordination = createFakeCoordinationPort({ store, now: clock.now });
+    await coordination.ensureWorkerCapacityPolicy({
+      repository,
+      seedWorkerCapacity: 2,
+    });
+
+    const wf = coordinatedWorkflow(57, [70]);
+    const tracker = createSharedTracker(
+      [wf],
+      [{ number: 70, title: "No-CI ticket", state: "OPEN", blockedBy: [] }],
+    );
+    // No required status checks on Target (private free / local-only delivery).
+    tracker.state.requiredStatusChecks = { strict: false, contexts: [] };
+    // Ticket-level CI green for integrate; PR CI will stay pending after open.
+    tracker.state.ciStatus = "success";
+
+    const home = createHome({
+      home: "home-57",
+      workflowId: 57,
+      tracker: tracker.port,
+      shared: tracker.state,
+      coordination,
+    });
+
+    await integrateTicket(home, 57, 70);
+    // Simulate Actions never starting after Workflow PR open.
+    tracker.state.ciStatus = "pending";
+
+    const open = await home.coordinator.runNextAction(OPEN_WORKFLOW_PR_ACTION.id);
+    expect(open).toMatchObject({ status: "completed", stage: "workflow-pr" });
+
+    const afterOpen = tracker.state.workflows.get(57);
+    expect(afterOpen?.coordination?.prFreshness?.validatedTargetSha).toBeUndefined();
+    expect(afterOpen?.coordination?.queueCandidate?.state).toBe("merge-ready");
+
+    const idsAfterOpen = (await home.coordinator.nextActions()).map((a) => a.id);
+    expect(idsAfterOpen).toContain(REFRESH_FROM_TARGET_ACTION.id);
+    expect(idsAfterOpen).not.toContain(MERGE_WORKFLOW_PR_ACTION.id);
+
+    const refreshed = await home.coordinator.runNextAction(
+      REFRESH_FROM_TARGET_ACTION.id,
+    );
+    expect(refreshed).toMatchObject({ status: "completed" });
+    expect(
+      tracker.state.workflows.get(57)?.coordination?.prFreshness?.validatedTargetSha,
+    ).toBe(tracker.state.targetSha);
+
+    const idsAfterRefresh = (await home.coordinator.nextActions()).map((a) => a.id);
+    expect(idsAfterRefresh).toContain(MERGE_WORKFLOW_PR_ACTION.id);
+
+    const merged = await home.coordinator.runNextAction(MERGE_WORKFLOW_PR_ACTION.id);
+    expect(merged).toMatchObject({ status: "completed", stage: "workflow-pr" });
+    expect(tracker.state.mergePrCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("still offers Refresh from awaiting-pr-checks when validatedTargetSha is missing", async () => {
+    const clock = testClock();
+    const store = createInMemoryCoordinationStore();
+    const coordination = createFakeCoordinationPort({ store, now: clock.now });
+    await coordination.ensureWorkerCapacityPolicy({
+      repository,
+      seedWorkerCapacity: 2,
+    });
+
+    const wf = coordinatedWorkflow(58, [71], {
+      stage: "pr-opened",
+      integrationBranch: integrationBranchName(58),
+      integratedTickets: [integratedTicket(58, 71, 1)],
+      workflowPr: {
+        number: 858,
+        headBranch: integrationBranchName(58),
+        baseBranch: "main",
+      },
+      coordination: {
+        target,
+        prFreshness: {
+          headSha: sha("a"),
+          mergeMethod: "squash",
+        },
+        queueCandidate: { state: "awaiting-pr-checks" },
+      },
+    });
+    const tracker = createSharedTracker(
+      [wf],
+      [{ number: 71, title: "Stuck awaiting", state: "CLOSED", blockedBy: [] }],
+    );
+    // Required checks configured — still must surface Refresh when freshness is missing.
+    tracker.state.requiredStatusChecks = { strict: true, contexts: ["ci"] };
+    tracker.state.ciStatus = "pending";
+    tracker.state.prHeadByNumber.set(858, {
+      headSha: sha("a"),
+      baseSha: tracker.state.targetSha,
+    });
+
+    const home = createHome({
+      home: "home-58",
+      workflowId: 58,
+      tracker: tracker.port,
+      shared: tracker.state,
+      coordination,
+    });
+    await home.workspace.ensureIntegrationWorkspace({
+      workflowId: 58,
+      baseRef: "main",
+    });
+
+    const ids = (await home.coordinator.nextActions()).map((a) => a.id);
+    expect(ids).toContain(REFRESH_FROM_TARGET_ACTION.id);
+    expect(ids).not.toContain(MERGE_WORKFLOW_PR_ACTION.id);
+
+    const refreshed = await home.coordinator.runNextAction(
+      REFRESH_FROM_TARGET_ACTION.id,
+    );
+    expect(refreshed).toMatchObject({ status: "completed" });
+    expect(
+      tracker.state.workflows.get(58)?.coordination?.prFreshness?.validatedTargetSha,
+    ).toBe(tracker.state.targetSha);
   });
 });

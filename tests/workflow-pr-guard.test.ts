@@ -5,6 +5,7 @@ import {
   evaluateProtectedBranchAutomation,
   MERGE_FRESHNESS_FAILURE_CODES,
   mergeMethodCliFlag,
+  policyRequiresStatusChecks,
   selectConfiguredMergeMethod,
   type ProtectedBranchAutomationPolicy,
 } from "../src/workflow-pr-guard.js";
@@ -288,6 +289,43 @@ describe("evaluateMergeFreshness", () => {
       code: MERGE_FRESHNESS_FAILURE_CODES.requiredChecksNotGreen,
       recovery: "retryable",
     });
+  });
+
+  it("allows merge without green CI when requireStatusChecks is false", () => {
+    const pending = evaluateMergeFreshness({
+      ...baseInput,
+      requiredChecks: { headSha: HEAD, status: "pending" },
+      requireStatusChecks: false,
+    });
+    expect(pending).toEqual({ ok: true });
+
+    const failed = evaluateMergeFreshness({
+      ...baseInput,
+      requiredChecks: { headSha: HEAD, status: "failure" },
+      requireStatusChecks: false,
+    });
+    expect(failed).toEqual({ ok: true });
+  });
+});
+
+describe("policyRequiresStatusChecks", () => {
+  it("is true only when contexts or strict required checks are configured", () => {
+    expect(
+      policyRequiresStatusChecks({
+        requiredStatusChecks: { strict: true, contexts: ["ci"] },
+      }),
+    ).toBe(true);
+    expect(
+      policyRequiresStatusChecks({
+        requiredStatusChecks: { strict: false, contexts: ["lint"] },
+      }),
+    ).toBe(true);
+    expect(
+      policyRequiresStatusChecks({
+        requiredStatusChecks: { strict: false, contexts: [] },
+      }),
+    ).toBe(false);
+    expect(policyRequiresStatusChecks({})).toBe(false);
   });
 });
 
