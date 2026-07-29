@@ -995,8 +995,11 @@ export async function waitForPipelineWorkers(
       if (paused) {
         if (liveWaitAvailable) {
           touchRunBriefStatus(ui, panel);
-        } else {
+        } else if (!skipLiveSurface) {
           notifyRunBrief(ui, panel, "warning");
+        } else {
+          // Parent persistent brief owns the frame; status-only here.
+          touchRunBriefStatus(ui, panel);
         }
         if (!controls) {
           log("warn", "pipeline:paused-without-controls", {
@@ -1025,6 +1028,13 @@ export async function waitForPipelineWorkers(
             ui.notify(formatTerminateNotify(result), "warning");
             return { status: "terminated", result };
           }
+        }
+        // Parent-owned persistent live brief: never open a second select/custom
+        // while paused — that races Resume confirm and blocks Implement.
+        // Quiet-poll until the persistent surface (or run-control) clears pause.
+        if (skipLiveSurface) {
+          await sleepFn(pollIntervalMs);
+          continue;
         }
         if (liveWaitAvailable) {
           const live = await presentLiveWaitControls(ui, controls, panel, {

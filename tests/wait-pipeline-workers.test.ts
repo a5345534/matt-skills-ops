@@ -725,6 +725,45 @@ describe("waitForPipelineWorkers", () => {
   });
 
 
+
+  it("skipLiveSurface while paused does not open select (parent owns Resume)", async () => {
+    let selectCalls = 0;
+    let ticks = 0;
+    let paused = true;
+    const coordinator = controlCoordinator(
+      async () => {
+        ticks += 1;
+        if (ticks > 3) paused = false;
+        return basePanel({
+          pipelinePaused: paused,
+          workers: [],
+        });
+      },
+      {
+        isPipelinePaused: () => paused,
+        resumePipeline: async () => {
+          paused = false;
+          return { pipelinePaused: false as const };
+        },
+      },
+    );
+    const ui = mockUi();
+    ui.select = async () => {
+      selectCalls += 1;
+      return undefined;
+    };
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 20,
+      sleep: async () => undefined,
+      skipLiveSurface: true,
+    });
+
+    expect(result.status).toBe("settled");
+    expect(selectCalls).toBe(0);
+  });
+
   it("skipLiveSurface does not open custom or select menus (parent owns brief)", async () => {
     let customCalls = 0;
     let selectCalls = 0;
