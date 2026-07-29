@@ -94,6 +94,11 @@ import type {
   WorkflowCoordinatorPorts,
 } from "./ports.js";
 import { buildParallelDeliveryPanelState } from "./parallel-delivery-state.js";
+import {
+  evaluateMergeFreshness,
+  evaluateProtectedBranchAutomation,
+  type ProtectedBranchAutomationPolicy,
+} from "./workflow-pr-guard.js";
 import type {
   ActiveWorkflow,
   AvailableModel,
@@ -118,6 +123,7 @@ import type {
   RunTerminationMode,
   RunTerminationResult,
   SpecDraft,
+  WorkflowMergeMethod,
   StageConfirmationDecision,
   StageResult,
   TargetBranchLease,
@@ -3248,6 +3254,120 @@ export function createWorkflowCoordinator(
     | undefined;
   const PREFLIGHT_TTL_MS = 5_000;
 
+  async function collectProtectedBranchAutomationChecks(
+    bound: RootScopedPorts,
+    targetBranch: string,
+  ): Promise<PreflightCheck[]> {
+    let policy: ProtectedBranchAutomationPolicy = {};
+    try {
+      if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+        policy = await bound.tracker.inspectProtectedBranchAutomation({
+          targetBranch,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return [
+        {
+          id: "canonical-repository",
+          ok: false,
+          guidance: `Could not inspect protected-branch automation policy: ${message}`,
+        },
+      ];
+    }
+
+    if (!policy.repository && typeof bound.tracker.getCanonicalRepositoryIdentity === "function") {
+      try {
+        const repository = await bound.tracker.getCanonicalRepositoryIdentity();
+        if (repository) {
+          const targetRef =
+            policy.targetRef ?? targetRefFromBranch(targetBranch);
+          policy = {
+            ...policy,
+            repository,
+            ...(targetRef ? { targetRef } : {}),
+          };
+        }
+      } catch {
+        // Evaluator fail-closes when repository identity is absent.
+      }
+    }
+
+    if (policy.coordinationRefsWritable === undefined) {
+      if (bound.coordination?.canWriteCoordinationRefs && policy.repository) {
+        try {
+          const probe = await bound.coordination.canWriteCoordinationRefs(
+            policy.repository,
+          );
+          policy = {
+            ...policy,
+            coordinationRefsWritable: probe.ok,
+          };
+        } catch {
+          policy = { ...policy, coordinationRefsWritable: false };
+        }
+      } else if (!bound.coordination) {
+        // Legacy single-workflow homes without a CoordinationPort skip the
+        // coordination-ref check by treating it as not required here; the pure
+        // evaluator still requires an explicit true, so mark writable only when
+        // no coordination port is configured (v1 path).
+        policy = { ...policy, coordinationRefsWritable: true };
+      } else {
+        policy = { ...policy, coordinationRefsWritable: false };
+      }
+    }
+
+    return evaluateProtectedBranchAutomation(policy).checks;
+  }
+
+  async function resolveRepositoryMergeMethod(
+    bound: RootScopedPorts,
+    targetBranch: string,
+  ): Promise<
+    | { ok: true; mergeMethod: WorkflowMergeMethod }
+    | { ok: false; reason: string }
+  > {
+    if (typeof bound.tracker.inspectProtectedBranchAutomation !== "function") {
+      return {
+        ok: false,
+        reason:
+          "Repository merge-method inspection is unavailable; Matt Auto will not hard-code a merge strategy.",
+      };
+    }
+    try {
+      const policy = await bound.tracker.inspectProtectedBranchAutomation({
+        targetBranch,
+      });
+      const evaluated = evaluateProtectedBranchAutomation({
+        ...policy,
+        // Merge-method selection only — do not require full automation green.
+        coordinationRefsWritable: true,
+        actorCanMergeWithoutApproval: true,
+        staleBaseProtectionGuaranteed: true,
+        requiredApprovingReviewCount: 0,
+        mergeQueueRequired: false,
+        requiredStatusChecks: policy.requiredStatusChecks ?? {
+          strict: true,
+          contexts: ["ci"],
+        },
+      });
+      if (!evaluated.mergeMethod) {
+        return {
+          ok: false,
+          reason:
+            "No supported repository merge method is enabled (merge, squash, or rebase).",
+        };
+      }
+      return { ok: true, mergeMethod: evaluated.mergeMethod };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: `Could not resolve repository-configured merge method: ${message}`,
+      };
+    }
+  }
+
   async function preflight(): Promise<PreflightResult> {
     const bound = await requireScoped();
     if (
@@ -3318,6 +3438,15 @@ export function createWorkflowCoordinator(
             : "No Worker profile is configured. Set a global or Workflow-root Worker profile (model + thinking level) before starting Implementation workers.",
       },
     ];
+
+    // Protected-branch automation preflight (fail-closed when the tracker can observe policy).
+    if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
+      const automationChecks = await collectProtectedBranchAutomationChecks(
+        bound,
+        targetBranch,
+      );
+      checks.push(...automationChecks);
+    }
 
     const result: PreflightResult = {
       ok: checks.every((check) => check.ok),
@@ -7328,6 +7457,58 @@ export function createWorkflowCoordinator(
       "Opened by Matt Auto after all tickets integrated and CI-complete.",
     ].join("\n");
 
+    // Coordination-aware delivery records PR freshness immediately so sibling
+    // workflows never gate this PR's creation, and queue facts can attach.
+    let mergeMethod: WorkflowMergeMethod | undefined;
+    let headSha: string | undefined;
+    if (active.coordination) {
+      const method = await resolveRepositoryMergeMethod(bound, base);
+      if (!method.ok) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: method.reason,
+          workflowId: active.workflowId,
+          integrationBranch: head,
+          targetBranch: base,
+        };
+      }
+      mergeMethod = method.mergeMethod;
+      try {
+        const integrationWorkspace =
+          await bound.workspace.ensureIntegrationWorkspace({
+            workflowId: active.workflowId,
+            baseRef: head,
+          });
+        const ahead = await bound.workspace.hasCommitsAhead({
+          worktreePath: integrationWorkspace.worktreePath,
+          baseRef: base,
+        });
+        headSha = ahead.headSha;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: `Could not resolve Integration head SHA before opening Workflow PR: ${message}`,
+          workflowId: active.workflowId,
+          integrationBranch: head,
+          targetBranch: base,
+        };
+      }
+      if (!headSha) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason:
+            "Could not resolve Integration head SHA before opening Workflow PR.",
+          workflowId: active.workflowId,
+          integrationBranch: head,
+          targetBranch: base,
+        };
+      }
+    }
+
     let pr: { number: number; url?: string };
     try {
       pr = await bound.tracker.createPullRequest({
@@ -7354,10 +7535,28 @@ export function createWorkflowCoordinator(
       baseBranch: base,
       ...(pr.url ? { url: pr.url } : {}),
     };
-    const manifest = manifestFromActive(active, {
+    let manifest = manifestFromActive(active, {
       stage: "pr-opened",
       workflowPr,
     });
+    if (
+      manifest.version === 2 &&
+      mergeMethod &&
+      headSha &&
+      manifest.coordination
+    ) {
+      manifest = {
+        ...manifest,
+        coordination: {
+          ...manifest.coordination,
+          prFreshness: {
+            headSha,
+            mergeMethod,
+          },
+          queueCandidate: { state: "awaiting-pr-checks" },
+        },
+      };
+    }
 
     const manifestAuthority = await ensureActiveWorkflowCoordinatorLease(
       bound,
@@ -7449,7 +7648,10 @@ export function createWorkflowCoordinator(
     // Dual-root: publish + re-check submodule pointers before merge (#30).
     const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
     try {
-      const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
+      const targetBranch = await resolveTargetBranch(
+        bound.preferences,
+        bound.environment,
+      );
       const integrationWorkspace =
         await bound.workspace.ensureIntegrationWorkspace({
           workflowId: active.workflowId,
@@ -7502,13 +7704,218 @@ export function createWorkflowCoordinator(
           : {}),
       };
     }
+    if (active.coordination && !mergeAuthority.lease) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason:
+          "Workflow coordinator lease is unavailable for Workflow PR merge.",
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
+      };
+    }
+
+    // Resolve repository-configured merge method — never hard-code a strategy.
+    const mergeMethodResult = await resolveRepositoryMergeMethod(
+      bound,
+      active.targetBranch,
+    );
+    let mergeMethod: WorkflowMergeMethod | undefined =
+      active.coordination?.prFreshness?.mergeMethod;
+    if (!mergeMethod) {
+      if (!mergeMethodResult.ok) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: mergeMethodResult.reason,
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+          ...(active.workflowPr.url
+            ? { workflowPrUrl: active.workflowPr.url }
+            : {}),
+        };
+      }
+      mergeMethod = mergeMethodResult.mergeMethod;
+    }
+
+    // Coordination-aware automatic merge: Target-branch lease + freshness preflight.
+    let heldTargetLease: TargetBranchLease | undefined;
+    let expectedHeadSha: string | undefined =
+      active.coordination?.prFreshness?.headSha;
+    let expectedTargetSha: string | undefined =
+      active.coordination?.prFreshness?.validatedTargetSha;
+    let queue: TargetBranchQueueOrchestrator | undefined;
+
+    if (active.coordination) {
+      if (!active.coordination.prFreshness) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason:
+            "Cannot merge a coordination-aware Workflow PR without recorded PR freshness facts.",
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+        };
+      }
+      if (!expectedTargetSha) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason:
+            "Cannot merge until the Workflow PR head has been refreshed against a validated Target SHA. Run Target-branch refresh first.",
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+        };
+      }
+
+      const queueResult = await ensureTargetDeliveryQueue(bound, active);
+      if (!queueResult.ok) {
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: queueResult.reason,
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+        };
+      }
+      queue = queueResult.queue;
+
+      const workflowCoordinatorLease = mergeAuthority.lease!;
+
+      heldTargetLease = queue.getHeldTargetBranchLease();
+      if (!heldTargetLease) {
+        const acquired = await queue.transition({
+          kind: "acquire-phase",
+          workflowCoordinatorLease,
+          phase: "merge",
+        });
+        if (!acquired.ok || !acquired.lease) {
+          return {
+            status: "failed",
+            stage: "workflow-pr",
+            reason: acquired.ok
+              ? "Target-branch lease acquisition did not return a lease."
+              : acquired.reason,
+            workflowId: active.workflowId,
+            workflowPrNumber: active.workflowPr.number,
+          };
+        }
+        heldTargetLease = acquired.lease;
+      }
+
+      // Observe live PR head + Target tip and required checks for that head.
+      if (typeof bound.tracker.getPullRequestFreshness !== "function") {
+        await queue.transition({ kind: "release-held-target-lease" });
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason:
+            "Pull request freshness observation is unavailable; refusing automatic merge.",
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+        };
+      }
+
+      let livePr: { headSha: string; baseSha: string };
+      try {
+        livePr = await bound.tracker.getPullRequestFreshness({
+          number: active.workflowPr.number,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await queue.transition({
+          kind: "record-failure",
+          workflowCoordinatorLease,
+          failureKind: "transient",
+          reason: `pr-freshness-observation-failed:${message}`,
+        });
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: `Could not observe Workflow PR freshness before merge: ${message}`,
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+        };
+      }
+
+      const ci = await bound.ci.checkStatus({
+        branchName: active.workflowPr.headBranch,
+      });
+
+      const freshness = evaluateMergeFreshness({
+        heldLease: heldTargetLease,
+        expectedGeneration: heldTargetLease.generation,
+        expectedHolderId: heldTargetLease.holderId,
+        validatedTargetSha: expectedTargetSha,
+        currentTargetSha: livePr.baseSha,
+        expectedHeadSha: expectedHeadSha!,
+        currentHeadSha: livePr.headSha,
+        requiredChecks: {
+          headSha: livePr.headSha,
+          status: ci.status,
+        },
+      });
+
+      if (!freshness.ok) {
+        // Stale target → requeue for refresh; other failures record retry outcomes.
+        if (freshness.recovery === "requeue-refresh") {
+          await queue.transition({
+            kind: "record-failure",
+            workflowCoordinatorLease,
+            failureKind: freshness.failureKind,
+            reason: freshness.code,
+          });
+        } else if (freshness.recovery === "awaiting-pr-checks") {
+          // Release the lane and return to awaiting checks without a deterministic failure.
+          await queue.transition({
+            kind: "release-for-pr-checks",
+            workflowCoordinatorLease,
+          });
+        } else {
+          await queue.transition({
+            kind: "record-failure",
+            workflowCoordinatorLease,
+            failureKind: freshness.failureKind,
+            reason: freshness.code,
+          });
+        }
+        return {
+          status: "failed",
+          stage: "workflow-pr",
+          reason: freshness.reason,
+          workflowId: active.workflowId,
+          workflowPrNumber: active.workflowPr.number,
+          ...(active.workflowPr.url
+            ? { workflowPrUrl: active.workflowPr.url }
+            : {}),
+        };
+      }
+
+      // Live head may have advanced only if it still matches expected; keep it.
+      expectedHeadSha = livePr.headSha;
+      expectedTargetSha = livePr.baseSha;
+    }
 
     try {
       await bound.tracker.mergePullRequest({
         number: active.workflowPr.number,
+        mergeMethod,
+        ...(expectedHeadSha ? { expectedHeadSha } : {}),
+        ...(expectedTargetSha ? { expectedTargetSha } : {}),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (queue && mergeAuthority.lease) {
+        await queue.transition({
+          kind: "record-failure",
+          workflowCoordinatorLease: mergeAuthority.lease,
+          failureKind: "transient",
+          reason: `merge-failed:${message}`,
+        });
+      }
       return {
         status: "failed",
         stage: "workflow-pr",
@@ -7519,6 +7926,17 @@ export function createWorkflowCoordinator(
           ? { workflowPrUrl: active.workflowPr.url }
           : {}),
       };
+    }
+
+    if (queue && mergeAuthority.lease && active.coordination) {
+      const marked = await queue.transition({
+        kind: "mark-merged",
+        workflowCoordinatorLease: mergeAuthority.lease,
+      });
+      if (!marked.ok) {
+        // PR is already merged on GitHub; surface the queue persistence problem
+        // but still try to write the local merged stage below.
+      }
     }
 
     const manifest = manifestFromActive(active, { stage: "merged" });

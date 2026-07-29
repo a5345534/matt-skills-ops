@@ -25,7 +25,10 @@ import type {
   ActiveWorkflow,
   CanonicalRepositoryIdentity,
   CanonicalTargetIdentity,
+  WorkflowMergeMethod,
 } from "../types.js";
+import type { ProtectedBranchAutomationPolicy } from "../workflow-pr-guard.js";
+import { isGitObjectId } from "../workflow-pr-guard.js";
 import {
   activeWorkflowsFromIssues,
   coordinatedActiveWorkflowsFromIssues,
@@ -755,13 +758,80 @@ ${result.stdout}`;
       }
     },
 
-    async mergePullRequest(input) {
+    async inspectProtectedBranchAutomation(input) {
+      return inspectProtectedBranchAutomation(cwd, input.targetBranch);
+    },
+
+    async getPullRequestFreshness(input) {
       const result = await run(cwd, "gh", [
         "pr",
-        "merge",
+        "view",
         String(input.number),
-        "--merge",
+        "--json",
+        "headRefOid,baseRefOid,mergeable",
       ]);
+      if (result.code !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `gh pr view failed for #${input.number} with exit code ${result.code}`,
+        );
+      }
+      let parsed: {
+        headRefOid?: string;
+        baseRefOid?: string;
+        mergeable?: string | boolean;
+      };
+      try {
+        parsed = JSON.parse(result.stdout) as {
+          headRefOid?: string;
+          baseRefOid?: string;
+          mergeable?: string | boolean;
+        };
+      } catch {
+        throw new Error(
+          `gh pr view returned non-JSON output for #${input.number}`,
+        );
+      }
+      if (!isGitObjectId(parsed.headRefOid) || !isGitObjectId(parsed.baseRefOid)) {
+        throw new Error(
+          `gh pr view did not return exact head/base SHAs for #${input.number}`,
+        );
+      }
+      const mergeable =
+        parsed.mergeable === true ||
+        (typeof parsed.mergeable === "string" &&
+          parsed.mergeable.toUpperCase() === "MERGEABLE");
+      return {
+        headSha: parsed.headRefOid.toLowerCase(),
+        baseSha: parsed.baseRefOid.toLowerCase(),
+        ...(parsed.mergeable !== undefined ? { mergeable } : {}),
+      };
+    },
+
+    async mergePullRequest(input) {
+      if (!input.mergeMethod) {
+        throw new Error(
+          `Cannot merge Workflow PR #${input.number}: repository-configured merge method is required; Matt Auto does not hard-code a merge strategy.`,
+        );
+      }
+      const methodFlag =
+        input.mergeMethod === "squash"
+          ? "--squash"
+          : input.mergeMethod === "rebase"
+            ? "--rebase"
+            : "--merge";
+      const args = ["pr", "merge", String(input.number), methodFlag];
+      if (input.expectedHeadSha) {
+        if (!isGitObjectId(input.expectedHeadSha)) {
+          throw new Error(
+            `Cannot merge Workflow PR #${input.number}: expected head SHA is not a valid Git object ID.`,
+          );
+        }
+        args.push("--match-head-commit", input.expectedHeadSha);
+      }
+      // expectedTargetSha is enforced by the coordinator before this call;
+      // GitHub's merge API does not accept an expected base OID.
+      const result = await run(cwd, "gh", args);
       if (result.code !== 0) {
         throw new Error(
           result.stderr.trim() ||
@@ -770,4 +840,164 @@ ${result.stdout}`;
       }
     },
   };
+}
+
+type GhRepoSettings = {
+  allow_merge_commit?: boolean;
+  allow_squash_merge?: boolean;
+  allow_rebase_merge?: boolean;
+  permissions?: { push?: boolean; admin?: boolean; maintain?: boolean };
+  viewerPermission?: string;
+};
+
+type GhBranchProtection = {
+  required_status_checks?: {
+    strict?: boolean;
+    contexts?: string[];
+    checks?: Array<{ context?: string }>;
+  } | null;
+  required_pull_request_reviews?: {
+    required_approving_review_count?: number;
+  } | null;
+  allow_force_pushes?: { enabled?: boolean } | boolean | null;
+};
+
+async function inspectProtectedBranchAutomation(
+  cwd: string,
+  targetBranch: string,
+): Promise<ProtectedBranchAutomationPolicy> {
+  const repository = await resolveRepoFullName(cwd);
+  const policy: ProtectedBranchAutomationPolicy = {};
+  if (repository) {
+    policy.repository = repository;
+    const targetRef = targetRefFromBranch(targetBranch);
+    if (targetRef) policy.targetRef = targetRef;
+  }
+
+  const repoResult = await run(cwd, "gh", [
+    "api",
+    "repos/{owner}/{repo}",
+    "--jq",
+    "{allow_merge_commit,allow_squash_merge,allow_rebase_merge,permissions,viewerPermission:.viewerPermission}",
+  ]);
+  if (repoResult.code === 0) {
+    try {
+      const repo = JSON.parse(repoResult.stdout) as GhRepoSettings;
+      const allowed: WorkflowMergeMethod[] = [];
+      if (repo.allow_merge_commit) allowed.push("merge");
+      if (repo.allow_squash_merge) allowed.push("squash");
+      if (repo.allow_rebase_merge) allowed.push("rebase");
+      policy.allowedMergeMethods = allowed;
+      // Prefer squash when available (common protected-branch default), else
+      // the single allowed method / deterministic order handled by the evaluator.
+      if (allowed.includes("squash")) {
+        policy.preferredMergeMethod = "squash";
+      } else if (allowed.length === 1 && allowed[0]) {
+        policy.preferredMergeMethod = allowed[0];
+      }
+      const push =
+        repo.permissions?.push === true ||
+        repo.permissions?.admin === true ||
+        repo.permissions?.maintain === true;
+      policy.actorCanMergeWithoutApproval = push;
+    } catch {
+      // Fall through with incomplete observations; evaluator fail-closes.
+    }
+  }
+
+  const protectionResult = await run(cwd, "gh", [
+    "api",
+    `repos/{owner}/{repo}/branches/${encodeURIComponent(targetBranch)}/protection`,
+  ]);
+  if (protectionResult.code === 0) {
+    try {
+      const protection = JSON.parse(protectionResult.stdout) as GhBranchProtection;
+      const contexts = [
+        ...(protection.required_status_checks?.contexts ?? []),
+        ...((protection.required_status_checks?.checks ?? [])
+          .map((check) => check.context)
+          .filter((context): context is string => typeof context === "string") ??
+          []),
+      ];
+      const uniqueContexts = [...new Set(contexts)];
+      if (protection.required_status_checks) {
+        policy.requiredStatusChecks = {
+          strict: protection.required_status_checks.strict === true,
+          contexts: uniqueContexts,
+        };
+        policy.staleBaseProtectionGuaranteed =
+          protection.required_status_checks.strict === true &&
+          uniqueContexts.length > 0;
+      }
+      const approvals =
+        protection.required_pull_request_reviews?.required_approving_review_count;
+      if (typeof approvals === "number") {
+        policy.requiredApprovingReviewCount = approvals;
+        if (approvals > 0) {
+          policy.actorCanMergeWithoutApproval = false;
+        }
+      }
+    } catch {
+      // Incomplete observations fail closed in the evaluator.
+    }
+  } else {
+    // 404 means no classic branch protection. Rulesets may still apply; without
+    // a strict required-check observation we cannot guarantee stale-base safety.
+    const detail = `${protectionResult.stderr}
+${protectionResult.stdout}`;
+    if (!/404|Not Found/i.test(detail)) {
+      // Keep actor merge ability from repo settings; leave protection unset.
+    }
+    // Probe rulesets for merge-queue / required checks when classic protection
+    // is absent.
+    const rulesResult = await run(cwd, "gh", [
+      "api",
+      `repos/{owner}/{repo}/rules/branches/${encodeURIComponent(targetBranch)}`,
+    ]);
+    if (rulesResult.code === 0) {
+      try {
+        const rules = JSON.parse(rulesResult.stdout) as Array<{
+          type?: string;
+          parameters?: {
+            required_status_checks?: Array<{ context?: string }>;
+            strict_required_status_checks_policy?: boolean;
+            required_approving_review_count?: number;
+          };
+        }>;
+        if (Array.isArray(rules)) {
+          if (rules.some((rule) => rule.type === "merge_queue")) {
+            policy.mergeQueueRequired = true;
+          }
+          const checkRule = rules.find(
+            (rule) => rule.type === "required_status_checks",
+          );
+          if (checkRule?.parameters) {
+            const contexts = (checkRule.parameters.required_status_checks ?? [])
+              .map((entry) => entry.context)
+              .filter((context): context is string => typeof context === "string");
+            const strict =
+              checkRule.parameters.strict_required_status_checks_policy === true;
+            policy.requiredStatusChecks = { strict, contexts };
+            policy.staleBaseProtectionGuaranteed =
+              strict && contexts.length > 0;
+          }
+          const reviewRule = rules.find(
+            (rule) => rule.type === "pull_request",
+          );
+          const approvals =
+            reviewRule?.parameters?.required_approving_review_count;
+          if (typeof approvals === "number") {
+            policy.requiredApprovingReviewCount = approvals;
+            if (approvals > 0) {
+              policy.actorCanMergeWithoutApproval = false;
+            }
+          }
+        }
+      } catch {
+        // Incomplete observations fail closed.
+      }
+    }
+  }
+
+  return policy;
 }

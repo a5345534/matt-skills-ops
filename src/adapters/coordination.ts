@@ -1197,6 +1197,25 @@ function createCoordinationPortFromStore(
       return { valid: true, lease: copyLease(observed.lease) };
     },
 
+    async canWriteCoordinationRefs(repository) {
+      try {
+        assertRepository(repository);
+        // Read path proves the reserved namespace is reachable. A successful
+        // list/get does not mutate durable coordination state (preflight-safe).
+        await store.list(LEASE_REF_PREFIX);
+        await readPolicySnapshot(repository);
+        return { ok: true as const };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false as const,
+          reason:
+            message.trim() ||
+            "Could not access the reserved Matt Auto coordination-ref namespace.",
+        };
+      }
+    },
+
     async getWorkerCapacityPolicy(repository) {
       const snapshot = await readPolicySnapshot(repository);
       return snapshot ? copyPolicy(snapshot.policy) : undefined;

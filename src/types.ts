@@ -4,7 +4,17 @@ export type PreflightCheckId =
   | "gh-auth"
   | "target-branch"
   | "matt-skills"
-  | "worker-profile";
+  | "worker-profile"
+  /** Canonical GitHub owner/name resolved for coordination and PR delivery. */
+  | "canonical-repository"
+  /** Write access to the reserved coordination-ref namespace. */
+  | "coordination-refs"
+  /** Repository-configured allowed merge method (never hard-coded). */
+  | "merge-method"
+  /** Strict stale-base / required-check protection on the Target branch. */
+  | "stale-base-protection"
+  /** Non-interactive merge authority without manual approval or merge queue. */
+  | "merge-authority";
 
 /** One Workflow preflight check result with corrective guidance. */
 export type PreflightCheck = {

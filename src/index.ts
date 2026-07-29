@@ -184,6 +184,22 @@ export type {
   TargetRefreshMerged,
 } from "./target-refresh.js";
 export {
+  MERGE_FRESHNESS_FAILURE_CODES,
+  evaluateMergeFreshness,
+  evaluateProtectedBranchAutomation,
+  isGitObjectId,
+  mergeMethodCliFlag,
+  sameGitObjectId,
+  selectConfiguredMergeMethod,
+} from "./workflow-pr-guard.js";
+export type {
+  MergeFreshnessFailureCode,
+  MergeFreshnessInput,
+  MergeFreshnessRecovery,
+  MergeFreshnessResult,
+  ProtectedBranchAutomationPolicy,
+} from "./workflow-pr-guard.js";
+export {
   isLiveWorkerSlotLease,
   planRepositoryWorkerSlots,
 } from "./worker-capacity.js";
