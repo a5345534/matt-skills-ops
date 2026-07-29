@@ -103,16 +103,71 @@ describe("evaluateProtectedBranchAutomation", () => {
     ).toMatch(/merge queue/i);
   });
 
-  it("fail-closes when strict stale-base protection cannot be guaranteed", () => {
+  it("fail-closes when protection is available but not strict", () => {
     const result = evaluateProtectedBranchAutomation(
       compatiblePolicy({
         requiredStatusChecks: { strict: false, contexts: ["ci"] },
         staleBaseProtectionGuaranteed: false,
+        branchProtectionObservation: "configured-non-strict",
       }),
     );
     expect(result.ok).toBe(false);
     expect(
       result.checks.find((check) => check.id === "stale-base-protection")?.ok,
+    ).toBe(false);
+    expect(
+      result.checks.find((check) => check.id === "stale-base-protection")
+        ?.guidance,
+    ).toMatch(/protection is available but incomplete|up to date/i);
+  });
+
+  it("allows degraded automation when protection APIs are plan-limited", () => {
+    const policy = compatiblePolicy({
+      staleBaseProtectionGuaranteed: false,
+      branchProtectionObservation: "plan-limited",
+    });
+    delete (policy as { requiredStatusChecks?: unknown }).requiredStatusChecks;
+    const result = evaluateProtectedBranchAutomation(policy);
+    expect(result.ok).toBe(true);
+    expect(result.degraded).toBe(true);
+    expect(
+      result.checks.find((check) => check.id === "stale-base-protection")?.ok,
+    ).toBe(true);
+    expect(
+      result.checks.find((check) => check.id === "branch-protection-unavailable")
+        ?.guidance,
+    ).toMatch(/403|plan|Pro-or-public/i);
+    expect(
+      result.checks.find((check) => check.id === "merge-authority")?.ok,
+    ).toBe(true);
+  });
+
+  it("allows degraded automation when no protection rules are configured", () => {
+    const policy = compatiblePolicy({
+      staleBaseProtectionGuaranteed: false,
+      branchProtectionObservation: "absent",
+    });
+    delete (policy as { requiredStatusChecks?: unknown }).requiredStatusChecks;
+    const result = evaluateProtectedBranchAutomation(policy);
+    expect(result.ok).toBe(true);
+    expect(result.degraded).toBe(true);
+    expect(
+      result.checks.find((check) => check.id === "stale-base-protection")
+        ?.guidance,
+    ).toMatch(/degraded automatic delivery/i);
+  });
+
+  it("still fail-closes plan-limited repos when the actor cannot merge", () => {
+    const policy = compatiblePolicy({
+      staleBaseProtectionGuaranteed: false,
+      branchProtectionObservation: "plan-limited",
+      actorCanMergeWithoutApproval: false,
+    });
+    delete (policy as { requiredStatusChecks?: unknown }).requiredStatusChecks;
+    const result = evaluateProtectedBranchAutomation(policy);
+    expect(result.ok).toBe(false);
+    expect(
+      result.checks.find((check) => check.id === "merge-authority")?.ok,
     ).toBe(false);
   });
 

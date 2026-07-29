@@ -13,6 +13,11 @@ export type PreflightCheckId =
   | "merge-method"
   /** Strict stale-base / required-check protection on the Target branch. */
   | "stale-base-protection"
+  /**
+   * Branch protection APIs are plan-limited or absent; degraded automation may
+   * be active. When ok, this is informational (does not block preflight).
+   */
+  | "branch-protection-unavailable"
   /** Non-interactive merge authority without manual approval or merge queue. */
   | "merge-authority";
 

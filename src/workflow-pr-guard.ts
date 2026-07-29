@@ -30,6 +30,22 @@ export type MergeFreshnessRecovery =
   /** Deterministic policy/authority problem; explicit recovery required. */
   | "retryable";
 
+/**
+ * How branch-protection / ruleset APIs were observed for the Target branch.
+ * Distinguishes plan limits from misconfiguration.
+ */
+export type BranchProtectionObservation =
+  /** Strict required checks (or equivalent) were observed. */
+  | "strict"
+  /** Protection/rulesets exist but do not guarantee strict stale-base. */
+  | "configured-non-strict"
+  /** Feature available; no classic protection and no applicable rulesets. */
+  | "absent"
+  /** GitHub refused inspection (private free / Pro-or-public 403). */
+  | "plan-limited"
+  /** Inspection failed for an unknown reason. */
+  | "unknown-error";
+
 /** Observed repository + branch policy used by Workflow preflight. */
 export type ProtectedBranchAutomationPolicy = {
   /** Canonical GitHub owner/name, when resolved. */
@@ -67,7 +83,38 @@ export type ProtectedBranchAutomationPolicy = {
    * required checks or an equivalent ruleset).
    */
   staleBaseProtectionGuaranteed?: boolean;
+  /**
+   * Classification of protection/ruleset API observation for this Target.
+   * When unset, the evaluator infers from other fields (legacy fixtures).
+   */
+  branchProtectionObservation?: BranchProtectionObservation;
 };
+
+/** True when Matt Auto may run degraded automation without strict stale-base. */
+export function isDegradedBranchProtectionMode(
+  policy: ProtectedBranchAutomationPolicy,
+): boolean {
+  const observation = resolveBranchProtectionObservation(policy);
+  return observation === "plan-limited" || observation === "absent";
+}
+
+export function resolveBranchProtectionObservation(
+  policy: ProtectedBranchAutomationPolicy,
+): BranchProtectionObservation {
+  if (policy.branchProtectionObservation) {
+    return policy.branchProtectionObservation;
+  }
+  // Legacy fixtures that only set staleBase / required checks.
+  if (policy.staleBaseProtectionGuaranteed === true) return "strict";
+  if (
+    policy.requiredStatusChecks &&
+    (policy.requiredStatusChecks.contexts.length > 0 ||
+      policy.requiredStatusChecks.strict)
+  ) {
+    return "configured-non-strict";
+  }
+  return "absent";
+}
 
 /** Merge-time facts checked immediately before automatic Workflow PR merge. */
 export type MergeFreshnessInput = {
@@ -146,7 +193,12 @@ function isAllowedMergeMethod(
  * Evaluate protected-branch automation compatibility for Workflow preflight.
  * Fail-closes on manual approval, manual merge, unsupported merge methods,
  * native merge-queue requirements, missing coordination-ref permissions, or
- * stale-base protection that cannot be guaranteed.
+ * misconfigured protection when the feature is available.
+ *
+ * When branch protection is plan-limited (private free 403) or absent (no rules),
+ * and the actor can still merge with a configured merge method, Matt Auto enters
+ * degraded automation mode: preflight passes with explicit guidance rather than
+ * blocking Create-spec / delivery.
  */
 export function evaluateProtectedBranchAutomation(
   policy: ProtectedBranchAutomationPolicy,
@@ -154,6 +206,8 @@ export function evaluateProtectedBranchAutomation(
   ok: boolean;
   mergeMethod?: WorkflowMergeMethod;
   checks: PreflightCheck[];
+  /** True when automation proceeds without strict stale-base guarantees. */
+  degraded?: boolean;
 } {
   const checks: PreflightCheck[] = [];
 
@@ -193,24 +247,64 @@ export function evaluateProtectedBranchAutomation(
   const hasRequiredChecks =
     (policy.requiredStatusChecks?.contexts.length ?? 0) > 0;
   const strictChecks = policy.requiredStatusChecks?.strict === true;
-  const staleBaseOk =
+  const staleBaseObserved =
     policy.staleBaseProtectionGuaranteed === true ||
     (hasRequiredChecks && strictChecks);
-  checks.push({
-    id: "stale-base-protection",
-    ok: staleBaseOk,
-    guidance: staleBaseOk
-      ? "Strict stale-base protection is guaranteed for the Target branch (required checks must pass on an up-to-date head)."
-      : "Target branch does not guarantee strict stale-base protection. Enable required status checks with \"require branches to be up to date before merging\" (or an equivalent ruleset). Matt Auto will not partially automate merges without that guarantee.",
+  const observation = resolveBranchProtectionObservation({
+    ...policy,
+    ...(staleBaseObserved
+      ? { branchProtectionObservation: policy.branchProtectionObservation ?? "strict" }
+      : {}),
   });
-
   const requiredApprovals = policy.requiredApprovingReviewCount ?? 0;
   const mergeQueueOk = policy.mergeQueueRequired !== true;
   const actorOk = policy.actorCanMergeWithoutApproval === true;
+
+  // Degraded mode: protection feature unavailable (plan-limited) or not configured
+  // (absent). Still requires merge authority + merge method + no approvals/queue.
+  const degradedEligible =
+    isDegradedBranchProtectionMode({
+      ...policy,
+      branchProtectionObservation: observation,
+    }) &&
+    mergeQueueOk &&
+    actorOk &&
+    requiredApprovals === 0 &&
+    mergeMethodOk;
+  const staleBaseOk = staleBaseObserved || degradedEligible;
+
+  if (observation === "plan-limited" || observation === "absent") {
+    checks.push({
+      id: "branch-protection-unavailable",
+      ok: true,
+      guidance:
+        observation === "plan-limited"
+          ? "Branch protection / ruleset APIs are unavailable on this repository plan (GitHub returned 403 Pro-or-public). Matt Auto will not ask you to enable settings that this plan cannot configure. Degraded automation is used when merge authority is otherwise satisfied."
+          : "No branch protection or rulesets were observed on the Target branch. Strict stale-base is not guaranteed. Degraded automation is used when merge authority is otherwise satisfied; enable required status checks with up-to-date heads when your plan supports them for stronger guarantees.",
+    });
+  }
+
+  checks.push({
+    id: "stale-base-protection",
+    ok: staleBaseOk,
+    guidance: staleBaseObserved
+      ? "Strict stale-base protection is guaranteed for the Target branch (required checks must pass on an up-to-date head)."
+      : degradedEligible
+        ? observation === "plan-limited"
+          ? "Strict stale-base protection cannot be configured on this plan; degraded automatic delivery is allowed because the automation identity can merge and no review/merge-queue gates were observed."
+          : "Strict stale-base protection is not configured; degraded automatic delivery is allowed because the automation identity can merge and no review/merge-queue gates were observed. Prefer enabling required status checks with up-to-date heads when available."
+        : observation === "configured-non-strict"
+          ? "Target branch has protection/rulesets but does not guarantee strict stale-base (required checks must pass on an up-to-date head). Enable \"require branches to be up to date before merging\" (or equivalent). Matt Auto will not partially automate merges when protection is available but incomplete."
+          : "Target branch does not guarantee strict stale-base protection, and degraded automation is not available (missing merge method, merge permission, or other gates).",
+  });
+
   const authorityOk =
     mergeQueueOk && actorOk && requiredApprovals === 0 && staleBaseOk;
   let authorityGuidance: string;
-  if (authorityOk) {
+  if (authorityOk && degradedEligible && !staleBaseObserved) {
+    authorityGuidance =
+      "Authenticated identity can merge Workflow PRs non-interactively in degraded mode (no strict stale-base observation). Matt Auto still will not invent branch protection.";
+  } else if (authorityOk) {
     authorityGuidance =
       "Authenticated identity can merge Workflow PRs non-interactively without manual approval.";
   } else if (!mergeQueueOk) {
@@ -223,7 +317,7 @@ export function evaluateProtectedBranchAutomation(
       "Authenticated identity cannot merge Workflow PRs without human interaction. Grant merge permission to the automation identity and remove manual-only merge gates.";
   } else {
     authorityGuidance =
-      "Protected-branch automation is incomplete: required-check / stale-base guarantees are missing, so non-interactive merge authority cannot be claimed.";
+      "Protected-branch automation is incomplete: required-check / stale-base guarantees are missing where protection is available, so non-interactive merge authority cannot be claimed.";
   }
   checks.push({
     id: "merge-authority",
@@ -236,6 +330,7 @@ export function evaluateProtectedBranchAutomation(
     ok,
     checks,
     ...(mergeMethod ? { mergeMethod } : {}),
+    ...(degradedEligible && !staleBaseObserved ? { degraded: true } : {}),
   };
 }
 

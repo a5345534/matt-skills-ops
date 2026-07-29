@@ -928,6 +928,13 @@ async function inspectProtectedBranchAutomation(
         policy.staleBaseProtectionGuaranteed =
           protection.required_status_checks.strict === true &&
           uniqueContexts.length > 0;
+        policy.branchProtectionObservation =
+          policy.staleBaseProtectionGuaranteed === true
+            ? "strict"
+            : "configured-non-strict";
+      } else {
+        // Classic protection exists without required status checks.
+        policy.branchProtectionObservation = "configured-non-strict";
       }
       const approvals =
         protection.required_pull_request_reviews?.required_approving_review_count;
@@ -938,18 +945,15 @@ async function inspectProtectedBranchAutomation(
         }
       }
     } catch {
-      // Incomplete observations fail closed in the evaluator.
+      policy.branchProtectionObservation = "unknown-error";
     }
   } else {
-    // 404 means no classic branch protection. Rulesets may still apply; without
-    // a strict required-check observation we cannot guarantee stale-base safety.
     const detail = `${protectionResult.stderr}
 ${protectionResult.stdout}`;
-    if (!/404|Not Found/i.test(detail)) {
-      // Keep actor merge ability from repo settings; leave protection unset.
-    }
-    // Probe rulesets for merge-queue / required checks when classic protection
-    // is absent.
+    const protectionPlanLimited = isGithubPlanLimitedProtectionError(detail);
+    const protectionAbsent = /404|Not Found|Branch not protected/i.test(detail);
+
+    // Probe rulesets when classic protection is absent or plan-limited.
     const rulesResult = await run(cwd, "gh", [
       "api",
       `repos/{owner}/{repo}/rules/branches/${encodeURIComponent(targetBranch)}`,
@@ -980,6 +984,17 @@ ${protectionResult.stdout}`;
             policy.requiredStatusChecks = { strict, contexts };
             policy.staleBaseProtectionGuaranteed =
               strict && contexts.length > 0;
+            policy.branchProtectionObservation =
+              policy.staleBaseProtectionGuaranteed === true
+                ? "strict"
+                : "configured-non-strict";
+          } else if (rules.length === 0) {
+            policy.branchProtectionObservation = protectionPlanLimited
+              ? "plan-limited"
+              : "absent";
+          } else if (!policy.branchProtectionObservation) {
+            // Rules exist but none encode required status checks.
+            policy.branchProtectionObservation = "configured-non-strict";
           }
           const reviewRule = rules.find(
             (rule) => rule.type === "pull_request",
@@ -994,10 +1009,45 @@ ${protectionResult.stdout}`;
           }
         }
       } catch {
-        // Incomplete observations fail closed.
+        policy.branchProtectionObservation =
+          policy.branchProtectionObservation ?? "unknown-error";
+      }
+    } else {
+      const rulesDetail = `${rulesResult.stderr}
+${rulesResult.stdout}`;
+      if (
+        protectionPlanLimited ||
+        isGithubPlanLimitedProtectionError(rulesDetail)
+      ) {
+        policy.branchProtectionObservation = "plan-limited";
+      } else if (protectionAbsent || /404|Not Found/i.test(rulesDetail)) {
+        policy.branchProtectionObservation = "absent";
+      } else {
+        policy.branchProtectionObservation = "unknown-error";
+      }
+    }
+
+    if (!policy.branchProtectionObservation) {
+      if (protectionPlanLimited) {
+        policy.branchProtectionObservation = "plan-limited";
+      } else if (protectionAbsent) {
+        policy.branchProtectionObservation = "absent";
+      } else {
+        policy.branchProtectionObservation = "unknown-error";
       }
     }
   }
 
   return policy;
+}
+
+/** True when GitHub refuses protection/ruleset APIs due to plan/visibility limits. */
+function isGithubPlanLimitedProtectionError(detail: string): boolean {
+  return (
+    /403/i.test(detail) &&
+    (/Upgrade to GitHub Pro/i.test(detail) ||
+      /make this repository public/i.test(detail) ||
+      /not available/i.test(detail) ||
+      /Upgrade to GitHub/i.test(detail))
+  );
 }
