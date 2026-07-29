@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createTrackerPort,
+  extractGhApiErrorMessage,
   formatWorkflowManifestComment,
   parsePaginatedApiArray,
 } from "../src/adapters/tracker.js";
@@ -47,6 +48,22 @@ function coordinatedManifest(workflowId: number): CoordinationWorkflowManifest {
   };
 }
 
+describe("extractGhApiErrorMessage", () => {
+  it("reads REST error objects (including rate-limit 403 bodies)", () => {
+    expect(
+      extractGhApiErrorMessage(
+        JSON.stringify({
+          message: "API rate limit exceeded for user ID 1",
+          status: "403",
+        }),
+      ),
+    ).toBe("API rate limit exceeded for user ID 1");
+    expect(extractGhApiErrorMessage(JSON.stringify([{ number: 1 }]))).toBe(
+      undefined,
+    );
+  });
+});
+
 describe("parsePaginatedApiArray", () => {
   it("accepts a flat merged page (gh without --slurp)", () => {
     expect(
@@ -67,6 +84,14 @@ describe("parsePaginatedApiArray", () => {
   it("treats empty stdout and empty array as success", () => {
     expect(parsePaginatedApiArray("")).toEqual([]);
     expect(parsePaginatedApiArray("[]")).toEqual([]);
+  });
+
+  it("rejects REST error objects so discovery can surface rate limits", () => {
+    expect(
+      parsePaginatedApiArray(
+        JSON.stringify({ message: "API rate limit exceeded", status: "403" }),
+      ),
+    ).toBeUndefined();
   });
 
   it("parses concatenated page arrays", () => {
@@ -223,6 +248,49 @@ process.exit(1);
       expect(
         calls.filter((call) => call.some((part) => part.includes("/comments?"))),
       ).toHaveLength(3);
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = originalPath;
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces GitHub rate-limit bodies that gh prints with exit 0", async () => {
+    const directory = await mkdtemp(
+      path.join(os.tmpdir(), "matt-auto-fake-gh-ratelimit-"),
+    );
+    const executablePath = path.join(directory, "gh");
+    await writeFile(
+      executablePath,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "repo" && args[1] === "view") {
+  process.stdout.write(JSON.stringify({ nameWithOwner: "Acme/workflow-tools" }));
+  process.exit(0);
+}
+if (args.includes("--paginate")) {
+  process.stdout.write(JSON.stringify({
+    message: "API rate limit exceeded for user ID 65459035",
+    status: "403",
+  }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+      "utf8",
+    );
+    await chmod(executablePath, 0o755);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${directory}${path.delimiter}${originalPath ?? ""}`;
+    try {
+      const tracker = createTrackerPort(process.cwd());
+      await expect(tracker.findActiveWorkflows(target)).rejects.toThrow(
+        /rate limit exceeded/i,
+      );
     } finally {
       if (originalPath === undefined) {
         delete process.env.PATH;

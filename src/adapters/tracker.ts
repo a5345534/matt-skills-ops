@@ -179,9 +179,36 @@ async function resolveRepoFullName(
  * - empty stdout / `[]` (no items)
  * - concatenated top-level JSON values (some older paginate modes)
  */
+/**
+ * When `gh api` prints a REST error object (often with exit 0), surface the
+ * message instead of treating stdout as a failed page parse.
+ */
+export function extractGhApiErrorMessage(stdout: string): string | undefined {
+  const trimmed = stdout.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      typeof (parsed as { message?: unknown }).message !== "string"
+    ) {
+      return undefined;
+    }
+    const message = (parsed as { message: string }).message.trim();
+    return message.length > 0 ? message : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function parsePaginatedApiArray(stdout: string): unknown[] | undefined {
   const trimmed = stdout.trim();
   if (trimmed.length === 0) return [];
+
+  // Rate-limit / REST error objects are not page arrays (gh may still exit 0).
+  if (extractGhApiErrorMessage(trimmed)) return undefined;
 
   try {
     const parsed: unknown = JSON.parse(trimmed);
@@ -356,17 +383,30 @@ export function createTrackerPort(cwd: string): TrackerPort {
 
   async function listOpenWorkflowIssues(
     repository: CanonicalRepositoryIdentity,
-  ): Promise<
-    Array<{ number: number; title?: string; state?: string }> | undefined
-  > {
+  ): Promise<Array<{ number: number; title?: string; state?: string }>> {
     const listed = await runGhApiPaginated(
       cwd,
       `${repositoryEndpoint(repository)}/issues?state=open&per_page=100`,
     );
-    if (listed.code !== 0) return undefined;
+    // gh may exit 0 while printing a REST error object (rate limit 403).
+    const apiError =
+      extractGhApiErrorMessage(listed.stdout) ??
+      extractGhApiErrorMessage(listed.stderr);
+    if (listed.code !== 0 || apiError) {
+      const detail =
+        apiError ||
+        (listed.stderr || listed.stdout || `exit ${listed.code}`).trim();
+      throw new Error(
+        `Could not paginate open GitHub issues for workflow discovery: ${detail}`,
+      );
+    }
     const entries = parsePaginatedApiArray(listed.stdout);
     // Empty repo / empty page is success (`[]`), not discovery failure.
-    if (!entries) return undefined;
+    if (!entries) {
+      throw new Error(
+        "Could not paginate open GitHub issues for workflow discovery: response was not a JSON issue list.",
+      );
+    }
 
     const issues = new Map<
       number,
@@ -456,9 +496,6 @@ export function createTrackerPort(cwd: string): TrackerPort {
     repository: CanonicalRepositoryIdentity,
   ): Promise<readonly WorkflowManifestIssue[]> {
     const issues = await listOpenWorkflowIssues(repository);
-    if (!issues) {
-      throw new Error("Could not paginate open GitHub issues for workflow discovery.");
-    }
 
     return mapWithConcurrency(issues, 8, async (issue) => {
       const comments = await loadIssueComments(repository, issue.number);

@@ -47,6 +47,7 @@ import {
   canonicalRepositoryIdentityKey,
   canonicalTargetIdentityKey,
   isCanonicalRepositoryIdentity,
+  targetBranchFromRef,
   targetRefFromBranch,
 } from "./coordination.js";
 import { isPublishableSpecDraft } from "./adapters/planning-draft.js";
@@ -4167,9 +4168,26 @@ export function createWorkflowCoordinator(
       };
     }
 
-    let candidates: readonly ActiveWorkflow[];
+    // Prefer single-issue discovery for explicit resume. Full open-issue
+    // pagination is expensive and fails closed under GitHub rate limits with a
+    // generic message (Workflow #53 take-over while listing all open issues).
+    const targetBranch = targetBranchFromRef(context.target.targetRef);
+    let active: ActiveWorkflow | undefined;
     try {
-      candidates = await bound.tracker.findActiveWorkflows(context.target);
+      if (targetBranch) {
+        active = await bound.tracker.findActiveWorkflow(
+          targetBranch,
+          workflowId,
+        );
+      }
+      if (!active) {
+        const candidates = await bound.tracker.findActiveWorkflows(
+          context.target,
+        );
+        active = candidates.find(
+          (candidate) => candidate.workflowId === workflowId,
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -4179,7 +4197,6 @@ export function createWorkflowCoordinator(
         workflowId,
       };
     }
-    const active = candidates.find((candidate) => candidate.workflowId === workflowId);
     if (!active) {
       return {
         status: "failed",
