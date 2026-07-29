@@ -32,7 +32,7 @@ const okPreflight: PreflightResult = {
   targetBranch: "main",
   checks: [
     {
-      id: "github-remote",
+      id: "tracker-remote",
       ok: true,
       guidance: "ok",
     },

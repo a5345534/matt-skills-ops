@@ -21,13 +21,13 @@ import type { ProtectedBranchAutomationPolicy } from "./workflow-pr-guard.js";
 
 /**
  * Environment facts for Workflow preflight on one Workflow root.
- * System boundary: git remotes, gh auth, branch existence.
+ * System boundary: git remotes, forge authentication, branch existence.
  */
 export type EnvironmentPort = {
-  /** Whether the Workflow root has a GitHub remote. */
-  hasGitHubRemote(): Promise<boolean>;
-  /** Whether `gh` is authenticated for GitHub. */
-  isGhAuthenticated(): Promise<boolean>;
+  /** Whether the Workflow root selects a supported GitHub or Forgejo tracker. */
+  hasSupportedTrackerRemote(): Promise<boolean>;
+  /** Whether the selected tracker identity can authenticate to its API. */
+  isTrackerAuthenticated(): Promise<boolean>;
   /** Whether the given branch exists locally or on a remote. */
   targetBranchExists(branch: string): Promise<boolean>;
   /**
@@ -250,7 +250,7 @@ export type WorkspacePort = {
   listWorkflowBranches(workflowId: number): Promise<readonly string[]>;
   /**
    * Remove local Implementation/Integration worktrees and matching local branches
-   * for a Workflow ID. Does not touch remotes or GitHub history.
+   * for a Workflow ID. Does not touch remotes or forge history.
    */
   cleanupWorkflowWorkspaces(workflowId: number): Promise<{
     removedWorktrees: readonly string[];
@@ -258,7 +258,7 @@ export type WorkspacePort = {
   }>;
   /**
    * Remove specific local worktrees and branches (Run termination T2).
-   * Does not touch remotes, GitHub history, or branches not listed.
+   * Does not touch remotes, forge history, or branches not listed.
    */
   removeLocalBranches(branchNames: readonly string[]): Promise<{
     removedWorktrees: readonly string[];
@@ -287,7 +287,7 @@ export type CiCheckResult = {
 };
 
 /**
- * GitHub Actions / checks CI gate.
+ * Forge Actions / checks CI gate.
  * On-demand only — the Workflow coordinator never starts a background poll loop.
  */
 export type CiPort = {
@@ -560,7 +560,7 @@ export type WorkerRuntimeInfo = {
 /**
  * Sink for Worker protocol events mapped from the worker's Pi JSON event stream.
  * The Workflow coordinator processes Stage results and progress; the sink carries
- * no GitHub mutation authority.
+ * no forge mutation authority.
  */
 export type WorkerEventSink = {
   onEvent(event: WorkerProtocolEvent): void | Promise<void>;
@@ -599,7 +599,7 @@ export type TranscriptKey = {
 /**
  * Local Worker transcript storage.
  * System boundary: rebuildable Matt Auto run storage under `.pi/matt-auto/`.
- * Transcripts are local and uncommitted; never published to GitHub.
+ * Transcripts are local and uncommitted; never published to the forge.
  */
 export type TranscriptPort = {
   /** Append one structured JSON event for a Worker attempt. */
@@ -608,13 +608,13 @@ export type TranscriptPort = {
   read(key: TranscriptKey): Promise<readonly unknown[]>;
   /**
    * Remove all local Worker transcripts for a Workflow ID (paired cleanup).
-   * Never touches GitHub history.
+   * Never touches forge history.
    */
   cleanupWorkflowTranscripts(workflowId: number): Promise<void>;
 };
 
 /**
- * One workflow ticket recovered from GitHub for frontier computation.
+ * One workflow ticket recovered from the workflow forge for frontier computation.
  * System boundary fact: issue number, title, state, and native blocked-by edges.
  */
 export type TrackerTicket = {
@@ -625,17 +625,17 @@ export type TrackerTicket = {
 };
 
 /**
- * GitHub issue-tracker operations owned by the Workflow coordinator.
- * System boundary: `gh` / GitHub remote writes and reads.
+ * Workflow-forge issue-tracker operations owned by the Workflow coordinator.
+ * System boundary: provider adapter remote writes and reads.
  */
 export type TrackerPort = {
   /**
-   * Resolve the canonical GitHub owner/name identity for this Workflow root.
+   * Resolve the canonical forge owner/name identity for this Workflow root.
    * Optional while legacy version-1 workflow routing remains supported.
    */
   getCanonicalRepositoryIdentity?(): Promise<CanonicalRepositoryIdentity | undefined>;
   /**
-   * Create a GitHub issue. For Create-spec publish, the issue number becomes the Workflow ID.
+   * Create a forge issue. For Create-spec publish, the issue number becomes the Workflow ID.
    */
   createIssue(input: {
     title: string;
@@ -651,7 +651,7 @@ export type TrackerPort = {
     manifest: WorkflowManifest,
   ): Promise<void>;
   /**
-   * Discover every Active workflow for one canonical GitHub repository and fully
+   * Discover every Active workflow for one canonical forge repository and fully
    * qualified Target ref. Implementations must paginate all candidate issues and
    * never select an arbitrary first match.
    */
@@ -683,7 +683,7 @@ export type TrackerPort = {
    */
   listTickets(issueNumbers: readonly number[]): Promise<readonly TrackerTicket[]>;
   /**
-   * Add a native GitHub blocked-by relationship:
+   * Add a native forge blocked-by relationship:
    * `issueNumber` is blocked by `blockerIssueNumber`.
    */
   addBlockedBy(
@@ -691,22 +691,24 @@ export type TrackerPort = {
     blockerIssueNumber: number,
   ): Promise<void>;
   /**
-   * Link a child ticket as a GitHub sub-issue of the Workflow ID parent.
+   * Link a child ticket to its Workflow ID parent when the forge supports a
+   * native hierarchy. The managed Workflow manifest remains authoritative, so
+   * a provider without native sub-issues may deliberately make this a no-op.
    */
   addSubIssue(
     parentIssueNumber: number,
     childIssueNumber: number,
   ): Promise<void>;
   /**
-   * Close a GitHub issue (ticket after CI gate, or parent Workflow spec after cleanup).
-   * Optional comment is posted with the close when supported by gh.
+   * Close a forge issue (ticket after CI gate, or parent Workflow spec after cleanup).
+   * Optional comment is posted with the close when the provider supports it.
    */
   closeIssue(
     issueNumber: number,
     options?: { comment?: string },
   ): Promise<void>;
   /**
-   * Reopen a closed GitHub issue for a pre-merge Rework attempt.
+   * Reopen a closed forge issue for a pre-merge Rework attempt.
    * Does not mutate completed workflow history after a Workflow PR merges.
    */
   reopenIssue(issueNumber: number): Promise<void>;
@@ -737,13 +739,13 @@ export type TrackerPort = {
   }): Promise<{
     headSha: string;
     baseSha: string;
-    /** When known, whether GitHub currently considers the PR mergeable. */
+    /** When known, whether the forge currently considers the PR mergeable. */
     mergeable?: boolean;
   }>;
   /**
-   * Merge the Workflow PR as a Next action (no manual GitHub UI required).
+   * Merge the Workflow PR as a Next action (no manual forge UI required).
    * Automatic delivery must pass the repository-configured merge method and
-   * the expected head SHA so GitHub cannot merge a different tip.
+   * the expected head SHA so the forge cannot merge a different tip.
    */
   mergePullRequest(input: {
     number: number;
@@ -764,7 +766,7 @@ export type TrackerPort = {
  * resolves precedence (snapshot → root → global).
  *
  * Worker concurrency layers are stored separately; the Workflow coordinator
- * resolves precedence (root → global → default 2). Local prefs only — never GitHub.
+ * resolves precedence (root → global → default 2). Local prefs only — never the forge.
  */
 export type PreferencesPort = {
   /**
@@ -832,7 +834,7 @@ export type PreferencesPort = {
   clearActiveWorkflowId(targetBranch: string): Promise<void>;
   /**
    * Checkout-local Workflow-home binding keyed by canonical repository + fully
-   * qualified Target ref. It is routing state only; GitHub remains authoritative.
+   * qualified Target ref. It is routing state only; the workflow forge remains authoritative.
    * Optional while old preference files and legacy v1 routing remain supported.
    */
   getWorkflowHomeBinding?(
@@ -900,7 +902,7 @@ export type RootScopedPorts = {
   verification: VerificationPort;
   /** Coordinator-only remote Git writes (push). */
   remoteGit: RemoteGitPort;
-  /** On-demand GitHub Actions CI gate (no background polling). */
+  /** On-demand forge Actions CI gate (no background polling). */
   ci: CiPort;
   /** Remote fenced lease records for coordination-aware Workflow manifests. */
   coordination?: CoordinationPort;

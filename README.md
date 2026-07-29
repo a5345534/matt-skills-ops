@@ -20,9 +20,33 @@ pi install /absolute/path/to/matt-skills-ops
 pi install -l /absolute/path/to/matt-skills-ops
 ```
 
+## Forgejo workflow setup
+
+New workflows use Forgejo as their authoritative forge. The active Git remote
+must point to Forgejo before starting a new workflow; configure the ignored,
+root-local `.pi/matt-auto/forge.json` alongside it:
+
+```json
+{
+  "provider": "forgejo",
+  "baseUrl": "http://localhost:3002",
+  "tokenFile": "/absolute/path/to/a-0600-forgejo-token"
+}
+```
+
+The configured remote owner/name and `baseUrl` must agree; Matt Auto rejects a
+mismatch rather than writing workflow state to the wrong forge. The token needs
+`read:user`, `write:user`, `write:repository`, and `write:issue` scopes. CI
+uses Forgejo Actions and a runner label that matches the workflow's `runs-on`.
+
+Do not migrate an in-progress workflow across forges. Workflow #53 and PR #59
+remain on GitHub until their GitHub cleanup completes; only then switch
+`origin` to `ssh://git@localhost:2222/a5345534/matt-skills-ops.git`, retain
+GitHub as an optional archive remote, and start new workflows on Forgejo.
+
 ## Debug log
 
-Matt Auto writes an append-only local log (not committed / not pushed to GitHub):
+Matt Auto writes an append-only local log (not committed / not pushed to the workflow forge):
 
 ```text
 <workflow-root>/.pi/matt-auto/logs/matt-auto-YYYY-MM-DD.log
@@ -32,9 +56,9 @@ Matt Auto writes an append-only local log (not committed / not pushed to GitHub)
 
 ## Manual Workflow dashboard
 
-`/matt-auto` opens a **local-only home** first: Settings plus unfinished workflows discovered from this checkout (preferences, bindings, transcripts). It does **not** call GitHub on open. Selecting an unfinished workflow binds this checkout to that Workflow ID and then opens the workflow surface (persistent dashboard when `ctx.ui.custom()` exists, otherwise the blocking workflow menu), which may read GitHub. **Start new workflow** appears only when no local unfinished work is known.
+`/matt-auto` opens a **local-only home** first: Settings plus unfinished workflows discovered from this checkout (preferences, bindings, transcripts). It does **not** call the workflow forge on open. Selecting an unfinished workflow binds this checkout to that Workflow ID and then opens the workflow surface (persistent dashboard when `ctx.ui.custom()` exists, otherwise the blocking workflow menu), which may read the forge. **Start new workflow** appears only when no local unfinished work is known.
 
-On the workflow dashboard, use arrow keys to browse workflow, ticket, worker, preflight, routing, and action rows; **Enter** runs a Next action or **Switch / take over workflow…** (bind this home to another Active workflow on the Target). Worker profile / concurrency / live-wait poll settings live only under the local home **Settings…** menu, not on the dashboard. Press `r` for a full refresh. `Esc` returns to the local home (or to chat from home). From home, pick a local unfinished workflow first — its submenu offers **Open this workflow**, **Take over this workflow…**, and **Switch / take over another Active workflow…** (not top-level home items). `/matt-auto next` still opens a Next-actions-focused surface and may read GitHub immediately.
+On the workflow dashboard, use arrow keys to browse workflow, ticket, worker, preflight, routing, and action rows; **Enter** runs a Next action or **Switch / take over workflow…** (bind this home to another Active workflow on the Target). Worker profile / concurrency / live-wait poll settings live only under the local home **Settings…** menu, not on the dashboard. Press `r` for a full refresh. `Esc` returns to the local home (or to chat from home). From home, pick a local unfinished workflow first — its submenu offers **Open this workflow**, **Take over this workflow…**, and **Switch / take over another Active workflow…** (not top-level home items). `/matt-auto next` still opens a Next-actions-focused surface and may read the forge immediately.
 
 `/matt-auto run` does **not** open the manual dashboard. Its **live run brief stays open for the whole run** once the workflow panel exists (including ticket transitions, disposition, and Integration) — stage waits do **not** open a second editor surface that would close between tickets. The brief refreshes from local panel state on a configurable interval (default **500ms**; **Settings → Configure live wait poll interval…**, range 200–10000ms, root overrides global). Controls: Pause / Resume / Terminate (re-opens after Pause confirm). The brief closes only when the run ends (workflow-complete, terminate, idle, or failure). Matt Auto does not stack the manual dashboard on top of that surface.
 
@@ -59,12 +83,12 @@ Matt Auto resolves the **Workflow root** from the nearest enclosing Git reposito
 - Monorepo packages share that single enclosing root
 - Nested independent Git repositories are discoverable and selectable from the Matt Auto menu
 - Git submodules are out of MVP and are not offered as roots
-- Roots without a GitHub remote are marked unavailable with an explicit unsupported-tracker explanation
+- Roots without a supported GitHub legacy remote or explicit Forgejo configuration are marked unavailable with an explicit unsupported-tracker explanation
 
 ## Workflow readiness
 
 Readiness is **action-scoped**, not one global gate. Passive Home/dashboard
-views use a local overview; they do not consume GitHub policy quota or hide
+views use a local overview; they do not consume forge policy quota or hide
 unrelated Next actions. Each action checks its own prerequisites immediately
 before its first side effect:
 
@@ -82,7 +106,7 @@ before its first side effect:
 Use **Refresh preflight** in the fallback Workflow menu when you explicitly
 want the full delivery diagnostic. It is informational until the action that
 actually needs a failed requirement runs; Matt Auto still fails closed at that
-operation and never bootstraps missing GitHub configuration.
+operation and never bootstraps missing forge configuration.
 
 **Branch protection observation:**
 
@@ -126,11 +150,11 @@ Example preferences:
 When Workflow preflight passes and there is no Active workflow, Next actions include **Create spec** (also the start of `/matt-auto run`):
 
 1. Matt Auto sends `/skill:to-spec` in **this Workflow home session** so the prior grill conversation stays in context.
-2. The skill is instructed **not** to publish to GitHub; it returns one plain Markdown PRD (H1 title plus required H2 sections), never Matt Auto protocol markers.
+2. The skill is instructed **not** to publish to the tracker; it returns one plain Markdown PRD (H1 title plus required H2 sections), never Matt Auto protocol markers.
 3. A fail-closed quality gate rejects empty / placeholder drafts, missing or thin required sections, fewer than three numbered User Stories, code fences, and any model-emitted protocol marker. Nothing is published on failure.
 4. **Manual menu**: Stage confirmation Publish / Revise / Cancel.
 5. **`/matt-auto run`**: auto-Publishes (no human Publish click).
-6. Publish creates a GitHub spec issue (Workflow ID) + Workflow manifest comment.
+6. Publish creates a forge spec issue (Workflow ID) + Workflow manifest comment.
 7. After publish, Next actions advance to **Create tickets** (`/matt-auto run` continues automatically).
 
 ## Create-tickets Planning stage and frontier discovery
@@ -139,9 +163,9 @@ When an Active workflow is in stage `spec-published`, Next actions include **Cre
 
 1. Matt Auto invokes the installed `to-tickets` skill as a Planning stage in Workflow home (skill definitions are not modified).
 2. The breakdown reaches one **Stage confirmation** menu: Publish / Revise / Cancel.
-3. **Publish** creates GitHub ticket issues (with `ready-for-agent`), links them as sub-issues of the Workflow ID, sets native **blocked-by** relationships, and updates the Workflow manifest (`stage: tickets-published`, `tickets: [...]`).
+3. **Publish** creates forge ticket issues (with `ready-for-agent`), records membership in the Workflow manifest, sets native **blocked-by** relationships, and updates the Workflow manifest (`stage: tickets-published`, `tickets: [...]`). Forgejo v12 has no native sub-issue REST edge; manifest membership is authoritative there.
 4. **Cancel** leaves no remote publication. **Revise** re-invokes `to-tickets` without publishing.
-5. After publish, the coordinator computes the **ready frontier** from GitHub issue state (open tickets with no open blockers).
+5. After publish, the coordinator computes the **ready frontier** from forge issue state (open tickets with no open blockers).
 6. Next actions and the Matt Auto menu show a **ticket-progress summary** (ready / open / closed + frontier).
 
 ## Single Implementation worker path
@@ -153,9 +177,9 @@ When tickets are published and the ready frontier is non-empty, Next actions inc
 3. Progress streams over the **Worker protocol** (Pi JSON event stream → Stage results). The passive **Workflow panel** shows condensed running status from the same panel DTO as the full-screen run brief (workflow id, pause state, worker ticket/status/alive, optional progress). When the Pi TUI exposes `setWidget`/`setStatus`, that summary is also published as a secondary always-on surface; without those APIs the publish is a no-op and the full-screen brief remains primary. The Workflow panel is not an interactive dashboard.
 4. A local **Worker transcript** is retained under `.pi/matt-auto/transcripts/` for the attempt.
 5. On success, **Implementation disposition** offers Close / Leave open / Investigate.
-6. **Close** starts a serialized **Integration unit** (does **not** close the GitHub ticket yet).
+6. **Close** starts a serialized **Integration unit** (does **not** close the forge ticket yet).
 7. Workers only commit locally. The Workflow coordinator remains the only remote writer for push, manifest, and issue mutations.
-8. Shutdown, reload, or Workflow-root switching **aborts** the worker cleanly; GitHub tickets stay open/ready for retry.
+8. Shutdown, reload, or Workflow-root switching **aborts** the worker cleanly; forge tickets stay open/ready for retry.
 
 ## Integration unit
 
@@ -176,8 +200,8 @@ Choosing **Close** on a completed Implementation disposition runs one Integratio
 When **all tickets** are integrated and CI-complete:
 
 1. **Open Workflow PR** — one PR from the Integration branch to the configured Target branch (default `main`).
-2. **Merge Workflow PR** — offered as a Matt Auto Next action (no manual GitHub merge required).
-3. **Cleanup workflow** — pairs local workspaces/transcripts with matching remote `matt-auto/*` branch removal; retains GitHub issue/PR/manifest history.
+2. **Merge Workflow PR** — offered as a Matt Auto Next action (no manual forge merge required).
+3. **Cleanup workflow** — pairs local workspaces/transcripts with matching remote `matt-auto/*` branch removal; retains forge issue/PR/manifest history.
 4. **Pre-merge Rework** — reopens a closed ticket and creates a fresh numbered attempt workspace (`…/rN`) without reusing the completed workspace.
 5. **Start Follow-up workflow** — after merge + cleanup, creates a new spec issue that references the completed Workflow rather than mutating it.
 

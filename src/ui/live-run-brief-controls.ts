@@ -108,7 +108,7 @@ function controlItems(panel: WorkflowPanelState): SelectItem[] {
     {
       value: "pause",
       label: "Pause pipeline…",
-      description: "Abort workers; GitHub state unchanged",
+      description: "Abort workers; tracker state unchanged",
     },
     {
       value: "terminate",
@@ -124,7 +124,7 @@ function confirmItems(kind: ConfirmKind, workflowId: number): SelectItem[] {
       {
         value: "confirm",
         label: "Confirm Pause",
-        description: `Abort workers for Workflow #${workflowId}; GitHub unchanged`,
+        description: `Abort workers for Workflow #${workflowId}; tracker unchanged`,
       },
       {
         value: "cancel",

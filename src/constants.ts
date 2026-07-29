@@ -64,11 +64,11 @@ export const REQUIRED_MATT_SKILLS = [
 ] as const;
 
 /**
- * Explanation when a Workflow root has no supported GitHub tracker.
- * Non-GitHub roots are unavailable rather than partially automated.
+ * Explanation when a Workflow root has no supported forge tracker.
+ * Arbitrary Git hosts remain unavailable rather than partially automated.
  */
 export const UNSUPPORTED_TRACKER_REASON =
-  "This Workflow root does not use a supported tracker. Matt Auto V1 requires a GitHub remote accessible through the gh CLI. Non-GitHub roots are unavailable rather than partially automated.";
+  "This Workflow root does not use a supported tracker. Matt Auto supports a GitHub origin through gh or an explicitly configured Forgejo root (.pi/matt-auto/forge.json). Other Git hosts are unavailable rather than partially automated.";
 
 /**
  * Explanation when the start path is not inside any Git repository.

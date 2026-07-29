@@ -169,7 +169,7 @@ function createSkillsHost(
       }
 
       ui.notify(
-        "Running installed /skill:to-spec in Workflow home (no GitHub publish yet)…",
+        "Running installed /skill:to-spec in Workflow home (no tracker publish yet)…",
         "info",
       );
       log?.info("runCreateSpec:start");
@@ -221,11 +221,11 @@ function createSkillsHost(
           ok: false,
           reason:
             texts.length === 0
-              ? "Create-spec did not receive any assistant reply after invoking to-spec (turn wait timed out or never started). Retry Create-spec or /matt-auto run. Nothing was published to GitHub."
+              ? "Create-spec did not receive any assistant reply after invoking to-spec (turn wait timed out or never started). Retry Create-spec or /matt-auto run. Nothing was published to the tracker."
               : [
                   "Create-spec quality gate rejected the assistant Markdown:",
                   validation.issues.join(" "),
-                  "Retry Create-spec or /matt-auto run. Nothing was published to GitHub.",
+                  "Retry Create-spec or /matt-auto run. Nothing was published to the tracker.",
                 ].join(" "),
         };
       }
@@ -252,7 +252,7 @@ function createSkillsHost(
       }
 
       ui.notify(
-        `Running installed /skill:to-tickets for Workflow #${input.workflowId} (no GitHub publish yet)…`,
+        `Running installed /skill:to-tickets for Workflow #${input.workflowId} (no tracker publish yet)…`,
         "info",
       );
       log?.info("runCreateTickets:start", {
@@ -321,7 +321,7 @@ function createSkillsHost(
       return {
         ok: false,
         reason:
-          "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block after 2 attempts (markers required). Retry Create-tickets. Nothing was published to GitHub.",
+          "Create-tickets finished but Matt Auto could not parse a valid ---MATT-AUTO-TICKETS-DRAFT--- JSON block after 2 attempts (markers required). Retry Create-tickets. Nothing was published to the tracker.",
       };
     },
   };
@@ -550,7 +550,7 @@ export default function mattAutoExtension(pi: ExtensionAPI) {
       typeof ctx.ui.confirm === "function"
         ? await ctx.ui.confirm(
             "Pause Matt Auto pipeline?",
-            "Abort session-owned workers and stop auto-advance. GitHub state is unchanged. Resume or Terminate from the control menu afterward.",
+            "Abort session-owned workers and stop auto-advance. Tracker state is unchanged. Resume or Terminate from the control menu afterward.",
           )
         : true;
     if (!confirm) {

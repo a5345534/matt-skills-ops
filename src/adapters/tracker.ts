@@ -13,6 +13,8 @@ import {
   DEFAULT_TRACKER_GH_TIMEOUT_MS,
   WORKFLOW_MANIFEST_MARKER,
 } from "../constants.js";
+import { createForgeResolver } from "./forge.js";
+import { createForgejoTrackerPort } from "./forgejo-tracker.js";
 import type { TrackerPort, TrackerTicket } from "../ports.js";
 import {
   buildBatchedListTicketsQuery,
@@ -360,7 +362,7 @@ async function resolveIssueNodeId(
  * Real TrackerPort backed by `gh` in a Workflow root.
  * Creates issues, native blocked-by edges, sub-issues, and managed manifests.
  */
-export function createTrackerPort(cwd: string): TrackerPort {
+export function createGitHubTrackerPort(cwd: string): TrackerPort {
   async function loadIssueComments(
     repository: CanonicalRepositoryIdentity,
     issueNumber: number,
@@ -1192,6 +1194,92 @@ ${rulesResult.stdout}`;
   }
 
   return policy;
+}
+
+/**
+ * Select the tracker from this root's configured forge. GitHub remains a
+ * first-class legacy path until existing GitHub workflows, including #53,
+ * complete; a Forgejo root never invokes `gh`.
+ */
+export function createTrackerPort(cwd: string): TrackerPort {
+  const resolveForge = createForgeResolver(cwd);
+  let delegate: Promise<TrackerPort> | undefined;
+
+  const resolveDelegate = (): Promise<TrackerPort> => {
+    if (!delegate) {
+      delegate = resolveForge().then((forge) => {
+        if (forge.provider === "github") return createGitHubTrackerPort(cwd);
+        if (forge.provider === "forgejo") {
+          return createForgejoTrackerPort(forge.connection);
+        }
+        throw new Error(forge.reason);
+      });
+    }
+    return delegate;
+  };
+
+  const port: TrackerPort = {
+    async getCanonicalRepositoryIdentity() {
+      const tracker = await resolveDelegate();
+      return tracker.getCanonicalRepositoryIdentity?.();
+    },
+    async createIssue(input) {
+      return (await resolveDelegate()).createIssue(input);
+    },
+    async writeWorkflowManifest(issueNumber, manifest) {
+      return (await resolveDelegate()).writeWorkflowManifest(issueNumber, manifest);
+    },
+    async findActiveWorkflows(target) {
+      return (await resolveDelegate()).findActiveWorkflows(target);
+    },
+    async findActiveWorkflowsForRepository(repository) {
+      const tracker = await resolveDelegate();
+      return tracker.findActiveWorkflowsForRepository?.(repository) ?? [];
+    },
+    async findActiveWorkflow(targetBranch, hintWorkflowId) {
+      return (await resolveDelegate()).findActiveWorkflow(
+        targetBranch,
+        hintWorkflowId,
+      );
+    },
+    async listTickets(issueNumbers) {
+      return (await resolveDelegate()).listTickets(issueNumbers);
+    },
+    async addBlockedBy(issueNumber, blockerIssueNumber) {
+      return (await resolveDelegate()).addBlockedBy(issueNumber, blockerIssueNumber);
+    },
+    async addSubIssue(parentIssueNumber, childIssueNumber) {
+      return (await resolveDelegate()).addSubIssue(
+        parentIssueNumber,
+        childIssueNumber,
+      );
+    },
+    async closeIssue(issueNumber, options) {
+      return (await resolveDelegate()).closeIssue(issueNumber, options);
+    },
+    async reopenIssue(issueNumber) {
+      return (await resolveDelegate()).reopenIssue(issueNumber);
+    },
+    async createPullRequest(input) {
+      return (await resolveDelegate()).createPullRequest(input);
+    },
+    async inspectProtectedBranchAutomation(input) {
+      const tracker = await resolveDelegate();
+      if (!tracker.inspectProtectedBranchAutomation) return {};
+      return tracker.inspectProtectedBranchAutomation(input);
+    },
+    async getPullRequestFreshness(input) {
+      const tracker = await resolveDelegate();
+      if (!tracker.getPullRequestFreshness) {
+        throw new Error("Selected tracker cannot read Workflow PR freshness.");
+      }
+      return tracker.getPullRequestFreshness(input);
+    },
+    async mergePullRequest(input) {
+      return (await resolveDelegate()).mergePullRequest(input);
+    },
+  };
+  return port;
 }
 
 /** True when GitHub refuses protection/ruleset APIs due to plan/visibility limits. */

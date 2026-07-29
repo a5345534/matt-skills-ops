@@ -154,7 +154,11 @@ function isIsoInstant(value: unknown): value is string {
 function cloneRepository(
   repository: CanonicalRepositoryIdentity,
 ): CanonicalRepositoryIdentity {
-  return { owner: repository.owner, name: repository.name };
+  return {
+    owner: repository.owner,
+    name: repository.name,
+    ...(repository.forge ? { forge: { ...repository.forge } } : {}),
+  };
 }
 
 function cloneTarget(target: CanonicalTargetIdentity): CanonicalTargetIdentity {

@@ -733,8 +733,8 @@ function sortedPreflightChecks(
   preflight: PreflightResult,
 ): PreflightResult["checks"][number][] {
   const order: readonly PreflightCheckId[] = [
-    "github-remote",
-    "gh-auth",
+    "tracker-remote",
+    "tracker-auth",
     "target-branch",
     "matt-skills",
     "worker-profile",

@@ -66,8 +66,8 @@ function createEnvironment(
   overrides: Partial<EnvironmentPort> = {},
 ): EnvironmentPort {
   return {
-    hasGitHubRemote: async () => true,
-    isGhAuthenticated: async () => true,
+    hasSupportedTrackerRemote: async () => true,
+    isTrackerAuthenticated: async () => true,
     targetBranchExists: async () => true,
     detectDefaultBranch: async () => "main",
     ...overrides,
@@ -1237,7 +1237,7 @@ function createPorts(
 }
 
 describe("Workflow coordinator preflight", () => {
-  it("passes when GitHub remote, gh auth, Target branch, Matt skills, and Worker profile are present", async () => {
+  it("passes when tracker remote/auth, Target branch, Matt skills, and Worker profile are present", async () => {
     const coordinator = createWorkflowCoordinator(createPorts());
 
     const result = await coordinator.preflight();
@@ -1245,8 +1245,8 @@ describe("Workflow coordinator preflight", () => {
     expect(result.ok).toBe(true);
     expect(result.targetBranch).toBe(DEFAULT_TARGET_BRANCH);
     expect(result.checks.map((c) => c.id)).toEqual([
-      "github-remote",
-      "gh-auth",
+      "tracker-remote",
+      "tracker-auth",
       "target-branch",
       "matt-skills",
       "worker-profile",
@@ -1297,41 +1297,41 @@ describe("Workflow coordinator preflight", () => {
     expect(result.targetBranch).toBe("develop");
   });
 
-  it("fails closed when there is no GitHub remote and offers corrective guidance", async () => {
+  it("fails closed when there is no supported tracker remote and offers corrective guidance", async () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
-          environment: { hasGitHubRemote: async () => false },
+          environment: { hasSupportedTrackerRemote: async () => false },
           preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
 
     const result = await coordinator.preflight();
-    const check = result.checks.find((c) => c.id === "github-remote");
+    const check = result.checks.find((c) => c.id === "tracker-remote");
 
     expect(result.ok).toBe(false);
     expect(check?.ok).toBe(false);
-    expect(check?.guidance).toMatch(/GitHub remote/i);
+    expect(check?.guidance).toMatch(/supported tracker/i);
     expect(check?.guidance).not.toMatch(/git init|create repository|push/i);
   });
 
-  it("fails closed when gh is not authenticated and guides login", async () => {
+  it("fails closed when the selected tracker is not authenticated", async () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
-          environment: { isGhAuthenticated: async () => false },
+          environment: { isTrackerAuthenticated: async () => false },
           preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
     );
 
     const result = await coordinator.preflight();
-    const check = result.checks.find((c) => c.id === "gh-auth");
+    const check = result.checks.find((c) => c.id === "tracker-auth");
 
     expect(result.ok).toBe(false);
     expect(check?.ok).toBe(false);
-    expect(check?.guidance).toMatch(/gh auth login/i);
+    expect(check?.guidance).toMatch(/not authenticated/i);
   });
 
   it("fails closed when the Target branch does not exist", async () => {
@@ -1820,7 +1820,7 @@ describe("Workflow coordinator Next actions", () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
-          environment: { hasGitHubRemote: async () => false },
+          environment: { hasSupportedTrackerRemote: async () => false },
           preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
@@ -2100,7 +2100,7 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
     const coordinator = createWorkflowCoordinator(
       createPorts({
         defaultRoot: {
-          environment: { hasGitHubRemote: async () => false },
+          environment: { hasSupportedTrackerRemote: async () => false },
           preferences: { globalWorkerProfile: defaultWorkerProfile },
           tracker,
         },
@@ -2368,7 +2368,7 @@ describe("Workflow coordinator root selection", () => {
         startPath: "/gitlab-only",
         topology: createTopology({ nearest: "/gitlab-only" }),
         defaultRoot: {
-          environment: { hasGitHubRemote: async () => false },
+          environment: { hasSupportedTrackerRemote: async () => false },
           preferences: { globalWorkerProfile: defaultWorkerProfile },
         },
       }),
@@ -2398,7 +2398,7 @@ describe("Workflow coordinator root selection", () => {
             preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/legacy-gitlab": {
-            environment: { hasGitHubRemote: async () => false },
+            environment: { hasSupportedTrackerRemote: async () => false },
             preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/product": {
@@ -2428,7 +2428,7 @@ describe("Workflow coordinator root selection", () => {
         }),
         roots: {
           "/workspace": {
-            environment: { hasGitHubRemote: async () => false },
+            environment: { hasSupportedTrackerRemote: async () => false },
             preferences: { globalWorkerProfile: defaultWorkerProfile },
           },
           "/workspace/services/api": {
@@ -2483,7 +2483,7 @@ describe("Workflow coordinator root selection", () => {
         startPath,
         topology: createTopology({ nearest: undefined, nested: [] }),
         defaultRoot: {
-          environment: { hasGitHubRemote: async () => false },
+          environment: { hasSupportedTrackerRemote: async () => false },
           preferences: {},
         },
       }),

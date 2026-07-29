@@ -566,8 +566,8 @@ function createHome(input: {
 
   const root: RootScopedPorts = {
     environment: {
-      hasGitHubRemote: async () => true,
-      isGhAuthenticated: async () => true,
+      hasSupportedTrackerRemote: async () => true,
+      isTrackerAuthenticated: async () => true,
       targetBranchExists: async () => true,
       detectDefaultBranch: async () => "main",
     },

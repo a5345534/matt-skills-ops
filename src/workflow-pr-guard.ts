@@ -41,22 +41,22 @@ export type BranchProtectionObservation =
   | "configured-non-strict"
   /** Feature available; no classic protection and no applicable rulesets. */
   | "absent"
-  /** GitHub refused inspection (private free / Pro-or-public 403). */
+  /** The forge refused policy inspection because of plan or visibility limits. */
   | "plan-limited"
   /** Inspection failed for an unknown reason. */
   | "unknown-error";
 
 /** Observed repository + branch policy used by Workflow preflight. */
 export type ProtectedBranchAutomationPolicy = {
-  /** Canonical GitHub owner/name, when resolved. */
+  /** Canonical forge owner/name, when resolved. */
   repository?: CanonicalRepositoryIdentity;
   /** Fully qualified Target ref, when known. */
   targetRef?: string;
   /** True when reserved coordination refs are writable by this home. */
   coordinationRefsWritable?: boolean;
   /**
-   * Required status-check configuration. `strict: true` is the GitHub
-   * "require branches to be up to date before merging" guarantee Matt Auto needs.
+   * Required status-check configuration. `strict: true` means the forge
+   * requires branches to be up to date before automatic merging.
    */
   requiredStatusChecks?: {
     strict: boolean;
@@ -71,11 +71,11 @@ export type ProtectedBranchAutomationPolicy = {
    * PR freshness and never invents a hard-coded strategy.
    */
   preferredMergeMethod?: WorkflowMergeMethod;
-  /** True when GitHub's native merge queue is the required delivery path. */
+  /** True when a forge-native merge queue is the required delivery path. */
   mergeQueueRequired?: boolean;
   /**
    * True when the authenticated actor can merge without human approval or a
-   * manual GitHub UI step.
+   * manual forge UI step.
    */
   actorCanMergeWithoutApproval?: boolean;
   /**
@@ -240,7 +240,7 @@ export function evaluateProtectedBranchAutomation(
     ok: hasRepository,
     guidance: hasRepository
       ? `Canonical repository ${policy.repository!.owner}/${policy.repository!.name} is resolved.`
-      : "Could not resolve the canonical GitHub repository owner/name for this Workflow root. Matt Auto will not invent a repository identity.",
+      : "Could not resolve the canonical forge repository owner/name for this Workflow root. Matt Auto will not invent a repository identity.",
   });
 
   const coordinationOk = policy.coordinationRefsWritable === true;
@@ -297,7 +297,7 @@ export function evaluateProtectedBranchAutomation(
       ok: true,
       guidance:
         observation === "plan-limited"
-          ? "Branch protection / ruleset APIs are unavailable on this repository plan (GitHub returned 403 Pro-or-public). Matt Auto will not ask you to enable settings that this plan cannot configure. Degraded automation is used when merge authority is otherwise satisfied."
+          ? "Branch protection APIs are unavailable on this forge plan or visibility tier (the tracker returned 403). Matt Auto will not ask you to enable settings that this installation cannot configure. Degraded automation is used when merge authority is otherwise satisfied."
           : "No branch protection or rulesets were observed on the Target branch. Strict stale-base is not guaranteed. Degraded automation is used when merge authority is otherwise satisfied; enable required status checks with up-to-date heads when your plan supports them for stronger guarantees.",
     });
   }
@@ -327,7 +327,7 @@ export function evaluateProtectedBranchAutomation(
       "Authenticated identity can merge Workflow PRs non-interactively without manual approval.";
   } else if (!mergeQueueOk) {
     authorityGuidance =
-      "Target branch requires GitHub's native merge queue, which is unsupported for Matt Auto automatic delivery. Use branch protection with required checks instead, or finish delivery manually.";
+      "Target branch requires a forge-native merge queue, which is unsupported for Matt Auto automatic delivery. Use branch protection with required checks instead, or finish delivery manually.";
   } else if (requiredApprovals > 0) {
     authorityGuidance = `Target branch requires ${requiredApprovals} approving review(s). Matt Auto will not bypass review requirements; automatic merge is incompatible until required approvals are removed for the automation identity or delivery stays manual.`;
   } else if (!actorOk) {

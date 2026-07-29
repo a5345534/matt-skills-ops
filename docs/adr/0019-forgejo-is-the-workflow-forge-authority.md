@@ -1,0 +1,3 @@
+# Forgejo is the workflow forge authority
+
+New Matt Auto workflows use the local Forgejo instance as the authoritative forge for repository history, issues, dependencies, manifests, pull requests, branch policy, and Forgejo Actions CI. GitHub remains a legacy adapter only until Workflow #53 finishes there; workflows are never continued across forges. Forgejo v12 has no native sub-issue REST relationship, so the managed Workflow manifest is authoritative for ticket membership and Forgejo dependencies represent blocker relationships. We chose a provider-aware canonical identity and adapter boundary over a remote-only swap so same-named GitHub and Forgejo repositories cannot share bindings or coordination leases accidentally.

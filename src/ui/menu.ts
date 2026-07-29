@@ -337,7 +337,7 @@ const CONFIRM_TERMINATE_ITEM = "Confirm Terminate";
 const CONFIRM_EMERGENCY_STOP_ITEM = "Confirm Emergency stop";
 const DECLINE_CONFIRM_ITEM = "Cancel";
 
-/** Pause confirmation body (bound workflow only; GitHub untouched; workers abort). */
+/** Pause confirmation body (bound workflow only; tracker state untouched; workers abort). */
 export function pauseConfirmMessage(workflowId: number): string {
   return [
     `Confirm Pause for Workflow #${workflowId}?`,
@@ -345,7 +345,7 @@ export function pauseConfirmMessage(workflowId: number): string {
     "• Release this workflow's worker slots and any held Target-branch lease",
     "• Stop auto-advance for this Matt Auto run",
     "• Sibling workflows are not interrupted",
-    "• GitHub issues, labels, manifests, and integrated history stay untouched",
+    "• Tracker issues, labels, manifests, and integrated history stay untouched",
   ].join("\n");
 }
 
@@ -393,7 +393,7 @@ export function emergencyStopConfirmMessage(workflowId: number): string {
     "• Abort this home's session-owned workers and end the run",
     "• Release this home's worker slots, any held Target-branch lease, and the Workflow coordinator lease",
     "• Sibling homes are not directly controlled (fencing prevents releasing leases this home does not hold)",
-    "• GitHub integrated history is not rewritten",
+    "• Tracker integrated history is not rewritten",
   ].join("\n");
 }
 
@@ -611,7 +611,7 @@ async function applyPauseAlreadyConfirmed(
     [
       `Pipeline paused for Workflow #${workflowId}.`,
       `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
-      "GitHub workflow state is unchanged. Choose Resume or Terminate.",
+      "Tracker workflow state is unchanged. Choose Resume or Terminate.",
     ].join("\n"),
     "warning",
   );
@@ -871,7 +871,7 @@ export async function waitForPipelineWorkers(
     options.offerRunningControls !== false && !skipLiveSurface;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
-  // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
+  // Full tracker refresh once; subsequent ticks use local workers + cached tickets
   // so wait loops do not burn GraphQL quota every poll.
   const initialPanel = await coordinator.getPanelState({ mode: "full" });
   const initialRunning = runningWorkers(initialPanel);
@@ -1771,8 +1771,8 @@ function parseHomeUnfinishedItem(selected: string): number | undefined {
 }
 
 /**
- * Fast Matt Auto home: local prefs/transcripts only — never GitHub.
- * Drill-in opens the workflow surface (GitHub) for one selected unfinished id.
+ * Fast Matt Auto home: local prefs/transcripts only — never the tracker.
+ * Drill-in opens the workflow surface for one selected unfinished id.
  */
 export async function presentMattAutoHome(
   coordinator: WorkflowCoordinator,
@@ -1894,7 +1894,7 @@ async function presentSelectedWorkflowMenu(
 }
 
 /**
- * List Active workflows on the current Target (GitHub) and Resume/take over one.
+ * List Active workflows on the current Target and Resume/take over one.
  * Used from a selected-workflow menu and from the dashboard routing row.
  */
 export async function presentTakeOverWorkflowMenu(
@@ -2159,7 +2159,7 @@ export async function presentMainMenu(
   ui: MattAutoUi,
   pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
-  // Home is local-first and never opens the GitHub-backed dashboard immediately.
+  // Home is local-first and never opens the tracker-backed dashboard immediately.
   await presentMattAutoHome(coordinator, ui, pipelineOptions);
 }
 

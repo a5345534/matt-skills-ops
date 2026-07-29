@@ -4,15 +4,32 @@ import type {
 } from "./types.js";
 
 const HEADS_REF_PREFIX = "refs/heads/";
-const GITHUB_NAME_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const FORGE_NAME_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const INVALID_BRANCH_CHARACTER = /[\x00-\x20~^:?*\[\\]/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isGitHubNameSegment(value: unknown): value is string {
-  return typeof value === "string" && GITHUB_NAME_SEGMENT.test(value);
+function isForgeNameSegment(value: unknown): value is string {
+  return typeof value === "string" && FORGE_NAME_SEGMENT.test(value);
+}
+
+function isForgeIdentity(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.provider !== "forgejo" || typeof value.baseUrl !== "string") {
+    return false;
+  }
+  try {
+    const url = new URL(value.baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    url.hash = "";
+    url.search = "";
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString().replace(/\/$/, "") === value.baseUrl;
+  } catch {
+    return false;
+  }
 }
 
 function isValidBranchName(value: string): boolean {
@@ -31,14 +48,19 @@ function isValidBranchName(value: string): boolean {
 }
 
 /**
- * Runtime validation for the GitHub owner/name identity used for coordination.
- * It deliberately excludes paths, remote aliases, and whitespace.
+ * Runtime validation for a forge owner/name identity used for coordination.
+ * It deliberately excludes paths, remote aliases, and whitespace. Omitted
+ * `forge` remains the legacy GitHub.com representation.
  */
 export function isCanonicalRepositoryIdentity(
   value: unknown,
 ): value is CanonicalRepositoryIdentity {
   if (!isRecord(value)) return false;
-  return isGitHubNameSegment(value.owner) && isGitHubNameSegment(value.name);
+  return (
+    isForgeNameSegment(value.owner) &&
+    isForgeNameSegment(value.name) &&
+    (value.forge === undefined || isForgeIdentity(value.forge))
+  );
 }
 
 /** Whether a value is a fully qualified branch ref suitable for Target identity. */
@@ -80,11 +102,18 @@ export function targetBranchFromRef(targetRef: string): string | undefined {
   return targetRef.slice(HEADS_REF_PREFIX.length);
 }
 
-/** Stable comparison key for a GitHub repository identity. */
+/**
+ * Stable comparison key for a forge repository identity.
+ *
+ * The legacy GitHub key intentionally remains owner/name so existing bindings
+ * and remote coordination refs retain their identity while old workflows close.
+ */
 export function canonicalRepositoryIdentityKey(
   repository: CanonicalRepositoryIdentity,
 ): string {
-  return `${repository.owner.toLowerCase()}/${repository.name.toLowerCase()}`;
+  const repositoryPath = `${repository.owner.toLowerCase()}/${repository.name.toLowerCase()}`;
+  if (!repository.forge) return repositoryPath;
+  return `${repository.forge.provider}:${repository.forge.baseUrl}/${repositoryPath}`;
 }
 
 /** Stable comparison key for a canonical repository and Target ref. */

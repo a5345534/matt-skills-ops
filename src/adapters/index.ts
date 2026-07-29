@@ -48,12 +48,37 @@ export {
   activeWorkflowFromManifest,
   activeWorkflowsFromIssues,
   coordinatedActiveWorkflowsFromIssues,
+  createGitHubTrackerPort,
   createTrackerPort,
   formatWorkflowManifestComment,
   parseWorkflowManifestComment,
   workflowManifestMatchesTarget,
 } from "./tracker.js";
 export type { WorkflowManifestIssue } from "./tracker.js";
+export {
+  FORGE_CONFIG_RELATIVE_PATH,
+  createForgeResolver,
+  parseGitRemoteUrl,
+  resolveForge,
+  resolveForgejoToken,
+} from "./forge.js";
+export type {
+  ForgejoConnection,
+  ForgeProvider,
+  ForgeResolution,
+} from "./forge.js";
+export {
+  createForgejoApiClient,
+  ForgejoApiError,
+} from "./forgejo-api.js";
+export type {
+  ForgejoApiClient,
+  ForgejoApiClientOptions,
+  ForgejoQueryValue,
+  ForgejoRequest,
+} from "./forgejo-api.js";
+export { createForgejoTrackerPort } from "./forgejo-tracker.js";
+export type { ForgejoTrackerPortOptions } from "./forgejo-tracker.js";
 export { createGitTopologyPort } from "./topology.js";
 export {
   createWorkspacePort,
@@ -89,7 +114,9 @@ export type {
   CoordinationPortOptions,
   InMemoryCoordinationPortOptions,
 } from "./coordination.js";
-export { createCiPort } from "./ci.js";
+export { createCiPort, createGitHubCiPort } from "./ci.js";
+export { createForgejoCiPort } from "./forgejo-ci.js";
+export type { ForgejoCiPortOptions } from "./forgejo-ci.js";
 export {
   InMemoryWorkflowHomeLockStore,
   createInMemoryWorkflowHomeLockPort,

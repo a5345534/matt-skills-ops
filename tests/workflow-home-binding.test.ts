@@ -223,8 +223,8 @@ function createCoordinator(input: {
   const pref = createPreferences(input.preferences);
   const root: RootScopedPorts = {
     environment: {
-      hasGitHubRemote: async () => true,
-      isGhAuthenticated: async () => true,
+      hasSupportedTrackerRemote: async () => true,
+      isTrackerAuthenticated: async () => true,
       targetBranchExists: async () => true,
       detectDefaultBranch: async () => "main",
     },

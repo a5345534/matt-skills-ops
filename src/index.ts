@@ -11,6 +11,24 @@ export {
   workflowManifestMatchesTarget,
 } from "./adapters/workflow-manifest.js";
 export {
+  FORGE_CONFIG_RELATIVE_PATH,
+  createForgeResolver,
+  createForgejoApiClient,
+  createForgejoCiPort,
+  createForgejoTrackerPort,
+  parseGitRemoteUrl,
+  resolveForge,
+  resolveForgejoToken,
+} from "./adapters/index.js";
+export type {
+  ForgejoApiClient,
+  ForgejoConnection,
+  ForgejoCiPortOptions,
+  ForgejoTrackerPortOptions,
+  ForgeProvider,
+  ForgeResolution,
+} from "./adapters/index.js";
+export {
   buildDashboardActionPromptView,
   buildDashboardActionResultView,
   createFallbackWorkflowActionInteraction,
@@ -263,6 +281,7 @@ export type {
   AvailableModel,
   CanonicalRepositoryIdentity,
   CanonicalTargetIdentity,
+  ForgeIdentity,
   CiRecoveryDecision,
   CiStatus,
   CoordinationLease,

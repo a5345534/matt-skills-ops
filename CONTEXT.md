@@ -17,8 +17,12 @@ A stage that is currently available from the persisted workflow state; `matt-aut
 _Avoid_: next step, command list
 
 **Workflow state**:
-The durable facts used to determine available Next actions. GitHub issues, labels, blocking edges, and completion status are authoritative; local data is a rebuildable cache for UI preferences and session lineage.
+The durable facts used to determine available Next actions. Forge issues, labels, blocking edges, manifests, and completion status are authoritative; local data is a rebuildable cache for UI preferences and session lineage.
 _Avoid_: local workflow state, session state
+
+**Workflow forge**:
+The hosted forge that owns a workflow's repository, issues, pull requests, policy, and CI. New workflows use Forgejo; GitHub remains only the legacy forge while Workflow #53 completes.
+_Avoid_: Git remote only, interchangeable tracker
 
 **Stage confirmation**:
 The one interactive approval presented after a stage produces a reviewable artifact. It authorizes the stage’s publication or launch and offers revise or cancel instead of per-operation confirmations.
@@ -73,7 +77,7 @@ The post-merge disposal of a completed workflow’s local workspaces, transcript
 _Avoid_: local-only cleanup, orphan remote branches, leaving parent spec open after successful cleanup, silent git pull of the Workflow root
 
 **CI gate**:
-The GitHub Actions verification required before an integrated ticket can close and unblock dependents. Pending CI returns control to Workflow home; Matt Auto checks it only when a user requests the next action.
+The workflow forge's Actions verification required before an integrated ticket can close and unblock dependents. Pending CI returns control to Workflow home; Matt Auto checks it only when a user requests the next action.
 _Avoid_: blocking wait, background polling
 
 **Local verification**:
@@ -85,11 +89,11 @@ The configured branch that receives a completed workflow. Matt Auto defaults it 
 _Avoid_: inferred default branch, remote alias as identity
 
 **Canonical Target identity**:
-The pair of GitHub's canonical repository owner/name and one fully qualified Target ref. It is independent of a local path, checkout, or Git remote alias.
+The workflow forge instance and canonical repository owner/name paired with one fully qualified Target ref. It is independent of a local path, checkout, or Git remote alias.
 _Avoid_: local repository identity, bare branch name as coordination scope
 
 **Workflow PR**:
-The single GitHub pull request from an Integration branch to the Target branch after all workflow tickets have integrated and passed CI. Matt Auto offers its merge as a Next action.
+The single forge pull request from an Integration branch to the Target branch after all workflow tickets have integrated and passed CI. Matt Auto offers its merge as a Next action.
 _Avoid_: direct push, per-ticket final PR
 
 **Active workflow**:
@@ -105,7 +109,7 @@ A renewable, fenced remote record that grants one Workflow coordinator, Target b
 _Avoid_: local-process lock, unfenced ownership
 
 **Repository Worker capacity policy**:
-The repository-scoped authoritative limit for simultaneous Implementation workers across coordination-aware Workflow homes. It is seeded from existing local concurrency settings once, then shared through GitHub-backed coordination state.
+The repository-scoped authoritative limit for simultaneous Implementation workers across coordination-aware Workflow homes. It is seeded from existing local concurrency settings once, then shared through Git-backed coordination state.
 _Avoid_: per-checkout aggregate capacity, fixed global cap
 
 **Workflow root**:
@@ -117,11 +121,11 @@ The resolution of a Workflow root from the nearest enclosing Git repository, wit
 _Avoid_: implicit child-repository inclusion
 
 **Supported tracker**:
-A GitHub repository accessible through the `gh` CLI. Workflow roots without a supported GitHub remote are unavailable to the MVP rather than partially automated.
-_Avoid_: tracker abstraction, partial non-GitHub support
+An authorized workflow forge repository. New roots use explicitly configured Forgejo; GitHub remains supported only to recover and finish legacy workflows rather than partially migrating them.
+_Avoid_: arbitrary Git host, cross-forge continuation
 
 **Workflow ID**:
-The GitHub issue number of a workflow’s published spec. It identifies the workflow’s tickets, branches, worktrees, and Workflow PR.
+The workflow forge issue number of a workflow’s published spec. It identifies the workflow’s tickets, branches, worktrees, and Workflow PR.
 _Avoid_: local workflow ID, generated opaque ID
 
 **Rework attempt**:
@@ -133,7 +137,7 @@ A background, isolated Pi process that runs `/implement` for one ticket in its I
 _Avoid_: visible child session, shared agent process
 
 **Session-owned worker**:
-An Implementation worker whose lifetime is bound to the Workflow home Pi process. Shutdown, reload, or Workflow-root switching aborts it cleanly; its GitHub state remains recoverable for a later retry.
+An Implementation worker whose lifetime is bound to the Workflow home Pi process. Shutdown, reload, or Workflow-root switching aborts it cleanly; its forge state remains recoverable for a later retry.
 _Avoid_: durable worker, orphan process
 
 **Worker concurrency**:
@@ -153,19 +157,19 @@ A Worker profile resolves from a global default, then a Workflow-root override, 
 _Avoid_: mutable in-flight worker configuration
 
 **Workflow coordinator**:
-The Workflow home component that owns all remote Git and GitHub writes, including pushing ticket branches, manifests, issue mutations, integration, CI queries, and Workflow PR operations. Implementation workers only modify, test, and commit in local worktrees before reporting a Stage result.
-_Avoid_: worker-owned remote state, distributed GitHub writes
+The Workflow home component that owns all remote Git and forge writes, including pushing ticket branches, manifests, issue mutations, integration, CI queries, and Workflow PR operations. Implementation workers only modify, test, and commit in local worktrees before reporting a Stage result.
+_Avoid_: worker-owned remote state, distributed forge writes
 
 **Worker protocol**:
-The structured Stage-result transport from an Implementation worker to its Workflow coordinator through the worker’s Pi JSON event stream. It carries no GitHub mutation authority.
-_Avoid_: worker GitHub writes, shared mutable state file
+The structured Stage-result transport from an Implementation worker to its Workflow coordinator through the worker’s Pi JSON event stream. It carries no forge mutation authority.
+_Avoid_: worker forge writes, shared mutable state file
 
 **Worker transcript**:
 The local, uncommitted structured JSON event record for a Worker attempt. Matt Auto retains it through the workflow so the panel can show diagnostics, then offers cleanup after merge.
-_Avoid_: GitHub-published transcript, live-only worker output
+_Avoid_: forge-published transcript, live-only worker output
 
 **Workflow preflight**:
-An explicit, full delivery diagnostic for a GitHub Workflow root: Target branch, `gh` authentication, installed skills, Worker profile, canonical repository identity, coordination-ref permissions, repository-configured merge method, strict stale-base / required-check protection, and non-interactive merge authority. It informs the operator but does not globally hide unrelated Next actions.
+An explicit, full delivery diagnostic for a Workflow forge root: tracker authentication, Target branch, installed skills, Worker profile, canonical repository identity, coordination-ref permissions, repository-configured merge method, strict stale-base / required-check protection, and non-interactive merge authority. It informs the operator but does not globally hide unrelated Next actions.
 _Avoid_: every-action global gate, automatic repository bootstrap, silent branch-protection mutation
 
 **Action readiness**:
@@ -185,7 +189,7 @@ The fail-closed recovery state entered when an invoked skill omits an expected S
 _Avoid_: inferred automatic progression
 
 **Workflow manifest**:
-The Matt Auto-managed structured GitHub comment on a workflow’s spec issue. Version 1 records legacy orchestration metadata; coordination-aware versions additionally record Canonical Target identity, PR freshness, queue facts, retry facts, and observed lease generations without altering the spec body.
+The Matt Auto-managed structured forge comment on a workflow’s spec issue. Version 1 records legacy orchestration metadata; coordination-aware versions additionally record Canonical Target identity, PR freshness, queue facts, retry facts, and observed lease generations without altering the spec body.
 _Avoid_: spec-body metadata, state-label proliferation, local coordination authority
 
 **Workflow panel**:
@@ -193,7 +197,7 @@ A persistent, passive Pi TUI surface showing the Active workflow’s live progre
 _Avoid_: forgotten background work, interactive persistent dashboard, one-line-only progress
 
 **Pipeline pause**:
-An operator control that, after confirmation, immediately aborts session-owned workers and stops auto-advance of the current Matt Auto run while leaving GitHub workflow state intact. Resume, after confirmation, continues orchestration in the same Workflow home, preferring to reuse the latest unintegrated Implementation attempt (branch/worktree/commits) rather than the aborted worker conversation.
+An operator control that, after confirmation, immediately aborts session-owned workers and stops auto-advance of the current Matt Auto run while leaving forge workflow state intact. Resume, after confirmation, continues orchestration in the same Workflow home, preferring to reuse the latest unintegrated Implementation attempt (branch/worktree/commits) rather than the aborted worker conversation.
 _Avoid_: SIGSTOP freeze of the worker LLM, token-level dialogue resume, silent pause without confirmation
 
 **Run termination**:

@@ -1762,8 +1762,9 @@ export function createWorkflowCoordinator(
     kind: WorkflowRootKind,
   ): Promise<WorkflowRoot> {
     const { environment } = ports.forRoot(rootPath);
-    const hasGitHubRemote = await environment.hasGitHubRemote();
-    if (!hasGitHubRemote) {
+    const hasSupportedTrackerRemote =
+      await environment.hasSupportedTrackerRemote();
+    if (!hasSupportedTrackerRemote) {
       return {
         path: rootPath,
         kind,
@@ -2031,14 +2032,14 @@ export function createWorkflowCoordinator(
         return {
           supported: true,
           ok: false,
-          reason: "Could not resolve this Workflow root's canonical GitHub owner/name identity.",
+          reason: "Could not resolve this Workflow root's canonical forge owner/name identity.",
         };
       }
       return {
         supported: true,
         ok: true,
         target: {
-          repository: { owner: repository.owner, name: repository.name },
+          repository: { ...repository },
           targetRef,
         },
       };
@@ -2047,7 +2048,7 @@ export function createWorkflowCoordinator(
       return {
         supported: true,
         ok: false,
-        reason: `Could not resolve this Workflow root's canonical GitHub identity: ${message}`,
+        reason: `Could not resolve this Workflow root's canonical forge identity: ${message}`,
       };
     }
   }
@@ -3504,7 +3505,7 @@ export function createWorkflowCoordinator(
       bound.environment,
     );
 
-    // Passive Home/dashboard views must not consume GitHub policy quota or
+    // Passive Home/dashboard views must not consume remote policy quota or
     // turn a final-delivery problem into an all-action pipeline blocker.
     if (scope === "overview") {
       const workerProfile = await resolveWorkerProfile(bound);
@@ -3525,14 +3526,14 @@ export function createWorkflowCoordinator(
     }
 
     const [
-      hasGitHubRemote,
-      isGhAuthenticated,
+      hasSupportedTrackerRemote,
+      isTrackerAuthenticated,
       targetBranchExists,
       installedSkills,
       workerProfile,
     ] = await Promise.all([
-      bound.environment.hasGitHubRemote(),
-      bound.environment.isGhAuthenticated(),
+      bound.environment.hasSupportedTrackerRemote(),
+      bound.environment.isTrackerAuthenticated(),
       bound.environment.targetBranchExists(targetBranch),
       bound.skills.installedSkillNames(),
       resolveWorkerProfile(bound),
@@ -3545,18 +3546,18 @@ export function createWorkflowCoordinator(
 
     const checks: PreflightCheck[] = [
       {
-        id: "github-remote",
-        ok: hasGitHubRemote,
-        guidance: hasGitHubRemote
-          ? "GitHub remote is configured."
-          : "No GitHub remote found on this Workflow root. Add a GitHub remote (for example `origin`) pointing at a GitHub repository. Matt Auto V1 does not create repositories or remotes.",
+        id: "tracker-remote",
+        ok: hasSupportedTrackerRemote,
+        guidance: hasSupportedTrackerRemote
+          ? "A supported tracker remote is configured."
+          : "No supported tracker is configured for this Workflow root. Use a GitHub origin, or configure Forgejo in .pi/matt-auto/forge.json. Matt Auto does not create repositories or remotes.",
       },
       {
-        id: "gh-auth",
-        ok: isGhAuthenticated,
-        guidance: isGhAuthenticated
-          ? "gh is authenticated."
-          : "GitHub CLI is not authenticated. Run `gh auth login` and retry Workflow preflight. Matt Auto V1 does not perform login for you.",
+        id: "tracker-auth",
+        ok: isTrackerAuthenticated,
+        guidance: isTrackerAuthenticated
+          ? "The selected tracker identity is authenticated."
+          : "The selected tracker identity is not authenticated. Authenticate gh for GitHub, or set the configured Forgejo token environment variable/tokenFile, then retry Workflow preflight.",
       },
       {
         id: "target-branch",
@@ -3889,7 +3890,7 @@ export function createWorkflowCoordinator(
             id: ciRecoveryActionId(n, "leave-open"),
             label: `Leave open #${n}`,
             description:
-              "Dismiss CI recovery and leave the GitHub ticket open. Check CI remains available later.",
+              "Dismiss CI recovery and leave the tracker ticket open. Check CI remains available later.",
           },
         );
       }
@@ -4412,7 +4413,7 @@ export function createWorkflowCoordinator(
       return {
         status: "failed",
         stage: "create-tickets",
-        reason: "Could not compute ticket progress from GitHub state.",
+        reason: "Could not compute ticket progress from tracker state.",
       };
     }
 
@@ -4520,7 +4521,7 @@ export function createWorkflowCoordinator(
       return {
         status: "failed",
         stage: "create-spec",
-        reason: `Failed to create the GitHub spec issue: ${message}`,
+        reason: `Failed to create the tracker spec issue: ${message}`,
       };
     }
 
@@ -7762,7 +7763,7 @@ export function createWorkflowCoordinator(
     if (!ticket) {
       return {
         ok: false,
-        reason: `Ticket #${ticketNumber} was not found on GitHub.`,
+        reason: `Ticket #${ticketNumber} was not found on the tracker.`,
       };
     }
     if (ticket.state === "CLOSED") {
@@ -9148,7 +9149,7 @@ export function createWorkflowCoordinator(
       return {
         status: "failed",
         stage: "rework",
-        reason: `Ticket #${ticketNumber} was not found on GitHub.`,
+        reason: `Ticket #${ticketNumber} was not found on the tracker.`,
         ticketNumber,
       };
     }

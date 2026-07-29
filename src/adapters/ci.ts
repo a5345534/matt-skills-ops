@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { CiCheckResult, CiPort } from "../ports.js";
+import { createForgeResolver } from "./forge.js";
+import { createForgejoCiPort } from "./forgejo-ci.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,7 +43,7 @@ type GhRun = {
 };
 
 /** On-demand GitHub Actions CI gate. Never polls in a loop. */
-export function createCiPort(workflowRoot: string): CiPort {
+export function createGitHubCiPort(workflowRoot: string): CiPort {
   const rootPath = path.resolve(workflowRoot);
   return {
     async checkStatus(input): Promise<CiCheckResult> {
@@ -123,6 +125,27 @@ export function createCiPort(workflowRoot: string): CiPort {
           latest?.name ||
           `CI succeeded on ${input.branchName}`,
       };
+    },
+  };
+}
+
+/** Select GitHub Actions or Forgejo Actions from the root's forge config. */
+export function createCiPort(workflowRoot: string): CiPort {
+  const resolveForge = createForgeResolver(workflowRoot);
+  let delegate: Promise<CiPort> | undefined;
+  const resolveDelegate = (): Promise<CiPort> => {
+    if (!delegate) {
+      delegate = resolveForge().then((forge) => {
+        if (forge.provider === "github") return createGitHubCiPort(workflowRoot);
+        if (forge.provider === "forgejo") return createForgejoCiPort(forge.connection);
+        throw new Error(forge.reason);
+      });
+    }
+    return delegate;
+  };
+  return {
+    async checkStatus(input) {
+      return (await resolveDelegate()).checkStatus(input);
     },
   };
 }

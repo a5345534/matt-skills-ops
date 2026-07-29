@@ -134,7 +134,7 @@ export function buildDashboardActionPromptView(
     const lines = [
       `Branch: ${prompt.branchName}`,
       ...(prompt.summary ? [`Summary: ${prompt.summary}`] : []),
-      "Close starts Integration later and does not close the GitHub ticket yet.",
+      "Close starts Integration later and does not close the tracker ticket yet.",
     ];
     if (prompt.worktreePath) {
       lines.splice(1, 0, `Worktree: ${prompt.worktreePath}`);
@@ -808,7 +808,7 @@ function isImplementationDispositionDecision(
 function fallbackPromptMessage(prompt: WorkflowActionPrompt): string {
   if (prompt.kind === "implementation-disposition") {
     const summary = prompt.summary ? `\n${prompt.summary}` : "";
-    return `Implementation disposition for #${prompt.ticketNumber} (r${prompt.attempt}) on ${prompt.branchName}.${summary}\nClose starts Integration later and does not close the GitHub ticket yet.`;
+    return `Implementation disposition for #${prompt.ticketNumber} (r${prompt.attempt}) on ${prompt.branchName}.${summary}\nClose starts Integration later and does not close the tracker ticket yet.`;
   }
 
   if (prompt.stage === "create-spec") {

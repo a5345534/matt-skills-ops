@@ -249,6 +249,9 @@ function parseWorkflowCoordinationFacts(
       repository: {
         owner: value.target.repository.owner,
         name: value.target.repository.name,
+        ...(value.target.repository.forge
+          ? { forge: { ...value.target.repository.forge } }
+          : {}),
       },
       targetRef: value.target.targetRef,
     },

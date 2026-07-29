@@ -7,8 +7,8 @@ export type PreflightScope =
 
 /** Preflight check identifiers for Workflow preflight. */
 export type PreflightCheckId =
-  | "github-remote"
-  | "gh-auth"
+  | "tracker-remote"
+  | "tracker-auth"
   | "target-branch"
   | "matt-skills"
   | "worker-profile"
@@ -181,10 +181,26 @@ export type WorkflowPrRef = {
   baseBranch: string;
 };
 
-/** GitHub repository identity, resolved from GitHub owner/name rather than a local remote alias. */
+/**
+ * A non-GitHub forge instance recorded on a canonical repository identity.
+ * Omitted means the legacy GitHub.com identity, preserving existing manifests
+ * and coordination-ref keys while GitHub workflows finish their lifecycle.
+ */
+export type ForgeIdentity = {
+  provider: "forgejo";
+  /** Normalized public API/web base URL, without a trailing slash. */
+  baseUrl: string;
+};
+
+/**
+ * Repository identity resolved from its forge owner/name rather than a local
+ * remote alias. `forge` distinguishes a Forgejo repository from a legacy
+ * GitHub repository with the same owner/name.
+ */
 export type CanonicalRepositoryIdentity = {
   owner: string;
   name: string;
+  forge?: ForgeIdentity;
 };
 
 /** One repository Target branch, always expressed as a fully qualified Git ref. */

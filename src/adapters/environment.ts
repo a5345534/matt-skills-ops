@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { EnvironmentPort } from "../ports.js";
+import { createForgeResolver } from "./forge.js";
+import { createForgejoApiClient } from "./forgejo-api.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,30 +32,45 @@ async function run(
   }
 }
 
+/** Process-level cache so every /matt-auto open does not re-hit auth endpoints. */
+const trackerAuthCache = new Map<string, { ok: boolean; at: number }>();
+const TRACKER_AUTH_TTL_MS = 60_000;
+
 /**
- * Real EnvironmentPort backed by git and gh in a Workflow root.
+ * Real EnvironmentPort backed by a supported forge, git, and its auth API.
  * Does not create remotes, authenticate, or invent branches.
  */
-// Process-level caches so every /matt-auto open does not re-hit network.
-const ghAuthCache = new Map<string, { ok: boolean; at: number }>();
-const GH_AUTH_TTL_MS = 60_000;
-
 export function createEnvironmentPort(cwd: string): EnvironmentPort {
+  const resolveForge = createForgeResolver(cwd);
+
   return {
-    async hasGitHubRemote() {
-      const result = await run(cwd, "git", ["remote", "-v"]);
-      if (result.code !== 0) return false;
-      return /github\.com[:/]/i.test(result.stdout);
+    async hasSupportedTrackerRemote() {
+      const forge = await resolveForge();
+      return forge.provider === "github" || forge.provider === "forgejo";
     },
 
-    async isGhAuthenticated() {
-      const cached = ghAuthCache.get(cwd);
-      if (cached && Date.now() - cached.at < GH_AUTH_TTL_MS) {
+    async isTrackerAuthenticated() {
+      const forge = await resolveForge();
+      if (forge.provider === "unsupported") return false;
+      const cacheKey = `${cwd}:${forge.provider}`;
+      const cached = trackerAuthCache.get(cacheKey);
+      if (cached && Date.now() - cached.at < TRACKER_AUTH_TTL_MS) {
         return cached.ok;
       }
-      const result = await run(cwd, "gh", ["auth", "status"]);
-      const ok = result.code === 0;
-      ghAuthCache.set(cwd, { ok, at: Date.now() });
+
+      let ok = false;
+      if (forge.provider === "github") {
+        const result = await run(cwd, "gh", ["auth", "status"]);
+        ok = result.code === 0;
+      } else {
+        try {
+          await createForgejoApiClient(forge.connection).request({ path: "/user" });
+          ok = true;
+        } catch {
+          ok = false;
+        }
+      }
+      trackerAuthCache.set(cacheKey, { ok, at: Date.now() });
       return ok;
     },
 
