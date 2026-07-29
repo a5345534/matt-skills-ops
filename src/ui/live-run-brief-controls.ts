@@ -19,6 +19,7 @@ import {
   type SelectItem,
 } from "@earendil-works/pi-tui";
 import { buildRunBriefViewModel } from "./run-brief.js";
+import { publishWorkflowPanel } from "./workflow-panel.js";
 import type { WorkflowCoordinator, WorkflowPanelState } from "../types.js";
 
 export type LiveWaitControlChoice =
@@ -45,6 +46,9 @@ export type LiveWaitCustomUi = {
     },
     options?: { overlay?: boolean },
   ) => Promise<T | undefined>;
+  /** Optional Pi TUI footer status (kept in sync with live brief polls). */
+  setStatus?(key: string, value: string | undefined): void;
+  setWidget?(key: string, lines: string[] | undefined): void;
 };
 
 export type LiveWaitTheme = {
@@ -232,6 +236,13 @@ export async function presentLiveWaitControls(
           briefLines = [
             ...buildRunBriefViewModel(panel, { omitControls: true }).lines,
           ];
+          // Keep footer status in sync with the live brief (Context / frontier).
+          // Without this, status-only stayed frozen at an earlier Ready frontier.
+          try {
+            publishWorkflowPanel(ui, panel, { mode: "status-only" });
+          } catch {
+            // Optional TUI status APIs — never break the wait surface.
+          }
 
           if (panel.runTerminated) {
             finish({ action: "settled" });

@@ -675,8 +675,18 @@ export function formatTicketTableRow(
       : undefined;
   const ci = panel.ci?.find((c) => c.ticketNumber === item.number);
   const completedRun = latestCompletedImplementationRun(panel, item.number);
-  const liveWorker = worker?.status === "running" ? worker : undefined;
-  const telemetry = liveWorker ?? completedRun ?? worker;
+  // Prefer the live panel worker while the attempt is still in the pipeline
+  // (running / needs-disposition / recovery). completedWorkerRuns freezes
+  // runtimeMs at process exit and made the ticket list look stuck while
+  // Pipeline Elapsed kept ticking.
+  const liveSessionWorker =
+    worker &&
+    (worker.status === "running" ||
+      worker.status === "needs-disposition" ||
+      worker.status === "compatibility-recovery")
+      ? worker
+      : undefined;
+  const telemetry = liveSessionWorker ?? completedRun ?? worker;
 
   // READY/BLOCK: session lifecycle overlays tracker frontier so the column
   // never says "ready" while STATUS is needs-disp / running / integrating.

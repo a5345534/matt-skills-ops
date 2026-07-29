@@ -493,6 +493,61 @@ describe("buildRunBriefViewModel", () => {
     expect(workerLines).not.toContain("I'll start by reading");
   });
 
+  it("keeps needs-disposition RUNTIME live instead of frozen completed telemetry", () => {
+    const panel = basePanel({
+      workers: [
+        {
+          ticketNumber: 56,
+          attempt: 1,
+          status: "needs-disposition",
+          branchName: "matt-auto/53/ticket-56/r1",
+          turnCount: 8,
+          startedAtMs: 1_000,
+          // Live wall clock from panel inspection (still advancing).
+          runtimeMs: 180_000,
+        },
+      ],
+      completedWorkerRuns: [
+        {
+          workflowId: 53,
+          ticketNumber: 56,
+          attempt: 1,
+          kind: "implementation",
+          turnCount: 8,
+          startedAtMs: 1_000,
+          completedAtMs: 1_000 + 71_000,
+          // Frozen at process-exit — must not win over live panel runtime.
+          runtimeMs: 71_000,
+        },
+      ],
+      ticketProgress: {
+        workflowId: 53,
+        total: 1,
+        open: 1,
+        closed: 0,
+        ready: [{ number: 56, title: "README" }],
+        blocked: [],
+        awaitingCi: [],
+        items: [
+          {
+            number: 56,
+            title: "README",
+            state: "OPEN",
+            status: "ready",
+          },
+        ],
+      },
+    });
+
+    const row56 = buildRunBriefViewModel(panel)
+      .sections.find((s) => s.id === "tickets")
+      ?.lines.find((l) => l.includes("#56"));
+    expect(row56).toMatch(/needs-disp/);
+    // Live 3m00s, not frozen 1m11s from completedWorkerRuns.
+    expect(row56).toMatch(/3m00s/);
+    expect(row56).not.toMatch(/1m11s/);
+  });
+
   it("shows integrating READY/BLOCK and live Integration elapsed, not stale fail reason", () => {
     const panel = basePanel({
       integration: {
