@@ -1166,6 +1166,8 @@ const NONE_AVAILABLE = "(none available)";
 
 const SET_GLOBAL_WORKER = "Set global default Worker profile";
 const SET_ROOT_WORKER = "Set Workflow-root override";
+const SET_ACTIVE_WORKFLOW_WORKER =
+  "Override Active workflow Worker profile…";
 const CLEAR_ROOT_WORKER = "Clear Workflow-root override";
 const SET_GLOBAL_WORKER_CONCURRENCY =
   "Set global default Worker concurrency";
@@ -2674,19 +2676,25 @@ export async function presentWorkerProfileMenu(
   ui: MattAutoUi,
 ): Promise<void> {
   for (;;) {
-    const [effective, global, root] = await Promise.all([
+    const [effective, global, root, active] = await Promise.all([
       coordinator.getWorkerProfile(),
       coordinator.getGlobalWorkerProfile(),
       coordinator.getRootWorkerProfile(),
+      coordinator.getActiveWorkflow(),
     ]);
 
     const options = [
       `Effective: ${effective ? formatProfileShort(effective.profile) + ` [${effective.source}]` : "(not configured)"}`,
       `Global default: ${global ? formatProfileShort(global) : "(not set)"}`,
       `Workflow-root override: ${root ? formatProfileShort(root) : "(not set)"}`,
-      SET_GLOBAL_WORKER,
-      SET_ROOT_WORKER,
     ];
+    if (active) {
+      options.push(
+        `Active workflow #${active.workflowId} snapshot: ${formatProfileShort(active.workerProfile)}`,
+      );
+      options.push(SET_ACTIVE_WORKFLOW_WORKER);
+    }
+    options.push(SET_GLOBAL_WORKER, SET_ROOT_WORKER);
     if (root) {
       options.push(CLEAR_ROOT_WORKER);
     }
@@ -2717,15 +2725,47 @@ export async function presentWorkerProfileMenu(
       );
       continue;
     }
+    if (selected.startsWith("Active workflow #")) {
+      ui.notify(
+        active
+          ? [
+              `Active workflow #${active.workflowId} Worker profile snapshot: ${formatProfileShort(active.workerProfile)}.`,
+              "This snapshot outranks global/root preferences for later tickets in this workflow.",
+              `Use "${SET_ACTIVE_WORKFLOW_WORKER}" to change it on the Workflow manifest.`,
+            ].join("\n")
+          : "No Active workflow snapshot is loaded.",
+        "info",
+      );
+      continue;
+    }
+
+    if (selected === SET_ACTIVE_WORKFLOW_WORKER) {
+      const profile = await promptWorkerProfile(coordinator, ui);
+      if (!profile) continue;
+      try {
+        await coordinator.setActiveWorkflowWorkerProfile(profile);
+        ui.notify(
+          `Active workflow Worker profile snapshot set to ${formatProfileShort(profile)}. Later Implementation workers use this model; Workflow home model is unchanged.`,
+          "info",
+        );
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+      }
+      continue;
+    }
 
     if (selected === SET_GLOBAL_WORKER) {
       const profile = await promptWorkerProfile(coordinator, ui);
       if (!profile) continue;
       try {
         await coordinator.setGlobalWorkerProfile(profile);
+        const stillSnapshotted =
+          (await coordinator.getWorkerProfile())?.source === "workflow-snapshot";
         ui.notify(
-          `Global default Worker profile set to ${formatProfileShort(profile)}. Workflow home model is unchanged.`,
-          "info",
+          stillSnapshotted
+            ? `Global default Worker profile set to ${formatProfileShort(profile)}. Effective profile still comes from the Active workflow snapshot — use "${SET_ACTIVE_WORKFLOW_WORKER}" to change this workflow.`
+            : `Global default Worker profile set to ${formatProfileShort(profile)}. Workflow home model is unchanged.`,
+          stillSnapshotted ? "warning" : "info",
         );
       } catch (error) {
         ui.notify(errorMessage(error), "error");
@@ -2738,9 +2778,13 @@ export async function presentWorkerProfileMenu(
       if (!profile) continue;
       try {
         await coordinator.setRootWorkerProfile(profile);
+        const stillSnapshotted =
+          (await coordinator.getWorkerProfile())?.source === "workflow-snapshot";
         ui.notify(
-          `Workflow-root Worker profile override set to ${formatProfileShort(profile)}. Workflow home model is unchanged.`,
-          "info",
+          stillSnapshotted
+            ? `Workflow-root Worker profile override set to ${formatProfileShort(profile)}. Effective profile still comes from the Active workflow snapshot — use "${SET_ACTIVE_WORKFLOW_WORKER}" to change this workflow.`
+            : `Workflow-root Worker profile override set to ${formatProfileShort(profile)}. Workflow home model is unchanged.`,
+          stillSnapshotted ? "warning" : "info",
         );
       } catch (error) {
         ui.notify(errorMessage(error), "error");

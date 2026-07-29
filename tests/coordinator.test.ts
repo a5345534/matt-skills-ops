@@ -1992,6 +1992,48 @@ describe("Workflow coordinator Create-spec Planning stage", () => {
       source: "workflow-snapshot",
     });
   });
+
+  it("overrides the Active workflow Worker profile snapshot on the manifest", async () => {
+    const rootProfile: WorkerProfile = {
+      provider: "openai",
+      modelId: "gpt-4o",
+      thinkingLevel: "off",
+    };
+    const replacement: WorkerProfile = {
+      provider: "anthropic",
+      modelId: "claude-sonnet-4",
+      thinkingLevel: "high",
+    };
+    const tracker = createTracker();
+    const coordinator = createWorkflowCoordinator(
+      createPorts({
+        defaultRoot: {
+          preferences: {
+            globalWorkerProfile: defaultWorkerProfile,
+            rootWorkerProfile: rootProfile,
+          },
+          tracker,
+        },
+      }),
+    );
+
+    await coordinator.runNextAction(CREATE_SPEC_ACTION.id);
+    await coordinator.confirmStage("publish");
+    expect(tracker.state.manifests.get(100)?.workerProfile).toEqual(rootProfile);
+
+    await coordinator.setActiveWorkflowWorkerProfile(replacement);
+
+    expect(tracker.state.manifests.get(100)?.workerProfile).toEqual(replacement);
+    await expect(coordinator.getWorkerProfile()).resolves.toEqual({
+      profile: replacement,
+      source: "workflow-snapshot",
+    });
+    // Root/global prefs remain lower priority for this Active workflow.
+    await expect(coordinator.getRootWorkerProfile()).resolves.toEqual(rootProfile);
+    await expect(coordinator.getGlobalWorkerProfile()).resolves.toEqual(
+      defaultWorkerProfile,
+    );
+  });
 });
 
 describe("Workflow coordinator root selection", () => {

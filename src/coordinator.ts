@@ -5899,6 +5899,28 @@ export function createWorkflowCoordinator(
     await bound.preferences.clearRootWorkerProfile();
   }
 
+  async function setActiveWorkflowWorkerProfile(
+    profile: WorkerProfile,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    await assertValidWorkerProfile(profile);
+    const active = await loadActiveWorkflow(bound, { force: true });
+    if (!active) {
+      throw new Error(
+        "No Active workflow on this Target branch. Configure the global default or Workflow-root override instead.",
+      );
+    }
+    const manifest = manifestFromActive(active);
+    manifest.workerProfile = {
+      provider: profile.provider,
+      modelId: profile.modelId,
+      thinkingLevel: profile.thinkingLevel,
+    };
+    await bound.tracker.writeWorkflowManifest(active.workflowId, manifest);
+    // Drop TTL so the next resolve reads the rewritten snapshot immediately.
+    activeWorkflowTtl = undefined;
+  }
+
   async function getEffectiveWorkerConcurrency(): Promise<number> {
     const bound = await requireScoped();
     const root = await bound.preferences.getRootWorkerConcurrency();
@@ -5969,6 +5991,7 @@ export function createWorkflowCoordinator(
     getRootWorkerProfile,
     setGlobalWorkerProfile,
     setRootWorkerProfile,
+    setActiveWorkflowWorkerProfile,
     clearRootWorkerProfile,
     getEffectiveWorkerConcurrency,
     getGlobalWorkerConcurrency,

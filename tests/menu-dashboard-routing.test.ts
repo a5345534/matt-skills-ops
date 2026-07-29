@@ -88,6 +88,8 @@ function coordinatorHarness() {
     getWorkerProfile: vi.fn(async () => undefined),
     getGlobalWorkerProfile: vi.fn(async () => undefined),
     getRootWorkerProfile: vi.fn(async () => undefined),
+    getActiveWorkflow: vi.fn(async () => undefined),
+    setActiveWorkflowWorkerProfile: vi.fn(async () => undefined),
     listAvailableModels: vi.fn(async () => []),
     getHomeModel: vi.fn(async () => undefined),
     getGlobalWorkerConcurrency: vi.fn(async () => undefined),

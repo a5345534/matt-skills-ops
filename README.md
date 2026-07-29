@@ -89,6 +89,8 @@ Model choices come from Pi’s authenticated available-model catalog via a searc
 
 Precedence: workflow snapshot (later tickets) → Workflow-root override → global default.
 
+Changing the global default or Workflow-root override does **not** move an already-published Active workflow off its snapshot. Use **Override Active workflow Worker profile…** in the Worker profile menu to rewrite that workflow’s manifest snapshot for later Implementation workers.
+
 Example preferences:
 
 ```json

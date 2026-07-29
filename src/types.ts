@@ -759,6 +759,12 @@ export type WorkflowCoordinator = {
   /** Remove the Workflow-root Worker profile override (global default remains). */
   clearRootWorkerProfile(): Promise<void>;
   /**
+   * Replace the Active workflow's Worker profile snapshot on its GitHub manifest.
+   * Required for mid-workflow model changes: snapshot outranks root/global prefs.
+   * Does not change the Workflow home currently selected model.
+   */
+  setActiveWorkflowWorkerProfile(profile: WorkerProfile): Promise<void>;
+  /**
    * Effective Worker concurrency after Workflow-root → global → default (2) precedence.
    * Always a positive integer; never writes to GitHub.
    */
