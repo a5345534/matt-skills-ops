@@ -70,6 +70,14 @@ Preflight checks (fail closed, no bootstrap inventing):
 3. Target branch (default `main`, overridable per root)
 4. Required Matt skills: `to-spec`, `to-tickets`, `implement`, `resolving-merge-conflicts`
 5. Worker profile presence (model + thinking level)
+6. Protected-branch automation compatibility (merge method, merge authority, stale-base)
+
+**Branch protection observation:**
+
+- **Strict** required checks / up-to-date heads → full automation guarantees.
+- **Plan-limited** (private free-tier **403** on protection/ruleset APIs) or **absent** (no protection rules) → **degraded automation** when the actor can push/merge and no review/merge-queue gates apply. Preflight passes with explicit guidance; Matt Auto does not invent branch protection or tell you to enable settings your plan cannot configure.
+- **Configured but non-strict** (protection exists without up-to-date required checks) → still fail-closed.
+- Required approvals or native merge queue → still fail-closed.
 
 Preferences live under:
 
