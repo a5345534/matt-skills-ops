@@ -478,6 +478,41 @@ describe("runPostGrillPipeline fill slots then wait", () => {
     );
   });
 
+  it("does not run broad delivery preflight before an available action", async () => {
+    const preflight = vi.fn(async (): Promise<PreflightResult> => ({
+      ok: false,
+      targetBranch: "main",
+      checks: [
+        {
+          id: "merge-authority",
+          ok: false,
+          guidance: "GitHub policy inspection is unavailable.",
+        },
+      ],
+    }));
+    const runNextAction = vi.fn(async () => ({
+      status: "completed" as const,
+      stage: "cleanup" as const,
+      workflowId: 42,
+    }));
+    const coordinator = {
+      beginPipelineRun: () => undefined,
+      isRunTerminated: () => false,
+      isPipelinePaused: () => false,
+      isAutoAdvanceBlocked: () => false,
+      preflight,
+      nextActions: async () => [CLEANUP_WORKFLOW_ACTION],
+      runNextAction,
+      getCompletedWorkerTelemetry: () => [],
+      getPipelineRunElapsedMs: () => 0,
+    } as unknown as WorkflowCoordinator;
+
+    await runPostGrillPipeline(coordinator, mockUi());
+
+    expect(preflight).not.toHaveBeenCalled();
+    expect(runNextAction).toHaveBeenCalledWith(CLEANUP_WORKFLOW_ACTION.id);
+  });
+
   it("opens min(N, readyCount) workers without waiting for the first to finish", async () => {
     const { coordinator, state } = createRunLoopFake({
       concurrency: 2,

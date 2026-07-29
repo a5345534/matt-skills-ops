@@ -165,8 +165,12 @@ The local, uncommitted structured JSON event record for a Worker attempt. Matt A
 _Avoid_: GitHub-published transcript, live-only worker output
 
 **Workflow preflight**:
-The Matt Auto setup check for a GitHub Workflow root, Target branch, `gh` authentication, required Matt skills, Worker profile, canonical repository identity, coordination-ref permissions, repository-configured merge method, strict stale-base / required-check protection, and non-interactive merge authority. The MVP guides correction but does not initialize Git, alter branch protection, or create repositories, commits, or pushes.
-_Avoid_: automatic repository bootstrap, silent branch-protection mutation
+An explicit, full delivery diagnostic for a GitHub Workflow root: Target branch, `gh` authentication, installed skills, Worker profile, canonical repository identity, coordination-ref permissions, repository-configured merge method, strict stale-base / required-check protection, and non-interactive merge authority. It informs the operator but does not globally hide unrelated Next actions.
+_Avoid_: every-action global gate, automatic repository bootstrap, silent branch-protection mutation
+
+**Action readiness**:
+The exact prerequisite checks performed immediately before an action's first side effect. Planning checks its installed skill; publication checks its Target and tracker/coordination writes; worker launch checks its frontier/profile/skill/capacity/lease; automatic Workflow PR merge checks merge policy, stale-base, authority, live freshness, CI, and leases. A failed final-delivery check cannot block unrelated planning, ticket, or worker work.
+_Avoid_: global preflight failure, speculative early remote checks
 
 **Matt Auto package**:
 The reusable Pi package that supplies Matt Auto across Workflow roots. It is installed globally by default, with project-local installation available for shared team setup.

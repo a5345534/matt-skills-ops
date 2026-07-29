@@ -128,6 +128,7 @@ import type {
   PipelineResumeResult,
   PreflightCheck,
   PreflightResult,
+  PreflightScope,
   ReadyTicket,
   RepositorySchedulerLease,
   ResolvedWorkerProfile,
@@ -3350,11 +3351,11 @@ export function createWorkflowCoordinator(
     }
   }
 
-  // Short-lived preflight cache — menu open calls preflight + nextActions back-to-back.
+  // Full delivery diagnostics are operator-triggered and may inspect remote
+  // policy. Cache only that expensive scope; passive surfaces use overview.
   let preflightCache:
     | { result: PreflightResult; at: number; rootPath: string }
     | undefined;
-  /** Cache preflight long enough to cover a full run-loop step (preflight → nextActions). */
   const PREFLIGHT_TTL_MS = 60_000;
 
   async function collectProtectedBranchAutomationChecks(
@@ -3423,6 +3424,29 @@ export function createWorkflowCoordinator(
     return evaluateProtectedBranchAutomation(policy).checks;
   }
 
+  /**
+   * Merge-only policy gate. Other actions must not be blocked by unknown
+   * merge settings, protection, or merge authority.
+   */
+  async function requireAutomaticMergeReadiness(
+    bound: RootScopedPorts,
+    targetBranch: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const checks = await collectProtectedBranchAutomationChecks(
+      bound,
+      targetBranch,
+    );
+    const failed = checks.filter((check) => !check.ok);
+    if (failed.length === 0) return { ok: true };
+    return {
+      ok: false,
+      reason: [
+        "Automatic Workflow PR merge readiness is incomplete.",
+        ...failed.map((check) => `${check.id}: ${check.guidance}`),
+      ].join("\n"),
+    };
+  }
+
   async function resolveRepositoryMergeMethod(
     bound: RootScopedPorts,
     targetBranch: string,
@@ -3471,8 +3495,27 @@ export function createWorkflowCoordinator(
     }
   }
 
-  async function preflight(): Promise<PreflightResult> {
+  async function preflight(
+    scope: PreflightScope = "delivery",
+  ): Promise<PreflightResult> {
     const bound = await requireScoped();
+    const targetBranch = await resolveTargetBranch(
+      bound.preferences,
+      bound.environment,
+    );
+
+    // Passive Home/dashboard views must not consume GitHub policy quota or
+    // turn a final-delivery problem into an all-action pipeline blocker.
+    if (scope === "overview") {
+      const workerProfile = await resolveWorkerProfile(bound);
+      return {
+        ok: true,
+        targetBranch,
+        checks: [],
+        ...(workerProfile ? { workerProfile } : {}),
+      };
+    }
+
     if (
       preflightCache &&
       preflightCache.rootPath === selectedPath &&
@@ -3480,8 +3523,6 @@ export function createWorkflowCoordinator(
     ) {
       return preflightCache.result;
     }
-
-    const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
 
     const [
       hasGitHubRemote,
@@ -3542,7 +3583,6 @@ export function createWorkflowCoordinator(
       },
     ];
 
-    // Protected-branch automation preflight (fail-closed when the tracker can observe policy).
     if (typeof bound.tracker.inspectProtectedBranchAutomation === "function") {
       const automationChecks = await collectProtectedBranchAutomationChecks(
         bound,
@@ -3649,15 +3689,8 @@ export function createWorkflowCoordinator(
 
   async function nextActions(): Promise<NextAction[]> {
     lastNextActionsDiagnostic = undefined;
-    const result = await preflight();
-    if (!result.ok) {
-      lastNextActionsDiagnostic = {
-        routeKind: "preflight-failed",
-        reason: "Workflow preflight is incomplete.",
-      };
-      return [];
-    }
-
+    // Action discovery is state/routing only. Each action validates the
+    // remote, skill, worker, and delivery requirements it actually needs.
     const bound = await requireScoped();
     const route = await loadWorkflowHomeRoute(bound);
     if (
@@ -4267,16 +4300,8 @@ export function createWorkflowCoordinator(
     options: { independent?: boolean } = {},
   ): Promise<StageResult> {
     const bound = await requireScoped();
-    const preflightResult = await preflight();
-    if (!preflightResult.ok) {
-      return {
-        status: "failed",
-        stage: "create-spec",
-        reason:
-          "Workflow preflight is incomplete. Resolve preflight checks before running Create-spec.",
-      };
-    }
-
+    // Create-spec planning is local. Publish validates its remote prerequisites
+    // after the operator has approved a reviewable draft.
     const route = await loadWorkflowHomeRoute(bound, { force: true });
     if (route.kind === "legacy" || route.kind === "bound") {
       const active = route.active;
@@ -4337,16 +4362,8 @@ export function createWorkflowCoordinator(
 
   async function startCreateTickets(): Promise<StageResult> {
     const bound = await requireScoped();
-    const preflightResult = await preflight();
-    if (!preflightResult.ok) {
-      return {
-        status: "failed",
-        stage: "create-tickets",
-        reason:
-          "Workflow preflight is incomplete. Resolve preflight checks before running Create-tickets.",
-      };
-    }
-
+    // to-tickets validates its own installed skill; remote writes happen only
+    // after the resulting draft is explicitly published.
     const active = await loadActiveWorkflow(bound);
     if (!active) {
       return {
@@ -4453,6 +4470,15 @@ export function createWorkflowCoordinator(
     // decision === "publish"
     const draft = current.draft;
     const targetBranch = await resolveTargetBranch(bound.preferences, bound.environment);
+    // Target identity becomes durable in the new manifest, so validate it at
+    // publish time rather than before the local to-spec planning stage.
+    if (!(await bound.environment.targetBranchExists(targetBranch))) {
+      return {
+        status: "failed",
+        stage: "create-spec",
+        reason: `Cannot publish Create-spec: Target branch "${targetBranch}" was not found locally or on a remote. Create or fetch it, or configure a different Target branch.`,
+      };
+    }
     const workerProfile = await resolveWorkerProfile(bound);
     if (!workerProfile) {
       return {
@@ -4883,17 +4909,8 @@ export function createWorkflowCoordinator(
 
   async function startImplementation(ticketNumber: number): Promise<StageResult> {
     const bound = await requireScoped();
-    const preflightResult = await preflight();
-    if (!preflightResult.ok) {
-      return {
-        status: "failed",
-        stage: "implement",
-        reason:
-          "Workflow preflight is incomplete. Resolve preflight checks before launching an Implementation worker.",
-        ticketNumber,
-      };
-    }
-
+    // Implementation checks its frontier, lease, Worker profile, and implement
+    // skill below; final-delivery policy is irrelevant to worker launch.
     if (pending) {
       return {
         status: "failed",
@@ -8136,6 +8153,25 @@ export function createWorkflowCoordinator(
           "Cannot merge the Workflow PR while tickets remain open or awaiting CI. Finish or Rework tickets first.",
         workflowId: active.workflowId,
         workflowPrNumber: active.workflowPr.number,
+      };
+    }
+
+    // Repository merge policy, stale-base guarantees, and non-interactive
+    // authority are intentionally checked only at the automatic merge boundary.
+    const automaticMergeReadiness = await requireAutomaticMergeReadiness(
+      bound,
+      active.targetBranch,
+    );
+    if (!automaticMergeReadiness.ok) {
+      return {
+        status: "failed",
+        stage: "workflow-pr",
+        reason: automaticMergeReadiness.reason,
+        workflowId: active.workflowId,
+        workflowPrNumber: active.workflowPr.number,
+        ...(active.workflowPr.url
+          ? { workflowPrUrl: active.workflowPr.url }
+          : {}),
       };
     }
 

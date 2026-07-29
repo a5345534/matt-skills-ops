@@ -302,7 +302,11 @@ function buildWorkflowRow(
   }
 
   appendTextLine(lines, "Target branch", inputs.preflight.targetBranch);
-  lines.push(`Preflight: ${inputs.preflight.ok ? "passed" : "needs attention"}`);
+  lines.push(
+    inputs.preflight.checks.length === 0
+      ? "Readiness: checked immediately before each action"
+      : `Preflight: ${inputs.preflight.ok ? "passed" : "needs attention"}`,
+  );
   lines.push(
     inputs.nextActions.length === 0
       ? "Next actions: none available"
@@ -896,7 +900,9 @@ export async function readWorkflowDashboardSnapshot(
   source: WorkflowDashboardDataSource,
 ): Promise<WorkflowDashboardSnapshot> {
   const [preflight, nextActions, ticketProgress, panel] = await Promise.all([
-    source.preflight(),
+    // Passive dashboard opens use only local overview readiness. Full delivery
+    // policy inspection is explicit and runs at the action boundary.
+    source.preflight("overview"),
     source.nextActions(),
     source.getTicketProgress(),
     source.getPanelState({ mode: "full" }),

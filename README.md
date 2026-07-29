@@ -61,16 +61,28 @@ Matt Auto resolves the **Workflow root** from the nearest enclosing Git reposito
 - Git submodules are out of MVP and are not offered as roots
 - Roots without a GitHub remote are marked unavailable with an explicit unsupported-tracker explanation
 
-## Workflow preflight
+## Workflow readiness
 
-Preflight checks (fail closed, no bootstrap inventing):
+Readiness is **action-scoped**, not one global gate. Passive Home/dashboard
+views use a local overview; they do not consume GitHub policy quota or hide
+unrelated Next actions. Each action checks its own prerequisites immediately
+before its first side effect:
 
-1. GitHub remote on the Workflow root
-2. `gh` authentication
-3. Target branch (default `main`, overridable per root)
-4. Required Matt skills: `to-spec`, `to-tickets`, `implement`, `resolving-merge-conflicts`
-5. Worker profile presence (model + thinking level)
-6. Protected-branch automation compatibility (merge method, merge authority, stale-base)
+- Create-spec / Create-tickets planning checks only its installed skill; remote
+  publication checks Target availability, tracker writes, and coordination then.
+- Implementation checks the ready frontier, Worker profile, `implement` skill,
+  capacity, and coordinator lease at launch.
+- Opening a Workflow PR checks its configured merge method and current
+  Integration facts.
+- Target refresh checks its queue/lease, Target, verification, and push path.
+- **Automatic Workflow PR merge only** checks merge method, non-interactive
+  merge authority, stale-base protection, live PR freshness, required checks,
+  and the Target-branch lease.
+
+Use **Refresh preflight** in the fallback Workflow menu when you explicitly
+want the full delivery diagnostic. It is informational until the action that
+actually needs a failed requirement runs; Matt Auto still fails closed at that
+operation and never bootstraps missing GitHub configuration.
 
 **Branch protection observation:**
 

@@ -1,3 +1,10 @@
+/** Scope for an explicit Workflow readiness inspection. */
+export type PreflightScope =
+  /** Cheap local summary used by passive Home / dashboard surfaces. */
+  | "overview"
+  /** Full remote delivery-policy inspection, run only on explicit request. */
+  | "delivery";
+
 /** Preflight check identifiers for Workflow preflight. */
 export type PreflightCheckId =
   | "github-remote"
@@ -61,7 +68,6 @@ export type NextActionsDiagnostic = {
     | "selection-required"
     | "lease-held"
     | "unavailable"
-    | "preflight-failed"
     | "unknown";
   /** Operator-visible reason when routing/home cannot produce actions. */
   reason?: string;
@@ -1131,11 +1137,16 @@ export type WorkflowRoot = {
 
 /** Public Workflow coordinator seam. */
 export type WorkflowCoordinator = {
-  /** Run Workflow preflight against the currently selected Workflow root. */
-  preflight(): Promise<PreflightResult>;
+  /**
+   * Inspect readiness for the currently selected Workflow root. The default
+   * delivery scope is explicit/operator-facing; passive surfaces request the
+   * cheap overview scope. Action bodies validate their own prerequisites
+   * immediately before side effects.
+   */
+  preflight(scope?: PreflightScope): Promise<PreflightResult>;
   /**
    * Return only currently available Next actions.
-   * Empty when preflight fails or no stage is available yet.
+   * Empty when no stage is available or workflow routing cannot be recovered.
    */
   nextActions(): Promise<NextAction[]>;
   /**

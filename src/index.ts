@@ -281,6 +281,7 @@ export type {
   PreflightCheck,
   PreflightCheckId,
   PreflightResult,
+  PreflightScope,
   ReadyTicket,
   ResolvedWorkerProfile,
   SiblingWorkflowSummary,

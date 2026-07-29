@@ -1712,9 +1712,14 @@ export function buildMainMenuItems(
     );
   }
 
-  items.push(PREFLIGHT_HEADER, ...preflight.checks.map(formatCheckLine));
+  items.push(
+    PREFLIGHT_HEADER,
+    ...(preflight.checks.length > 0
+      ? preflight.checks.map(formatCheckLine)
+      : ["Readiness checks run immediately before the action that needs them."]),
+  );
 
-  if (preflight.ok && nextActions.length > 0) {
+  if (nextActions.length > 0) {
     items.push(RUN_PIPELINE_ITEM);
   }
 
@@ -2167,10 +2172,14 @@ async function presentWorkflowBlockingMenu(
   ui: MattAutoUi,
   pipelineOptions: RunPostGrillPipelineOptions = {},
 ): Promise<void> {
+  // Full delivery diagnostics are explicit (Refresh preflight), never an
+  // automatic blocker for unrelated local or ticket-stage actions.
+  let inspectedPreflight: PreflightResult | undefined;
   for (;;) {
     const currentRoot = await coordinator.currentRoot();
     const roots = await coordinator.listRoots();
-    const preflight = await coordinator.preflight();
+    const overview = await coordinator.preflight("overview");
+    const preflight = inspectedPreflight ?? overview;
     const nextActions = await coordinator.nextActions();
     const ticketProgress = await coordinator.getTicketProgress();
     const panel = await coordinator.getPanelState();
@@ -2200,7 +2209,11 @@ async function presentWorkflowBlockingMenu(
     if (selected === "← Back to home") return;
 
     if (selected === undefined) return;
-    if (selected === REFRESH_ITEM || selected.startsWith("---")) continue;
+    if (selected === REFRESH_ITEM) {
+      inspectedPreflight = await coordinator.preflight("delivery");
+      continue;
+    }
+    if (selected.startsWith("---")) continue;
 
     if (
       selected.startsWith("Tickets:") ||
@@ -2234,6 +2247,7 @@ async function presentWorkflowBlockingMenu(
 
     if (selected === RUN_PIPELINE_ITEM) {
       await runPostGrillPipeline(coordinator, ui, pipelineOptions);
+      inspectedPreflight = undefined;
       continue;
     }
 
@@ -2259,7 +2273,7 @@ async function presentWorkflowBlockingMenu(
         ui.notify(summarizePreflightFailures(preflight), "warning");
       } else {
         ui.notify(
-          "Workflow preflight passed. No Next actions are available yet.",
+          "No Next actions are available yet. Readiness is checked at each action boundary.",
           "info",
         );
       }
@@ -2277,6 +2291,7 @@ async function presentWorkflowBlockingMenu(
     const action = nextActions.find((a) => selected.startsWith(a.label));
     if (action) {
       await handleNextAction(coordinator, ui, action);
+      inspectedPreflight = undefined;
     }
   }
 }
@@ -2659,24 +2674,8 @@ export async function runPostGrillPipeline(
       continue;
     }
 
-    const stepStarted = Date.now();
-    const preflight = await coordinator.preflight();
-    log("debug", "pipeline:preflight", {
-      step,
-      ok: preflight.ok,
-      ms: Date.now() - stepStarted,
-      failed: preflight.checks.filter((c) => !c.ok).map((c) => c.id),
-    });
-    if (!preflight.ok) {
-      ui.notify(summarizePreflightFailures(preflight), "warning");
-      log("warn", "pipeline:stop", { reason: "preflight-failed", step });
-      endSignal = {
-        body: "Matt Auto preflight failed — see notice in session.",
-        warning: true,
-      };
-      return;
-    }
-
+    // Do not run one broad delivery preflight before every loop. The selected
+    // action validates its own requirements immediately before side effects.
     const nextStarted = Date.now();
     const nextActions = await coordinator.nextActions();
     const nextDiagnostic =
@@ -3976,17 +3975,11 @@ export async function presentNextActions(
     return;
   }
 
-  const preflight = await coordinator.preflight();
   const nextActions = await coordinator.nextActions();
-
-  if (!preflight.ok) {
-    ui.notify(summarizePreflightFailures(preflight), "warning");
-    return;
-  }
 
   if (nextActions.length === 0) {
     ui.notify(
-      "No Next actions available. Workflow preflight passed; no stages are ready yet.",
+      "No Next actions available. Readiness is checked when an action needs it.",
       "info",
     );
     return;
