@@ -174,6 +174,12 @@ function createPreferences(workflowId: number): PreferencesPort {
     setGlobalWorkerConcurrency: async () => {},
     setRootWorkerConcurrency: async () => {},
     clearRootWorkerConcurrency: async () => {},
+
+    getGlobalLiveWaitPollIntervalMs: async () => undefined,
+    getRootLiveWaitPollIntervalMs: async () => undefined,
+    setGlobalLiveWaitPollIntervalMs: async () => {},
+    setRootLiveWaitPollIntervalMs: async () => {},
+    clearRootLiveWaitPollIntervalMs: async () => {},
     getActiveWorkflowId: async () => undefined,
     setActiveWorkflowId: async () => {},
     clearActiveWorkflowId: async () => {},

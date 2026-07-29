@@ -53,7 +53,9 @@ import { gcMattAutoGitlinkArtifacts } from "./adapters/gitlink-cleanup.js";
 import { ensureSubmoduleGitlinksPublished } from "./adapters/submodule-gate.js";
 import {
   assertValidWorkerConcurrency,
+  assertValidLiveWaitPollIntervalMs,
   resolveEffectiveWorkerConcurrency,
+  resolveLiveWaitPollInterval,
 } from "./adapters/preferences.js";
 import {
   getTrackerGhMetrics,
@@ -10043,6 +10045,44 @@ export function createWorkflowCoordinator(
     await bound.preferences.clearRootWorkerConcurrency();
   }
 
+  async function getEffectiveLiveWaitPollIntervalMs(): Promise<number> {
+    const bound = await requireScoped();
+    const root = await bound.preferences.getRootLiveWaitPollIntervalMs();
+    const global = await bound.preferences.getGlobalLiveWaitPollIntervalMs();
+    return resolveLiveWaitPollInterval(root, global).intervalMs;
+  }
+
+  async function getGlobalLiveWaitPollIntervalMs(): Promise<number | undefined> {
+    const bound = await requireScoped();
+    return bound.preferences.getGlobalLiveWaitPollIntervalMs();
+  }
+
+  async function getRootLiveWaitPollIntervalMs(): Promise<number | undefined> {
+    const bound = await requireScoped();
+    return bound.preferences.getRootLiveWaitPollIntervalMs();
+  }
+
+  async function setGlobalLiveWaitPollIntervalMs(
+    intervalMs: number,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    assertValidLiveWaitPollIntervalMs(intervalMs);
+    await bound.preferences.setGlobalLiveWaitPollIntervalMs(intervalMs);
+  }
+
+  async function setRootLiveWaitPollIntervalMs(
+    intervalMs: number,
+  ): Promise<void> {
+    const bound = await requireScoped();
+    assertValidLiveWaitPollIntervalMs(intervalMs);
+    await bound.preferences.setRootLiveWaitPollIntervalMs(intervalMs);
+  }
+
+  async function clearRootLiveWaitPollIntervalMs(): Promise<void> {
+    const bound = await requireScoped();
+    await bound.preferences.clearRootLiveWaitPollIntervalMs();
+  }
+
   async function listAvailableModels(): Promise<readonly AvailableModel[]> {
     return ports.models.listAvailableModels();
   }
@@ -10085,6 +10125,12 @@ export function createWorkflowCoordinator(
     setGlobalWorkerConcurrency,
     setRootWorkerConcurrency,
     clearRootWorkerConcurrency,
+    getEffectiveLiveWaitPollIntervalMs,
+    getGlobalLiveWaitPollIntervalMs,
+    getRootLiveWaitPollIntervalMs,
+    setGlobalLiveWaitPollIntervalMs,
+    setRootLiveWaitPollIntervalMs,
+    clearRootLiveWaitPollIntervalMs,
     listAvailableModels,
     getHomeModel,
     thinkingLevelsFor,

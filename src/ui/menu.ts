@@ -2,7 +2,9 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { MattAutoLogger } from "../adapters/logger.js";
 import {
+  isValidLiveWaitPollIntervalMs,
   isValidWorkerConcurrency,
+  resolveLiveWaitPollInterval,
   resolveWorkerConcurrency,
   type WorkerConcurrencySource,
 } from "../adapters/preferences.js";
@@ -41,6 +43,9 @@ import {
   START_NEW_INDEPENDENT_WORKFLOW_ACTION,
   STAGE_CONFIRMATION_OPTIONS,
   TICKET_PROGRESS_ACTION,
+  DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS,
+  MAX_LIVE_WAIT_POLL_INTERVAL_MS,
+  MIN_LIVE_WAIT_POLL_INTERVAL_MS,
   WORKER_CONCURRENCY_WARNING_THRESHOLD,
 } from "../constants.js";
 
@@ -1332,6 +1337,11 @@ const REFRESH_ITEM = "Refresh preflight";
 const SWITCH_ROOT_ITEM = "Switch Workflow root…";
 const CONFIGURE_WORKER_ITEM = "Configure Worker profile…";
 const CONFIGURE_WORKER_CONCURRENCY_ITEM = "Configure Worker concurrency…";
+const CONFIGURE_LIVE_WAIT_POLL_ITEM = "Configure live wait poll interval…";
+const SET_GLOBAL_LIVE_WAIT_POLL = "Set global default poll interval";
+const SET_ROOT_LIVE_WAIT_POLL = "Set Workflow-root poll interval override";
+const CLEAR_ROOT_LIVE_WAIT_POLL =
+  "Clear Workflow-root poll interval override";
 const RUN_PIPELINE_ITEM =
   "▶ Run post-grill pipeline (to-spec → tickets → implement…)";
 const NONE_AVAILABLE = "(none available)";
@@ -1711,6 +1721,7 @@ async function presentHomeSettingsMenu(
     const options = [
       CONFIGURE_WORKER_ITEM,
       CONFIGURE_WORKER_CONCURRENCY_ITEM,
+      CONFIGURE_LIVE_WAIT_POLL_ITEM,
       SWITCH_ROOT_ITEM,
       BACK_ITEM,
     ];
@@ -1724,10 +1735,180 @@ async function presentHomeSettingsMenu(
       await presentWorkerConcurrencyMenu(coordinator, ui);
       continue;
     }
+    if (selected === CONFIGURE_LIVE_WAIT_POLL_ITEM) {
+      await presentLiveWaitPollIntervalMenu(coordinator, ui);
+      continue;
+    }
     if (selected === SWITCH_ROOT_ITEM) {
       await presentRootSwitcher(coordinator, ui);
     }
   }
+}
+
+/** Format effective live-wait poll interval for menus. */
+export function formatResolvedLiveWaitPollIntervalLine(
+  intervalMs: number,
+  source: "workflow-root" | "global" | "default",
+): string {
+  return `Effective live wait poll: ${intervalMs}ms [${source}]`;
+}
+
+/** Parse free-text poll interval (milliseconds). */
+export function parseLiveWaitPollIntervalInput(
+  raw: string,
+): { ok: true; value: number } | { ok: false; reason: string } {
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed.length === 0) {
+    return {
+      ok: false,
+      reason: `Live wait poll interval must be an integer ${MIN_LIVE_WAIT_POLL_INTERVAL_MS}–${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms.`,
+    };
+  }
+  // Allow optional trailing "ms".
+  const digits = trimmed.endsWith("ms") ? trimmed.slice(0, -2).trim() : trimmed;
+  if (!/^\d+$/.test(digits)) {
+    return {
+      ok: false,
+      reason: `Invalid poll interval "${raw}". Enter an integer ${MIN_LIVE_WAIT_POLL_INTERVAL_MS}–${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms.`,
+    };
+  }
+  const value = Number(digits);
+  if (!isValidLiveWaitPollIntervalMs(value)) {
+    return {
+      ok: false,
+      reason: `Live wait poll interval must be an integer ${MIN_LIVE_WAIT_POLL_INTERVAL_MS}–${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms.`,
+    };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * Live wait poll interval configuration (global + Workflow-root).
+ * Controls how often the run brief refreshes during /matt-auto run.
+ */
+export async function presentLiveWaitPollIntervalMenu(
+  coordinator: WorkflowCoordinator,
+  ui: MattAutoUi,
+): Promise<void> {
+  for (;;) {
+    const [global, root] = await Promise.all([
+      coordinator.getGlobalLiveWaitPollIntervalMs(),
+      coordinator.getRootLiveWaitPollIntervalMs(),
+    ]);
+    const effective = resolveLiveWaitPollInterval(root, global);
+    const options = [
+      formatResolvedLiveWaitPollIntervalLine(
+        effective.intervalMs,
+        effective.source,
+      ),
+      `Global default: ${global !== undefined ? `${global}ms` : "(not set)"}`,
+      `Workflow-root override: ${root !== undefined ? `${root}ms` : "(not set)"}`,
+      SET_GLOBAL_LIVE_WAIT_POLL,
+      SET_ROOT_LIVE_WAIT_POLL,
+    ];
+    if (root !== undefined) {
+      options.push(CLEAR_ROOT_LIVE_WAIT_POLL);
+    }
+    options.push(BACK_ITEM);
+
+    const selected = await ui.select("Live wait poll interval", options);
+    if (selected === undefined || selected === BACK_ITEM) return;
+
+    if (selected.startsWith("Effective live wait poll:")) {
+      ui.notify(
+        [
+          formatResolvedLiveWaitPollIntervalLine(
+            effective.intervalMs,
+            effective.source,
+          ),
+          `Allowed range: ${MIN_LIVE_WAIT_POLL_INTERVAL_MS}–${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms (default ${DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS}ms).`,
+          "Lower values refresh the brief more often; higher values reduce UI churn.",
+        ].join("\n"),
+        "info",
+      );
+      continue;
+    }
+    if (selected.startsWith("Global default:")) {
+      ui.notify(
+        global !== undefined
+          ? `Global default live wait poll interval: ${global}ms`
+          : `No global default set (effective falls back to ${DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS}ms).`,
+        "info",
+      );
+      continue;
+    }
+    if (selected.startsWith("Workflow-root override:")) {
+      ui.notify(
+        root !== undefined
+          ? `Workflow-root live wait poll override: ${root}ms`
+          : "No Workflow-root poll interval override is set.",
+        "info",
+      );
+      continue;
+    }
+
+    if (selected === SET_GLOBAL_LIVE_WAIT_POLL) {
+      const value = await promptLiveWaitPollInterval(ui, "global default");
+      if (value === undefined) continue;
+      try {
+        await coordinator.setGlobalLiveWaitPollIntervalMs(value);
+        ui.notify(`Global live wait poll interval set to ${value}ms.`, "info");
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+      }
+      continue;
+    }
+
+    if (selected === SET_ROOT_LIVE_WAIT_POLL) {
+      const value = await promptLiveWaitPollInterval(
+        ui,
+        "Workflow-root override",
+      );
+      if (value === undefined) continue;
+      try {
+        await coordinator.setRootLiveWaitPollIntervalMs(value);
+        ui.notify(
+          `Workflow-root live wait poll interval set to ${value}ms.`,
+          "info",
+        );
+      } catch (error) {
+        ui.notify(errorMessage(error), "error");
+      }
+      continue;
+    }
+
+    if (selected === CLEAR_ROOT_LIVE_WAIT_POLL) {
+      await coordinator.clearRootLiveWaitPollIntervalMs();
+      ui.notify(
+        `Cleared Workflow-root poll interval override. Effective falls back to global (or default ${DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS}ms).`,
+        "info",
+      );
+    }
+  }
+}
+
+export async function promptLiveWaitPollInterval(
+  ui: MattAutoUi,
+  layerLabel: string,
+): Promise<number | undefined> {
+  if (!ui.input) {
+    ui.notify(
+      "Live wait poll interval configuration needs an input UI to enter milliseconds.",
+      "warning",
+    );
+    return undefined;
+  }
+  const raw = await ui.input(
+    `Live wait poll interval (${layerLabel}) — ${MIN_LIVE_WAIT_POLL_INTERVAL_MS}–${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms`,
+    String(DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS),
+  );
+  if (raw === undefined) return undefined;
+  const parsed = parseLiveWaitPollIntervalInput(raw);
+  if (!parsed.ok) {
+    ui.notify(parsed.reason, "error");
+    return undefined;
+  }
+  return parsed.value;
 }
 
 /**
@@ -1997,6 +2178,13 @@ export async function runPostGrillPipeline(
   let stopPersistentLive = false;
   let persistentLiveOpen = false;
   const persistentLiveCapable = canPresentLiveWaitControls(ui);
+  const liveWaitPollIntervalMs =
+    typeof coordinator.getEffectiveLiveWaitPollIntervalMs === "function"
+      ? await coordinator.getEffectiveLiveWaitPollIntervalMs()
+      : DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS;
+  log("info", "pipeline:live-wait-poll-interval", {
+    intervalMs: liveWaitPollIntervalMs,
+  });
   const persistentLivePromise: Promise<unknown> = persistentLiveCapable
     ? (async () => {
         const activity = startGhosttyActivity(ui, {
@@ -2014,7 +2202,7 @@ export async function runPostGrillPipeline(
           if (!panel || stopPersistentLive) return;
           persistentLiveOpen = true;
           const live = await presentLiveWaitControls(ui, coordinator, panel, {
-            pollIntervalMs: 500,
+            pollIntervalMs: liveWaitPollIntervalMs,
             holdUntilRunEnd: true,
             shouldFinish: () =>
               stopPersistentLive || coordinator.isRunTerminated(),
@@ -2119,6 +2307,7 @@ export async function runPostGrillPipeline(
     // Pipeline pause keeps the brief visible until Resume or Terminate.
     if (coordinator.isPipelinePaused()) {
       const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        pollIntervalMs: liveWaitPollIntervalMs,
         skipLiveSurface: skipPersistentLiveSurface(),
       });
       if (isWaitStopResult(waitResult)) {
@@ -2197,6 +2386,7 @@ export async function runPostGrillPipeline(
           ...(diagnostic ? { nextActionsDiagnostic: diagnostic } : {}),
         });
         const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+          pollIntervalMs: liveWaitPollIntervalMs,
           skipLiveSurface: skipPersistentLiveSurface(),
         });
         if (isWaitStopResult(waitResult)) {
@@ -2275,6 +2465,7 @@ export async function runPostGrillPipeline(
         return;
       }
       const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        pollIntervalMs: liveWaitPollIntervalMs,
         skipLiveSurface: skipPersistentLiveSurface(),
       });
       if (isWaitStopResult(waitResult)) {
@@ -2332,6 +2523,7 @@ export async function runPostGrillPipeline(
               })),
             });
             const waitResult = await waitForPipelineWorkers(coordinator, ui, {
+        pollIntervalMs: liveWaitPollIntervalMs,
         skipLiveSurface: skipPersistentLiveSurface(),
       });
             if (isWaitStopResult(waitResult)) {

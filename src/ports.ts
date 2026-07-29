@@ -810,6 +810,16 @@ export type PreferencesPort = {
   /** Clear the Workflow-root Worker concurrency override. */
   clearRootWorkerConcurrency(): Promise<void>;
   /**
+   * Global default live run-brief poll interval in ms, if set.
+   * Integer in [200, 10000]; invalid stored values are treated as unset.
+   */
+  getGlobalLiveWaitPollIntervalMs(): Promise<number | undefined>;
+  /** Workflow-root live wait poll interval override in ms, if set. */
+  getRootLiveWaitPollIntervalMs(): Promise<number | undefined>;
+  setGlobalLiveWaitPollIntervalMs(intervalMs: number): Promise<void>;
+  setRootLiveWaitPollIntervalMs(intervalMs: number): Promise<void>;
+  clearRootLiveWaitPollIntervalMs(): Promise<void>;
+  /**
    * Legacy rebuildable local pointer to the Active workflow ID for a bare
    * Target branch. New coordination-aware homes use WorkflowHomeBinding below;
    * this remains only for version-1 compatibility and one-time migration.

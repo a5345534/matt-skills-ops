@@ -1231,7 +1231,16 @@ export type WorkflowCoordinator = {
    */
   setRootWorkerConcurrency(concurrency: number): Promise<void>;
   /** Remove the Workflow-root Worker concurrency override (global default remains). */
-  clearRootWorkerConcurrency(): Promise<void>;
+    clearRootWorkerConcurrency(): Promise<void>;
+  /**
+   * Effective live run-brief poll interval after root → global → default (500ms).
+   */
+  getEffectiveLiveWaitPollIntervalMs(): Promise<number>;
+  getGlobalLiveWaitPollIntervalMs(): Promise<number | undefined>;
+  getRootLiveWaitPollIntervalMs(): Promise<number | undefined>;
+  setGlobalLiveWaitPollIntervalMs(intervalMs: number): Promise<void>;
+  setRootLiveWaitPollIntervalMs(intervalMs: number): Promise<void>;
+  clearRootLiveWaitPollIntervalMs(): Promise<void>;
   /**
    * Authenticated available models from Pi’s catalog.
    * Used by Worker profile menus; never mutates the home model.

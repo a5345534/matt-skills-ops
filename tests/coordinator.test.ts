@@ -1072,6 +1072,11 @@ function createPreferences(state: PrefState = {}): PreferencesPort {
     clearRootWorkerConcurrency: async () => {
       delete store.rootWorkerConcurrency;
     },
+    getGlobalLiveWaitPollIntervalMs: async () => undefined,
+    getRootLiveWaitPollIntervalMs: async () => undefined,
+    setGlobalLiveWaitPollIntervalMs: async () => {},
+    setRootLiveWaitPollIntervalMs: async () => {},
+    clearRootLiveWaitPollIntervalMs: async () => {},
     getActiveWorkflowId: async (targetBranch) =>
       store.activeWorkflowIds?.[targetBranch],
     setActiveWorkflowId: async (targetBranch, workflowId) => {

@@ -1,7 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_WORKER_CONCURRENCY } from "../constants.js";
+import {
+  DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS,
+  DEFAULT_WORKER_CONCURRENCY,
+  MAX_LIVE_WAIT_POLL_INTERVAL_MS,
+  MIN_LIVE_WAIT_POLL_INTERVAL_MS,
+} from "../constants.js";
 import {
   canonicalTargetIdentitiesEqual,
   canonicalTargetIdentityKey,
@@ -19,6 +24,8 @@ type PreferencesFile = {
   workerProfile?: WorkerProfile;
   /** Optional positive integer Worker concurrency for this prefs layer. */
   workerConcurrency?: number;
+  /** Optional live run-brief poll interval in milliseconds for this prefs layer. */
+  liveWaitPollIntervalMs?: number;
   /** Target branch → Active Workflow ID (legacy rebuildable local cache). */
   activeWorkflowIds?: Record<string, number>;
   /** Canonical Target identity → checkout-local Workflow-home routing binding. */
@@ -46,6 +53,52 @@ export type WorkerConcurrencySource =
   | "workflow-root"
   | "global"
   | "default";
+
+/** Where an effective live-wait poll interval was resolved from. */
+export type LiveWaitPollIntervalSource =
+  | "workflow-root"
+  | "global"
+  | "default";
+
+export type ResolvedLiveWaitPollInterval = {
+  intervalMs: number;
+  source: LiveWaitPollIntervalSource;
+};
+
+/** True when value is an integer within the live-wait poll interval bounds. */
+export function isValidLiveWaitPollIntervalMs(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= MIN_LIVE_WAIT_POLL_INTERVAL_MS &&
+    value <= MAX_LIVE_WAIT_POLL_INTERVAL_MS
+  );
+}
+
+export function assertValidLiveWaitPollIntervalMs(
+  value: unknown,
+): asserts value is number {
+  if (!isValidLiveWaitPollIntervalMs(value)) {
+    throw new Error(
+      `Live wait poll interval must be an integer between ${MIN_LIVE_WAIT_POLL_INTERVAL_MS} and ${MAX_LIVE_WAIT_POLL_INTERVAL_MS} ms.`,
+    );
+  }
+}
+
+/** Resolve live-wait poll interval: root → global → default 500ms. */
+export function resolveLiveWaitPollInterval(
+  root: number | undefined,
+  global: number | undefined,
+  defaultValue: number = DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS,
+): ResolvedLiveWaitPollInterval {
+  if (isValidLiveWaitPollIntervalMs(root)) {
+    return { intervalMs: root, source: "workflow-root" };
+  }
+  if (isValidLiveWaitPollIntervalMs(global)) {
+    return { intervalMs: global, source: "global" };
+  }
+  return { intervalMs: defaultValue, source: "default" };
+}
 
 /** Effective Worker concurrency with the layer that supplied it. */
 export type ResolvedWorkerConcurrency = {
@@ -274,6 +327,47 @@ export function createPreferencesPort(workflowRoot: string): PreferencesPort {
         return;
       }
       const { workerConcurrency: _removed, ...rest } = existing;
+      await writePreferencesFile(rootPrefsPath, rest);
+    },
+
+    async getGlobalLiveWaitPollIntervalMs() {
+      const global = await readPreferencesFile(globalPrefsPath);
+      return isValidLiveWaitPollIntervalMs(global?.liveWaitPollIntervalMs)
+        ? global.liveWaitPollIntervalMs
+        : undefined;
+    },
+
+    async getRootLiveWaitPollIntervalMs() {
+      const root = await readPreferencesFile(rootPrefsPath);
+      return isValidLiveWaitPollIntervalMs(root?.liveWaitPollIntervalMs)
+        ? root.liveWaitPollIntervalMs
+        : undefined;
+    },
+
+    async setGlobalLiveWaitPollIntervalMs(intervalMs: number) {
+      assertValidLiveWaitPollIntervalMs(intervalMs);
+      const existing = (await readPreferencesFile(globalPrefsPath)) ?? {};
+      await writePreferencesFile(globalPrefsPath, {
+        ...existing,
+        liveWaitPollIntervalMs: intervalMs,
+      });
+    },
+
+    async setRootLiveWaitPollIntervalMs(intervalMs: number) {
+      assertValidLiveWaitPollIntervalMs(intervalMs);
+      const existing = (await readPreferencesFile(rootPrefsPath)) ?? {};
+      await writePreferencesFile(rootPrefsPath, {
+        ...existing,
+        liveWaitPollIntervalMs: intervalMs,
+      });
+    },
+
+    async clearRootLiveWaitPollIntervalMs() {
+      const existing = await readPreferencesFile(rootPrefsPath);
+      if (!existing || existing.liveWaitPollIntervalMs === undefined) {
+        return;
+      }
+      const { liveWaitPollIntervalMs: _removed, ...rest } = existing;
       await writePreferencesFile(rootPrefsPath, rest);
     },
 

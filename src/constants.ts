@@ -8,6 +8,13 @@ export const DEFAULT_TARGET_BRANCH = "main";
  */
 export const DEFAULT_WORKER_CONCURRENCY = 2;
 
+/** Default live run-brief poll interval when no preference is set. */
+export const DEFAULT_LIVE_WAIT_POLL_INTERVAL_MS = 500;
+
+/** Inclusive bounds for live wait poll interval preference (milliseconds). */
+export const MIN_LIVE_WAIT_POLL_INTERVAL_MS = 200;
+export const MAX_LIVE_WAIT_POLL_INTERVAL_MS = 10_000;
+
 /**
  * Default lifetime for a renewable remote coordination lease. The coordinator
  * renews well before this TTL; expiry allows a crashed Workflow home to be
