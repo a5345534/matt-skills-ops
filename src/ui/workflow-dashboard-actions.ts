@@ -271,13 +271,24 @@ export function buildDashboardActionResultView(
         tone: "info",
         title: `${stageLabel(result.stage)} running`,
         lines: [
-          `Ticket: #${result.ticketNumber}`,
+          ...(result.stage === "target-refresh"
+            ? [
+                `Target branch: ${result.targetBranch}`,
+                `Integration branch: ${result.integrationBranch}`,
+                ...(result.targetSha
+                  ? [`Target SHA: ${result.targetSha.slice(0, 12)}`]
+                  : []),
+              ]
+            : [`Ticket: #${result.ticketNumber}`]),
           `Attempt: r${result.attempt}`,
           ...(result.stage === "implement"
             ? [`Worktree: ${result.worktreePath}`]
             : []),
         ],
-        action: "Watch the Worker telemetry; a disposition appears after Implementation completes.",
+        action:
+          result.stage === "target-refresh"
+            ? "Watch Target-refresh / Conflict resolution telemetry; the Target-branch lease is held until verification and PR update complete."
+            : "Watch the Worker telemetry; a disposition appears after Implementation completes.",
       };
     case "pending-ci":
       return {
@@ -830,6 +841,8 @@ function stageLabel(stage: StageId): string {
       return "CI gate";
     case "workflow-pr":
       return "Workflow PR";
+    case "target-refresh":
+      return "Target-branch refresh";
     case "cleanup":
       return "Workflow cleanup";
     case "rework":

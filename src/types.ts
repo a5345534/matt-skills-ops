@@ -42,6 +42,8 @@ export type StageId =
   | "integrate"
   | "ci-gate"
   | "workflow-pr"
+  /** Target-branch refresh of the Integration branch before automatic merge. */
+  | "target-refresh"
   | "cleanup"
   | "rework"
   | "follow-up"
@@ -660,6 +662,20 @@ export type StageResult =
       conflictResolution?: true;
     }
   | {
+      status: "running";
+      stage: "target-refresh";
+      workflowId: number;
+      attempt: number;
+      workerId: string;
+      integrationBranch: string;
+      integrationWorktreePath?: string;
+      targetBranch: string;
+      /** Exact Target SHA being merged, when known. */
+      targetSha?: string;
+      /** True when a Conflict resolution worker owns the Target-refresh merge. */
+      conflictResolution?: true;
+    }
+  | {
       status: "needs-disposition";
       stage: "implement";
       workflowId: number;
@@ -715,6 +731,10 @@ export type StageResult =
       workflowPrUrl?: string;
       /** Target branch for the Workflow PR. */
       targetBranch?: string;
+      /** Exact Target object ID used for the most recent Target-branch refresh. */
+      validatedTargetSha?: string;
+      /** Exact Integration / PR head SHA after a Target-branch refresh. */
+      headSha?: string;
       /** Branches removed by paired Workflow cleanup (local + remote). */
       removedBranches?: readonly string[];
       /** True when paired cleanup removed local workspaces/transcripts. */

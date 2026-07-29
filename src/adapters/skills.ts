@@ -5,6 +5,7 @@ import type {
   CreateSpecSkillOutcome,
   CreateTicketsSkillOutcome,
   PrepareImplementOutcome,
+  PrepareResolveConflictsInput,
   SkillsPort,
 } from "../ports.js";
 
@@ -26,11 +27,9 @@ export type SkillsHost = {
     ticketNumber: number;
     title: string;
   }): Promise<PrepareImplementOutcome>;
-  prepareResolveConflicts?(input: {
-    ticketNumber: number;
-    ticketBranch: string;
-    integrationBranch: string;
-  }): Promise<PrepareImplementOutcome>;
+  prepareResolveConflicts?(
+    input: PrepareResolveConflictsInput,
+  ): Promise<PrepareImplementOutcome>;
 };
 
 /** @deprecated Prefer SkillsHost; kept for existing Create-spec wiring. */
@@ -229,6 +228,43 @@ export function createSkillsPort(
         return conflictHost.prepareResolveConflicts(input);
       }
 
+      const stageResultBlock = [
+        "## Matt Auto Stage result (required)",
+        "When finished, print a single JSON object (optionally in a ```json fence):",
+        "```json",
+        '{ "type": "stage-result", "outcome": { "status": "completed", "summary": "merge conflict resolved" } }',
+        "```",
+      ];
+
+      if (input.kind === "target-refresh") {
+        return {
+          ok: true,
+          skillCommand: "/resolving-merge-conflicts",
+          prompt: [
+            `/resolving-merge-conflicts`,
+            "",
+            "Resolve the in-progress merge conflict from a Target-branch refresh.",
+            `Integration branch: ${input.integrationBranch}`,
+            `Target branch: ${input.targetBranch}`,
+            `Expected target SHA: ${input.targetSha}`,
+            ...(input.targetLeaseGeneration !== undefined
+              ? [
+                  `Target-branch lease generation: ${input.targetLeaseGeneration}`,
+                ]
+              : []),
+            ...(input.workflowId !== undefined
+              ? [`Workflow ID: #${input.workflowId}`]
+              : []),
+            "",
+            "Work only in this Integration workspace. Always resolve; never --abort.",
+            "Do not push, edit GitHub issues, rebase, or mutate remote workflow state.",
+            "Do not push the Target branch.",
+            "",
+            ...stageResultBlock,
+          ].join("\n"),
+        };
+      }
+
       return {
         ok: true,
         skillCommand: "/resolving-merge-conflicts",
@@ -242,11 +278,7 @@ export function createSkillsPort(
           "Work only in this Integration workspace. Always resolve; never --abort.",
           "Do not push, edit GitHub issues, or mutate remote workflow state.",
           "",
-          "## Matt Auto Stage result (required)",
-          "When finished, print a single JSON object (optionally in a ```json fence):",
-          "```json",
-          '{ "type": "stage-result", "outcome": { "status": "completed", "summary": "merge conflict resolved" } }',
-          "```",
+          ...stageResultBlock,
         ].join("\n"),
       };
     },

@@ -20,6 +20,7 @@ import {
   MERGE_WORKFLOW_PR_ACTION,
   NO_GIT_REPOSITORY_REASON,
   OPEN_WORKFLOW_PR_ACTION,
+  REFRESH_FROM_TARGET_ACTION,
   parseCheckCiActionId,
   parseCiRecoveryActionId,
   parseDispositionActionId,
@@ -71,6 +72,21 @@ import {
   type RepositoryWorkerDemand,
   type RepositoryWorkerSlotPlan,
 } from "./worker-capacity.js";
+import {
+  createTargetBranchQueueOrchestrator,
+  type TargetBranchQueueOrchestrator,
+} from "./target-branch-queue.js";
+import {
+  mergeTargetIntoIntegration,
+  recordTargetRefreshFailure,
+  refreshedWorkflowPrFreshness,
+  releaseTargetRefreshForPrChecks,
+  TARGET_REFRESH_FAILURE_REASONS,
+  TARGET_REFRESH_TRANSCRIPT_TICKET,
+  targetRefreshConflictSkillInput,
+  ticketIntegrationConflictSkillInput,
+  type TargetRefreshConflict,
+} from "./target-refresh.js";
 import type {
   RootScopedPorts,
   TrackerTicket,
@@ -432,14 +448,25 @@ type ActiveImplementationWorker = {
 /**
  * Session-owned Conflict resolution worker for an in-progress Integration merge.
  * Runs the installed resolving-merge-conflicts skill in the Integration workspace.
+ * Supports ticket-to-Integration conflicts and Target-branch refresh conflicts.
  */
 type ActiveConflictWorker = {
   workerId: string;
   workflowId: number;
+  /**
+   * Ticket number for ticket-to-Integration conflicts.
+   * Target-refresh uses TARGET_REFRESH_TRANSCRIPT_TICKET (0).
+   */
   ticketNumber: number;
   attempt: number;
+  /** Discriminates ticket-to-Integration vs Target-refresh conflict ownership. */
+  resolutionKind: "ticket-integration" | "target-refresh";
   integrationBranch: string;
   integrationWorktreePath: string;
+  /** Target-refresh context when resolutionKind is target-refresh. */
+  targetBranch?: string;
+  targetSha?: string;
+  targetLeaseGeneration?: number;
   status: ImplementationWorkerStatus;
   /** Exact model profile used for this launched conflict-resolution attempt. */
   workerProfile?: WorkerProfile;
@@ -453,6 +480,22 @@ type ActiveConflictWorker = {
   /** Epoch ms when this conflict worker was launched (R1 runtime base). */
   startedAtMs: number;
   receivedStageResult: boolean;
+};
+
+/**
+ * In-flight Target-branch refresh of the Integration branch.
+ * Holds facts needed to resume Conflict resolution or finalize after a clean merge.
+ */
+type PendingTargetRefresh = {
+  workflowId: number;
+  attempt: number;
+  targetBranch: string;
+  integrationBranch: string;
+  integrationWorktreePath: string;
+  targetSha?: string;
+  targetLeaseGeneration?: number;
+  lastFailure?: string;
+  conflict?: TargetRefreshConflict;
 };
 
 /**
@@ -552,8 +595,20 @@ export function createWorkflowCoordinator(
   /**
    * Session-owned Conflict resolution worker for a preserved in-progress merge.
    * Lifetime is bound to Workflow home; never durable across processes.
+   * Handles both ticket-to-Integration and Target-refresh conflicts.
    */
   let activeConflictWorker: ActiveConflictWorker | undefined;
+  /**
+   * In-flight Target-branch refresh (merge Target into Integration under the
+   * Target-branch lease). Serialized with Integration units and conflict workers.
+   */
+  let pendingTargetRefresh: PendingTargetRefresh | undefined;
+  let targetRefreshInProgress = false;
+  /**
+   * Queue orchestrator that holds the Target-branch lease for the active refresh.
+   * Kept alive across Conflict resolution so finalize / fail can release the lane.
+   */
+  let targetDeliveryQueue: TargetBranchQueueOrchestrator | undefined;
   let pendingCiRecovery: PendingCiRecovery | undefined;
   /**
    * Session pointer to the most recently cleaned-up workflow on this Target branch.
@@ -912,7 +967,10 @@ export function createWorkflowCoordinator(
     const reason = implementationLaunchBlockReason({
       slots,
       pendingDisposition: hasNeedsDispositionWaiting(),
-      pendingIntegration: pendingIntegration !== undefined,
+      // Target-branch refresh is serialized like an Integration unit: no new
+      // Implementation workers while the serial Target delivery lane is active.
+      pendingIntegration:
+        pendingIntegration !== undefined || pendingTargetRefresh !== undefined,
       activeConflictWorker: activeConflictWorker !== undefined,
       // Specific ticket readiness is checked separately; treat as non-empty here.
       readyCount: 1,
@@ -2917,8 +2975,21 @@ export function createWorkflowCoordinator(
       const progressText = activeConflictWorker.progress
         ? ` — ${activeConflictWorker.progress}`
         : "";
+      if (activeConflictWorker.resolutionKind === "target-refresh") {
+        lines.push(
+          `Target-refresh conflict r${activeConflictWorker.attempt}: ${activeConflictWorker.status}${progressText}`,
+        );
+      } else {
+        lines.push(
+          `Conflict resolution #${activeConflictWorker.ticketNumber} r${activeConflictWorker.attempt}: ${activeConflictWorker.status}${progressText}`,
+        );
+      }
+    } else if (pendingTargetRefresh) {
+      const failure = pendingTargetRefresh.lastFailure
+        ? ` — ${pendingTargetRefresh.lastFailure}`
+        : "";
       lines.push(
-        `Conflict resolution #${activeConflictWorker.ticketNumber} r${activeConflictWorker.attempt}: ${activeConflictWorker.status}${progressText}`,
+        `Target-refresh r${pendingTargetRefresh.attempt}: ${targetRefreshInProgress ? "running" : "pending-retry"}${failure}`,
       );
     } else if (pendingIntegration) {
       const failure = pendingIntegration.lastFailure
@@ -3343,6 +3414,23 @@ export function createWorkflowCoordinator(
         return [];
       }
 
+      // Target-branch refresh owns the operator surface while the lease is held
+      // or a Target-refresh Conflict resolution worker is active.
+      if (pendingTargetRefresh && !targetRefreshInProgress && !activeConflictWorker) {
+        return [
+          {
+            id: REFRESH_FROM_TARGET_ACTION.id,
+            label: `Retry ${REFRESH_FROM_TARGET_ACTION.label}`,
+            description:
+              pendingTargetRefresh.lastFailure ??
+              REFRESH_FROM_TARGET_ACTION.description,
+          },
+        ];
+      }
+      if (pendingTargetRefresh && (targetRefreshInProgress || activeConflictWorker)) {
+        return [];
+      }
+
       // Legacy workflows retain local N/running accounting. Coordination-aware
       // workflows preview the shared remote plan instead; conditional slot
       // acquisition in startImplementation remains the authoritative fence.
@@ -3486,6 +3574,20 @@ export function createWorkflowCoordinator(
               description: `${OPEN_WORKFLOW_PR_ACTION.description} Target branch: ${active.targetBranch}.`,
             });
           } else if (active.stage === "pr-opened") {
+            if (active.coordination) {
+              const candidate = active.coordination.queueCandidate;
+              const refreshable =
+                candidate?.state === "merge-ready" ||
+                candidate?.state === "refreshing" ||
+                pendingTargetRefresh !== undefined;
+              if (refreshable && !targetRefreshInProgress) {
+                actions.unshift({
+                  id: REFRESH_FROM_TARGET_ACTION.id,
+                  label: REFRESH_FROM_TARGET_ACTION.label,
+                  description: `${REFRESH_FROM_TARGET_ACTION.description} PR #${active.workflowPr.number} → ${active.workflowPr.baseBranch}.`,
+                });
+              }
+            }
             actions.unshift({
               id: MERGE_WORKFLOW_PR_ACTION.id,
               label: MERGE_WORKFLOW_PR_ACTION.label,
@@ -3558,6 +3660,10 @@ export function createWorkflowCoordinator(
 
     if (actionId === OPEN_WORKFLOW_PR_ACTION.id) {
       return openWorkflowPr();
+    }
+
+    if (actionId === REFRESH_FROM_TARGET_ACTION.id) {
+      return runTargetRefresh();
     }
 
     if (actionId === MERGE_WORKFLOW_PR_ACTION.id) {
@@ -4987,6 +5093,23 @@ export function createWorkflowCoordinator(
         worker.status = "completed";
         activeConflictWorker = undefined;
 
+        if (worker.resolutionKind === "target-refresh") {
+          const pending = pendingTargetRefresh;
+          if (!pending || pending.workflowId !== worker.workflowId) {
+            return;
+          }
+          delete pending.conflict;
+          delete pending.lastFailure;
+          if (worker.targetSha) pending.targetSha = worker.targetSha;
+          targetRefreshInProgress = true;
+          try {
+            await finishTargetRefreshAfterMerge(bound, pending);
+          } finally {
+            targetRefreshInProgress = false;
+          }
+          return;
+        }
+
         const unit = pendingIntegration;
         if (
           !unit ||
@@ -5016,16 +5139,33 @@ export function createWorkflowCoordinator(
 
       worker.status = "failed";
       activeConflictWorker = undefined;
+      await bound.transcripts.append(transcriptKey, {
+        type: "conflict-resolution-failed",
+        reason: event.outcome.reason,
+        resolutionKind: worker.resolutionKind,
+      });
+
+      if (worker.resolutionKind === "target-refresh") {
+        if (
+          pendingTargetRefresh &&
+          pendingTargetRefresh.workflowId === worker.workflowId
+        ) {
+          pendingTargetRefresh.lastFailure = `Conflict resolution failed: ${event.outcome.reason}`;
+        }
+        await failTargetRefresh(bound, {
+          failureKind: "deterministic",
+          reason: TARGET_REFRESH_FAILURE_REASONS.conflictResolutionFailed,
+          detail: event.outcome.reason,
+        });
+        return;
+      }
+
       if (
         pendingIntegration &&
         pendingIntegration.ticketNumber === worker.ticketNumber
       ) {
         pendingIntegration.lastFailure = `Conflict resolution failed: ${event.outcome.reason}`;
       }
-      await bound.transcripts.append(transcriptKey, {
-        type: "conflict-resolution-failed",
-        reason: event.outcome.reason,
-      });
       return;
     }
 
@@ -5036,18 +5176,37 @@ export function createWorkflowCoordinator(
     worker.status = "compatibility-recovery";
     activeConflictWorker = undefined;
     const reason =
-      "Conflict resolution worker process exited without a Stage result on the Worker protocol. Matt Auto entered Compatibility recovery rather than guessing merges.";
+      worker.resolutionKind === "target-refresh"
+        ? "Target-refresh Conflict resolution worker process exited without a Stage result on the Worker protocol. Matt Auto entered Compatibility recovery rather than guessing merges."
+        : "Conflict resolution worker process exited without a Stage result on the Worker protocol. Matt Auto entered Compatibility recovery rather than guessing merges.";
+    await bound.transcripts.append(transcriptKey, {
+      type: "compatibility-recovery",
+      reason,
+      code: event.code,
+      resolutionKind: worker.resolutionKind,
+    });
+
+    if (worker.resolutionKind === "target-refresh") {
+      if (
+        pendingTargetRefresh &&
+        pendingTargetRefresh.workflowId === worker.workflowId
+      ) {
+        pendingTargetRefresh.lastFailure = `Compatibility recovery: ${reason}`;
+      }
+      await failTargetRefresh(bound, {
+        failureKind: "deterministic",
+        reason: TARGET_REFRESH_FAILURE_REASONS.missingStageResult,
+        detail: reason,
+      });
+      return;
+    }
+
     if (
       pendingIntegration &&
       pendingIntegration.ticketNumber === worker.ticketNumber
     ) {
       pendingIntegration.lastFailure = `Compatibility recovery: ${reason}`;
     }
-    await bound.transcripts.append(transcriptKey, {
-      type: "compatibility-recovery",
-      reason,
-      code: event.code,
-    });
   }
 
   async function confirmDisposition(
@@ -5512,11 +5671,13 @@ export function createWorkflowCoordinator(
       };
     }
 
-    const prepared = await bound.skills.prepareResolveConflicts({
-      ticketNumber: unit.ticketNumber,
-      ticketBranch: unit.branchName,
-      integrationBranch: conflict.integrationBranch,
-    });
+    const prepared = await bound.skills.prepareResolveConflicts(
+      ticketIntegrationConflictSkillInput({
+        ticketNumber: unit.ticketNumber,
+        ticketBranch: unit.branchName,
+        integrationBranch: conflict.integrationBranch,
+      }),
+    );
     if (!prepared.ok) {
       unit.lastFailure = prepared.reason;
       return {
@@ -5534,6 +5695,7 @@ export function createWorkflowCoordinator(
       workflowId: unit.workflowId,
       ticketNumber: unit.ticketNumber,
       attempt: unit.attempt,
+      resolutionKind: "ticket-integration",
       integrationBranch: conflict.integrationBranch,
       integrationWorktreePath: conflict.integrationWorktreePath,
       status: "running",
@@ -5888,6 +6050,725 @@ export function createWorkflowCoordinator(
       if (heldGuard) {
         integrationInProgress = false;
       }
+    }
+  }
+
+  function targetRefreshTranscriptKey(pending: PendingTargetRefresh) {
+    return {
+      workflowId: pending.workflowId,
+      ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+      attempt: pending.attempt,
+    };
+  }
+
+  function clearTargetRefreshState(): void {
+    pendingTargetRefresh = undefined;
+    targetRefreshInProgress = false;
+    targetDeliveryQueue = undefined;
+  }
+
+  async function ensureTargetDeliveryQueue(
+    bound: RootScopedPorts,
+    active: ActiveWorkflow,
+  ): Promise<
+    | { ok: true; queue: TargetBranchQueueOrchestrator }
+    | { ok: false; reason: string }
+  > {
+    if (!active.coordination) {
+      return {
+        ok: false,
+        reason:
+          "Target-branch refresh requires a coordination-aware Workflow manifest.",
+      };
+    }
+    if (!bound.coordination) {
+      return {
+        ok: false,
+        reason:
+          "Target-branch refresh requires a CoordinationPort on this Workflow root.",
+      };
+    }
+    if (targetDeliveryQueue) {
+      return { ok: true, queue: targetDeliveryQueue };
+    }
+    const queue = createTargetBranchQueueOrchestrator({
+      target: active.coordination.target,
+      workflowId: active.workflowId,
+      holderId: workflowHomeHolderId,
+      coordination: bound.coordination,
+      store: {
+        listActiveWorkflows: (target) => bound.tracker.findActiveWorkflows(target),
+        writeWorkflowManifest: (workflowId, manifest) =>
+          bound.tracker.writeWorkflowManifest(workflowId, manifest),
+      },
+    });
+    targetDeliveryQueue = queue;
+    return { ok: true, queue };
+  }
+
+  async function failTargetRefresh(
+    bound: RootScopedPorts,
+    input: {
+      failureKind: "transient" | "deterministic";
+      reason: string;
+      detail?: string;
+    },
+  ): Promise<StageResult> {
+    const pending = pendingTargetRefresh;
+    const workflowId = pending?.workflowId;
+    const attempt = pending?.attempt ?? 1;
+    const detailReason = input.detail
+      ? `${input.reason}: ${input.detail}`
+      : input.reason;
+
+    if (pending) {
+      pending.lastFailure = detailReason;
+      await bound.transcripts.append(targetRefreshTranscriptKey(pending), {
+        type: "target-refresh-failed",
+        reason: detailReason,
+        failureKind: input.failureKind,
+      });
+    }
+
+    const active =
+      workflowId !== undefined
+        ? await loadActiveWorkflow(bound, { force: true })
+        : undefined;
+    if (
+      active &&
+      active.workflowId === workflowId &&
+      active.coordination &&
+      bound.coordination
+    ) {
+      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+      if (authority.ok && authority.lease) {
+        const queueResult = await ensureTargetDeliveryQueue(bound, active);
+        if (queueResult.ok) {
+          await recordTargetRefreshFailure({
+            queue: queueResult.queue,
+            workflowCoordinatorLease: authority.lease,
+            failureKind: input.failureKind,
+            reason: input.reason,
+          });
+        } else if (targetDeliveryQueue) {
+          await targetDeliveryQueue.transition({
+            kind: "release-held-target-lease",
+          });
+        }
+      } else if (targetDeliveryQueue) {
+        await targetDeliveryQueue.transition({
+          kind: "release-held-target-lease",
+        });
+      }
+    } else if (targetDeliveryQueue) {
+      await targetDeliveryQueue.transition({ kind: "release-held-target-lease" });
+    }
+
+    clearTargetRefreshState();
+    return {
+      status: "failed",
+      stage: "target-refresh",
+      reason: detailReason,
+      ...(workflowId !== undefined ? { workflowId } : {}),
+      attempt,
+      ...(pending?.integrationBranch
+        ? { integrationBranch: pending.integrationBranch }
+        : {}),
+      ...(pending?.targetBranch ? { targetBranch: pending.targetBranch } : {}),
+      ...(pending?.targetSha
+        ? { validatedTargetSha: pending.targetSha }
+        : {}),
+    };
+  }
+
+  async function finishTargetRefreshAfterMerge(
+    bound: RootScopedPorts,
+    pending: PendingTargetRefresh,
+  ): Promise<StageResult> {
+    const heldGuard = !targetRefreshInProgress;
+    if (heldGuard) targetRefreshInProgress = true;
+    const transcriptKey = targetRefreshTranscriptKey(pending);
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
+
+    try {
+      const active = await loadActiveWorkflow(bound, { force: true });
+      if (!active || active.workflowId !== pending.workflowId) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+          detail:
+            "No bound Active workflow matches this Target-branch refresh.",
+        });
+      }
+      if (!active.coordination?.prFreshness) {
+        return failTargetRefresh(bound, {
+          failureKind: "deterministic",
+          reason: TARGET_REFRESH_FAILURE_REASONS.prUpdateFailed,
+          detail:
+            "Workflow PR freshness facts are required to persist the refreshed Target SHA.",
+        });
+      }
+      if (!pending.targetSha) {
+        return failTargetRefresh(bound, {
+          failureKind: "deterministic",
+          reason: TARGET_REFRESH_FAILURE_REASONS.mergeError,
+          detail: "Target-branch refresh completed without a recorded Target SHA.",
+        });
+      }
+
+      const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+      if (!authority.ok || !authority.lease) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+          detail: authority.ok
+            ? "Workflow coordinator lease is unavailable for Target-refresh finalization."
+            : authority.reason,
+        });
+      }
+
+      const queueResult = await ensureTargetDeliveryQueue(bound, active);
+      if (!queueResult.ok) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+          detail: queueResult.reason,
+        });
+      }
+
+      // Renew the Target-branch lease while local verification runs.
+      await queueResult.queue.transition({ kind: "renew-held-target-lease" });
+
+      const verification = await bound.verification.runLocalVerification(
+        pending.integrationWorktreePath,
+      );
+      if (!verification.ok) {
+        return failTargetRefresh(bound, {
+          failureKind: "deterministic",
+          reason: TARGET_REFRESH_FAILURE_REASONS.localVerificationFailed,
+          detail: verification.reason,
+        });
+      }
+      await bound.transcripts.append(transcriptKey, {
+        type: "target-refresh-local-verification",
+        commands: verification.commands,
+      });
+
+      const pushAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!pushAuthority.ok || !pushAuthority.lease) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+          detail: pushAuthority.ok
+            ? "Workflow coordinator lease is unavailable for Target-refresh push."
+            : pushAuthority.reason,
+        });
+      }
+
+      try {
+        await bound.remoteGit.pushBranch(pending.integrationBranch);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.pushFailed,
+          detail: message,
+        });
+      }
+
+      const head = await bound.workspace.hasCommitsAhead({
+        worktreePath: pending.integrationWorktreePath,
+        baseRef: pending.targetBranch,
+      });
+      const headSha = head.headSha;
+      if (!headSha) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.prUpdateFailed,
+          detail: "Could not resolve the refreshed Integration head SHA after push.",
+        });
+      }
+
+      const prFreshness = refreshedWorkflowPrFreshness({
+        headSha,
+        validatedTargetSha: pending.targetSha,
+        mergeMethod: active.coordination.prFreshness.mergeMethod,
+      });
+
+      const releaseAuthority = await ensureActiveWorkflowCoordinatorLease(
+        bound,
+        active,
+      );
+      if (!releaseAuthority.ok || !releaseAuthority.lease) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+          detail: releaseAuthority.ok
+            ? "Workflow coordinator lease is unavailable for Target-refresh PR update."
+            : releaseAuthority.reason,
+        });
+      }
+
+      const released = await releaseTargetRefreshForPrChecks({
+        queue: queueResult.queue,
+        workflowCoordinatorLease: releaseAuthority.lease,
+        prFreshness,
+      });
+      if (!released.ok) {
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.prUpdateFailed,
+          detail: released.reason,
+        });
+      }
+
+      await bound.transcripts.append(transcriptKey, {
+        type: "target-refresh-completed",
+        targetSha: pending.targetSha,
+        headSha,
+        integrationBranch: pending.integrationBranch,
+        pushedBranches: [pending.integrationBranch],
+      });
+
+      clearTargetRefreshState();
+      invalidatePanelCaches();
+
+      return {
+        status: "completed",
+        stage: "target-refresh",
+        workflowId: pending.workflowId,
+        attempt: pending.attempt,
+        integrationBranch: pending.integrationBranch,
+        integrationWorktreePath: pending.integrationWorktreePath,
+        targetBranch: pending.targetBranch,
+        validatedTargetSha: pending.targetSha,
+        headSha,
+        localVerification: {
+          ok: true,
+          commands: verification.commands,
+        },
+        pushedBranches: [pending.integrationBranch],
+      };
+    } finally {
+      stopHeartbeat();
+      if (heldGuard) targetRefreshInProgress = false;
+    }
+  }
+
+  async function launchTargetRefreshConflictWorker(
+    bound: RootScopedPorts,
+    pending: PendingTargetRefresh,
+    conflict: TargetRefreshConflict,
+  ): Promise<StageResult> {
+    pending.conflict = conflict;
+    pending.targetSha = conflict.targetSha;
+    const transcriptKey = targetRefreshTranscriptKey(pending);
+
+    const active = await loadActiveWorkflow(bound, { force: true });
+    if (!active || active.workflowId !== pending.workflowId) {
+      return failTargetRefresh(bound, {
+        failureKind: "transient",
+        reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+        detail:
+          "No bound Active workflow matches this Target-refresh Conflict resolution worker.",
+      });
+    }
+    const conflictAuthority = await ensureActiveWorkflowCoordinatorLease(
+      bound,
+      active,
+    );
+    if (!conflictAuthority.ok || !conflictAuthority.lease) {
+      return failTargetRefresh(bound, {
+        failureKind: "transient",
+        reason: TARGET_REFRESH_FAILURE_REASONS.authorityLost,
+        detail: conflictAuthority.ok
+          ? "Workflow coordinator lease is unavailable for Target-refresh Conflict resolution."
+          : conflictAuthority.reason,
+      });
+    }
+
+    const workerProfile = await resolveWorkerProfile(bound);
+    if (!workerProfile) {
+      return failTargetRefresh(bound, {
+        failureKind: "deterministic",
+        reason: TARGET_REFRESH_FAILURE_REASONS.conflictResolutionFailed,
+        detail:
+          "Cannot launch a Target-refresh Conflict resolution worker without a Worker profile.",
+      });
+    }
+
+    const prepared = await bound.skills.prepareResolveConflicts(
+      targetRefreshConflictSkillInput(conflict, pending.workflowId),
+    );
+    if (!prepared.ok) {
+      pending.lastFailure = prepared.reason;
+      await failTargetRefresh(bound, {
+        failureKind: "deterministic",
+        reason: TARGET_REFRESH_FAILURE_REASONS.conflictResolutionFailed,
+        detail: prepared.reason,
+      });
+      return {
+        status: "compatibility-recovery",
+        stage: "target-refresh",
+        reason: prepared.reason,
+        attempt: pending.attempt,
+      };
+    }
+
+    const workerId = `conflict-refresh-${pending.workflowId}-r${pending.attempt}`;
+    const worker: ActiveConflictWorker = {
+      workerId,
+      workflowId: pending.workflowId,
+      ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+      attempt: pending.attempt,
+      resolutionKind: "target-refresh",
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      targetBranch: conflict.targetBranch,
+      targetSha: conflict.targetSha,
+      ...(conflict.targetLeaseGeneration !== undefined
+        ? { targetLeaseGeneration: conflict.targetLeaseGeneration }
+        : {}),
+      status: "running",
+      workerProfile: { ...workerProfile.profile },
+      turnCount: 0,
+      startedAtMs: Date.now(),
+      receivedStageResult: false,
+    };
+    activeConflictWorker = worker;
+
+    await bound.transcripts.append(transcriptKey, {
+      type: "conflict-resolution-launch",
+      workerId,
+      startedAtMs: worker.startedAtMs,
+      skillCommand: prepared.skillCommand,
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      message: conflict.message,
+      resolutionKind: "target-refresh",
+      targetBranch: conflict.targetBranch,
+      targetSha: conflict.targetSha,
+      ...(conflict.targetLeaseGeneration !== undefined
+        ? { targetLeaseGeneration: conflict.targetLeaseGeneration }
+        : {}),
+    });
+
+    const sink: WorkerEventSink = {
+      onEvent: (event) => handleWorkerEvent(bound, event),
+    };
+
+    try {
+      const runtime = await bound.workers.launch(
+        {
+          workerId,
+          workflowId: pending.workflowId,
+          ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+          attempt: pending.attempt,
+          worktreePath: conflict.integrationWorktreePath,
+          branchName: conflict.integrationBranch,
+          workerProfile: workerProfile.profile,
+          ticketTitle: `Target-refresh conflict resolution for Workflow #${pending.workflowId}`,
+          prompt: prepared.prompt,
+          skillCommand: prepared.skillCommand,
+        },
+        sink,
+      );
+      if (typeof runtime.pid === "number") {
+        worker.pid = runtime.pid;
+      }
+      await bound.transcripts.append(transcriptKey, {
+        type: "worker-process",
+        workerId,
+        pid: runtime.pid,
+        alive: runtime.alive,
+        worktreePath: conflict.integrationWorktreePath,
+        branchName: conflict.integrationBranch,
+        transcriptPath: workerTranscriptPath(selectedPath ?? ports.startPath, {
+          workflowId: pending.workflowId,
+          ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+          attempt: pending.attempt,
+        }),
+      });
+    } catch (error) {
+      activeConflictWorker = undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      return failTargetRefresh(bound, {
+        failureKind: "transient",
+        reason: TARGET_REFRESH_FAILURE_REASONS.conflictResolutionFailed,
+        detail: `Failed to launch Target-refresh Conflict resolution worker: ${message}`,
+      });
+    }
+
+    return {
+      status: "running",
+      stage: "target-refresh",
+      workflowId: pending.workflowId,
+      attempt: pending.attempt,
+      workerId,
+      integrationBranch: conflict.integrationBranch,
+      integrationWorktreePath: conflict.integrationWorktreePath,
+      targetBranch: conflict.targetBranch,
+      targetSha: conflict.targetSha,
+      conflictResolution: true,
+    };
+  }
+
+  /**
+   * Target-branch refresh delivery path:
+   * 1. Acquire Target-branch lease as FIFO queue head (merge-ready → refreshing)
+   * 2. Fetch + merge Target into Integration (never rebase / never push Target)
+   * 3. On conflict: launch Conflict resolution worker with target-refresh context
+   * 4. On clean/resolved: Local verification → push Integration → update PR freshness
+   * 5. Release Target-branch lease while remote PR checks re-run
+   */
+  async function runTargetRefresh(): Promise<StageResult> {
+    const bound = await requireScoped();
+
+    if (pendingIntegration || integrationInProgress) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason:
+          "Cannot refresh from the Target branch while an Integration unit is pending.",
+      };
+    }
+    if (
+      activeConflictWorker &&
+      activeConflictWorker.resolutionKind === "ticket-integration"
+    ) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason: `A ticket-to-Integration Conflict resolution worker is already running for #${activeConflictWorker.ticketNumber}.`,
+      };
+    }
+
+    if (
+      pendingTargetRefresh?.conflict &&
+      activeConflictWorker?.resolutionKind === "target-refresh"
+    ) {
+      return {
+        status: "running",
+        stage: "target-refresh",
+        workflowId: pendingTargetRefresh.workflowId,
+        attempt: pendingTargetRefresh.attempt,
+        workerId: activeConflictWorker.workerId,
+        integrationBranch: activeConflictWorker.integrationBranch,
+        integrationWorktreePath: activeConflictWorker.integrationWorktreePath,
+        targetBranch:
+          activeConflictWorker.targetBranch ?? pendingTargetRefresh.targetBranch,
+        ...(activeConflictWorker.targetSha
+          ? { targetSha: activeConflictWorker.targetSha }
+          : {}),
+        conflictResolution: true,
+      };
+    }
+
+    if (pendingTargetRefresh?.conflict && !activeConflictWorker) {
+      return launchTargetRefreshConflictWorker(
+        bound,
+        pendingTargetRefresh,
+        pendingTargetRefresh.conflict,
+      );
+    }
+
+    if (targetRefreshInProgress && pendingTargetRefresh) {
+      return {
+        status: "running",
+        stage: "target-refresh",
+        workflowId: pendingTargetRefresh.workflowId,
+        attempt: pendingTargetRefresh.attempt,
+        workerId: `target-refresh-${pendingTargetRefresh.workflowId}`,
+        integrationBranch: pendingTargetRefresh.integrationBranch,
+        integrationWorktreePath: pendingTargetRefresh.integrationWorktreePath,
+        targetBranch: pendingTargetRefresh.targetBranch,
+        ...(pendingTargetRefresh.targetSha
+          ? { targetSha: pendingTargetRefresh.targetSha }
+          : {}),
+      };
+    }
+
+    const active = await loadActiveWorkflow(bound, { force: true });
+    if (!active || active.stage !== "pr-opened" || !active.workflowPr) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason:
+          "Target-branch refresh requires an open Workflow PR on a coordination-aware Active workflow.",
+      };
+    }
+    if (!active.coordination) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason:
+          "Target-branch refresh is only available for coordination-aware workflows.",
+        workflowId: active.workflowId,
+      };
+    }
+    if (!active.integrationBranch) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason:
+          "Target-branch refresh requires an Integration branch on the Workflow manifest.",
+        workflowId: active.workflowId,
+      };
+    }
+
+    const authority = await ensureActiveWorkflowCoordinatorLease(bound, active);
+    if (!authority.ok || !authority.lease) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason: authority.ok
+          ? "Workflow coordinator lease is unavailable for Target-branch refresh."
+          : authority.reason,
+        workflowId: active.workflowId,
+      };
+    }
+    const workflowCoordinatorLease = authority.lease;
+
+    const queueResult = await ensureTargetDeliveryQueue(bound, active);
+    if (!queueResult.ok) {
+      return {
+        status: "failed",
+        stage: "target-refresh",
+        reason: queueResult.reason,
+        workflowId: active.workflowId,
+      };
+    }
+
+    const attempt = (pendingTargetRefresh?.attempt ?? 0) + 1;
+    const targetBranch = active.targetBranch;
+    const stopHeartbeat = startWorkflowCoordinatorHeartbeat(bound);
+    targetRefreshInProgress = true;
+
+    try {
+      // Acquire serial Target-branch lease only as FIFO queue head.
+      let heldLease = queueResult.queue.getHeldTargetBranchLease();
+      if (!heldLease) {
+        const acquired = await queueResult.queue.transition({
+          kind: "acquire-phase",
+          workflowCoordinatorLease,
+          phase: "refresh",
+        });
+        if (!acquired.ok || !acquired.lease) {
+          clearTargetRefreshState();
+          return {
+            status: "failed",
+            stage: "target-refresh",
+            reason: acquired.ok
+              ? "Target-branch lease acquisition did not return a lease."
+              : acquired.reason,
+            workflowId: active.workflowId,
+            targetBranch,
+          };
+        }
+        heldLease = acquired.lease;
+      }
+
+      let integrationWorkspace: { branchName: string; worktreePath: string };
+      try {
+        integrationWorkspace = await bound.workspace.ensureIntegrationWorkspace({
+          workflowId: active.workflowId,
+          baseRef: active.integrationBranch,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failedPending: PendingTargetRefresh = {
+          workflowId: active.workflowId,
+          attempt,
+          targetBranch,
+          integrationBranch: active.integrationBranch,
+          integrationWorktreePath: "",
+          ...(heldLease.generation !== undefined
+            ? { targetLeaseGeneration: heldLease.generation }
+            : {}),
+        };
+        pendingTargetRefresh = failedPending;
+        return failTargetRefresh(bound, {
+          failureKind: "transient",
+          reason: TARGET_REFRESH_FAILURE_REASONS.mergeError,
+          detail: `Failed to ensure Integration workspace: ${message}`,
+        });
+      }
+
+      const pending: PendingTargetRefresh = {
+        workflowId: active.workflowId,
+        attempt,
+        targetBranch,
+        integrationBranch: integrationWorkspace.branchName,
+        integrationWorktreePath: integrationWorkspace.worktreePath,
+        ...(heldLease.generation !== undefined
+          ? { targetLeaseGeneration: heldLease.generation }
+          : {}),
+      };
+      pendingTargetRefresh = pending;
+
+      const transcriptKey = targetRefreshTranscriptKey(pending);
+      await bound.transcripts.append(transcriptKey, {
+        type: "target-refresh-start",
+        targetBranch,
+        integrationBranch: integrationWorkspace.branchName,
+        targetLeaseGeneration: heldLease.generation,
+      });
+
+      // Renew while merge runs so long local work does not drop the lane.
+      await queueResult.queue.transition({ kind: "renew-held-target-lease" });
+
+      const mergePhase = await mergeTargetIntoIntegration({
+        workspace: bound.workspace,
+        workflowId: active.workflowId,
+        targetBranch,
+        integrationBranch: integrationWorkspace.branchName,
+        integrationWorktreePath: integrationWorkspace.worktreePath,
+        ...(heldLease.generation !== undefined
+          ? { targetLeaseGeneration: heldLease.generation }
+          : {}),
+      });
+
+      if (mergePhase.status === "failed") {
+        return failTargetRefresh(bound, {
+          failureKind: mergePhase.failureKind,
+          reason: mergePhase.failureReasonCode,
+          detail: mergePhase.reason,
+        });
+      }
+
+      if (mergePhase.status === "conflict") {
+        pending.targetSha = mergePhase.conflict.targetSha;
+        pending.conflict = mergePhase.conflict;
+        pendingTargetRefresh = pending;
+        await bound.transcripts.append(transcriptKey, {
+          type: "target-refresh-conflict",
+          reason: mergePhase.conflict.message,
+          targetSha: mergePhase.conflict.targetSha,
+        });
+        targetRefreshInProgress = false;
+        return launchTargetRefreshConflictWorker(
+          bound,
+          pending,
+          mergePhase.conflict,
+        );
+      }
+
+      pending.targetSha = mergePhase.targetSha;
+      pendingTargetRefresh = pending;
+      await bound.transcripts.append(transcriptKey, {
+        type: "target-refresh-merged",
+        targetSha: mergePhase.targetSha,
+        mergeCommitSha: mergePhase.mergeCommitSha,
+        alreadyUpToDate: mergePhase.alreadyUpToDate,
+      });
+
+      return await finishTargetRefreshAfterMerge(bound, pending);
+    } finally {
+      stopHeartbeat();
+      targetRefreshInProgress = false;
     }
   }
 
@@ -7427,7 +8308,16 @@ export function createWorkflowCoordinator(
         },
         options.transcriptEvent,
       );
-      if (
+      if (conflictWorker.resolutionKind === "target-refresh") {
+        if (
+          pendingTargetRefresh &&
+          pendingTargetRefresh.workflowId === conflictWorker.workflowId
+        ) {
+          pendingTargetRefresh.lastFailure =
+            options.preservePendingIntegrationMessage ??
+            "Target-refresh Conflict resolution worker aborted. Target-branch lease is released; refresh can be retried when merge-ready again.";
+        }
+      } else if (
         pendingIntegration &&
         pendingIntegration.ticketNumber === conflictWorker.ticketNumber
       ) {
@@ -7438,6 +8328,27 @@ export function createWorkflowCoordinator(
     }
 
     activeConflictWorker = undefined;
+
+    // Pause / Terminate release only this workflow's Target-branch lease so
+    // sibling workflows can continue delivery on the shared Target lane.
+    if (targetDeliveryQueue) {
+      try {
+        await targetDeliveryQueue.transition({
+          kind: "release-held-target-lease",
+        });
+      } catch {
+        // Best-effort; TTL reclaim remains the fail-closed backstop.
+      }
+      targetDeliveryQueue = undefined;
+    }
+    if (pendingTargetRefresh && !pendingTargetRefresh.conflict) {
+      // Non-conflict refresh mid-flight cannot safely resume with a dropped lease.
+      pendingTargetRefresh = undefined;
+      targetRefreshInProgress = false;
+    } else {
+      targetRefreshInProgress = false;
+    }
+
     return affected;
   }
 
@@ -8005,9 +8916,35 @@ export function createWorkflowCoordinator(
         attempt: activeConflictWorker.attempt,
         status: "conflict-resolution",
         branchName: activeConflictWorker.integrationBranch,
-        ...(pendingIntegration?.lastFailure
-          ? { reason: pendingIntegration.lastFailure }
-          : {}),
+        ...(activeConflictWorker.resolutionKind === "target-refresh"
+          ? {
+              reason:
+                pendingTargetRefresh?.lastFailure ??
+                "Target-branch refresh conflict",
+            }
+          : pendingIntegration?.lastFailure
+            ? { reason: pendingIntegration.lastFailure }
+            : {}),
+      };
+    } else if (pendingTargetRefresh && targetRefreshInProgress) {
+      state.integration = {
+        ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+        attempt: pendingTargetRefresh.attempt,
+        status: "running",
+        branchName: pendingTargetRefresh.integrationBranch,
+        ...(pendingTargetRefresh.lastFailure
+          ? { reason: pendingTargetRefresh.lastFailure }
+          : { reason: "Target-branch refresh" }),
+      };
+    } else if (pendingTargetRefresh) {
+      state.integration = {
+        ticketNumber: TARGET_REFRESH_TRANSCRIPT_TICKET,
+        attempt: pendingTargetRefresh.attempt,
+        status: "pending-retry",
+        branchName: pendingTargetRefresh.integrationBranch,
+        ...(pendingTargetRefresh.lastFailure
+          ? { reason: pendingTargetRefresh.lastFailure }
+          : { reason: "Target-branch refresh" }),
       };
     } else if (pendingIntegration && integrationInProgress) {
       // Unit is actively finishing (merge/verify/push) — wait must not P1-settle.
