@@ -724,6 +724,53 @@ describe("waitForPipelineWorkers", () => {
     ).toBeLessThanOrEqual(1);
   });
 
+
+  it("skipLiveSurface does not open custom or select menus (parent owns brief)", async () => {
+    let customCalls = 0;
+    let selectCalls = 0;
+    let ticks = 0;
+    const coordinator = controlCoordinator(async () => {
+      ticks += 1;
+      if (ticks === 1) {
+        return basePanel({ workers: [runningWorker()] });
+      }
+      return basePanel({
+        workers: [runningWorker({ status: "needs-disposition" })],
+      });
+    });
+    const ui = mockUi({
+      custom: async <T>(
+        _factory: (
+          tui: { requestRender: () => void },
+          theme: {
+            fg: (color: unknown, text: string) => string;
+            bold: (text: string) => string;
+          },
+          keybindings: unknown,
+          done: (value: T) => void,
+        ) => unknown,
+      ) => {
+        customCalls += 1;
+        return undefined;
+      },
+    });
+    ui.select = async () => {
+      selectCalls += 1;
+      return undefined;
+    };
+
+    const result = await waitForPipelineWorkers(coordinator, ui, {
+      pollIntervalMs: 1,
+      maxTicks: 10,
+      sleep: async () => undefined,
+      skipLiveSurface: true,
+    });
+
+    expect(result.status).toBe("settled");
+    expect(customCalls).toBe(0);
+    expect(selectCalls).toBe(0);
+  });
+
   it("returns settled status when workers finish without controls", async () => {
     const result = await waitForPipelineWorkers(
       {

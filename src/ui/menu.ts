@@ -838,10 +838,13 @@ export async function waitForPipelineWorkers(
   const pollIntervalMs = options.pollIntervalMs ?? 500;
   const maxTicks = options.maxTicks ?? 7200;
   const sleepFn = options.sleep ?? sleep;
+  const skipLiveSurface = options.skipLiveSurface === true;
   // Default ON: Pause/Terminate must be selectable options. Shortcuts alone
   // failed in real terminals (Ctrl+Alt often never reaches the editor).
-  const offerRunningControls = options.offerRunningControls !== false;
-  const skipLiveSurface = options.skipLiveSurface === true;
+  // When a parent persistent live surface owns the editor, never open a
+  // competing select menu or second custom() — that closes the run brief.
+  const offerRunningControls =
+    options.offerRunningControls !== false && !skipLiveSurface;
   const controls = hasControlApis(coordinator) ? coordinator : undefined;
 
   // Full GitHub refresh once; subsequent ticks use local workers + cached tickets
@@ -868,20 +871,22 @@ export async function waitForPipelineWorkers(
   }
 
   if (initialPanel) {
-    // Always paint the current brief into chat once when wait starts so the
-    // operator still has a readable snapshot if the editor custom surface is
-    // easy to miss or fails open. Live custom owns subsequent refreshes.
-    const initialBrief = notifyRunBrief(ui, initialPanel);
+    // Parent-owned persistent brief: status only (do not stack chat copies).
+    // Own live/select surface: one chat snapshot so the brief is readable.
+    const initialBrief = skipLiveSurface
+      ? touchRunBriefStatus(ui, initialPanel)
+      : notifyRunBrief(ui, initialPanel);
     log("info", "pipeline:wait-workers", {
       runningCount: initialRunning.length,
       pipelinePaused: initialPaused,
       panelWorkers: panelWorkerSnapshot(initialPanel),
       briefSections: initialBrief.sections.map((s) => s.id),
       liveWait: liveWaitAvailable,
+      skipLiveSurface,
     });
   }
 
-  if (!initialPaused) {
+  if (!initialPaused && !skipLiveSurface) {
     const controlPath = runControlFilePath(process.cwd());
     if (liveWaitAvailable) {
       ui.notify(
@@ -1128,11 +1133,11 @@ export async function waitForPipelineWorkers(
         }
       }
 
-      // Live custom owns the full brief frame. Chat-notify only for the select
-      // fallback — otherwise every outer tick stacks a stale full brief above live.
-      const brief = liveWaitAvailable
-        ? touchRunBriefStatus(ui, panel)
-        : notifyRunBrief(ui, panel);
+      // Live / parent-owned brief: status only. Select fallback may chat-notify.
+      const brief =
+        liveWaitAvailable || skipLiveSurface
+          ? touchRunBriefStatus(ui, panel)
+          : notifyRunBrief(ui, panel);
       const tickPayload: Record<string, unknown> = {
         tick: i + 1,
         runningCount: running.length,
@@ -2302,8 +2307,8 @@ export async function runPostGrillPipeline(
     [
       "Matt Auto post-grill pipeline (auto-advance): /skill:to-spec → publish → /skill:to-tickets → publish → implement…",
       "Stage confirmation is auto-Publish; disposition is auto-Close.",
-      "While workers run: select menu — Keep waiting / Pause / Terminate (not shortcuts).",
-      `Shell fallback: echo terminate-now > ${controlPath}`,
+      "Live run brief stays open for the whole run once the workflow panel exists (Pause / Terminate in the editor).",
+      `Emergency shell: echo terminate-now > ${controlPath}`,
     ].join("\n"),
     "info",
   );
@@ -2323,12 +2328,14 @@ export async function runPostGrillPipeline(
       }
     | undefined;
 
-  // Persistent live brief for the whole /matt-auto run: stays open across ticket
-  // transitions (disposition / integration) with local panel polls until the run
-  // ends. Pipeline work continues in parallel; per-stage waits skip a second
-  // custom() surface so the brief does not disappear between issues.
+  // Persistent live brief for the whole /matt-auto run. Stage waits always skip
+  // their own custom/select surfaces while this is capable so the brief never
+  // closes between tickets (disposition / Integration / next implement).
   let stopPersistentLive = false;
-  let persistentLiveOpen = false;
+  let persistentLiveFailed = false;
+  /** True once the hold-loop is responsible for the editor surface (including
+   * brief gaps while Pause confirm runs — stage waits must still skip). */
+  let persistentLiveOwnsSurface = false;
   const persistentLiveCapable = canPresentLiveWaitControls(ui);
   const liveWaitPollIntervalMs =
     typeof coordinator.getEffectiveLiveWaitPollIntervalMs === "function"
@@ -2345,88 +2352,119 @@ export async function runPostGrillPipeline(
           detail: "pipeline",
         });
         try {
-          // Create-spec may run for minutes before any Active workflow panel exists.
-          // Wait for the whole run (not a short cap) so the brief does not miss open.
-          let panel: WorkflowPanelState | undefined;
+          // Claim ownership before panel exists so stage waits never open a
+          // competing brief that would close at the next ticket boundary.
+          persistentLiveOwnsSurface = true;
+          let announced = false;
           let waitedMs = 0;
-          while (!stopPersistentLive) {
-            panel = await coordinator.getPanelState({ mode: "local" });
-            if (panel) break;
-            await sleep(250);
-            waitedMs += 250;
-            if (waitedMs === 30_000 || waitedMs % 60_000 === 0) {
-              log("info", "pipeline:persistent-live-waiting-panel", {
+
+          while (
+            !stopPersistentLive &&
+            !coordinator.isRunTerminated()
+          ) {
+            let panel = await coordinator.getPanelState({ mode: "local" });
+            if (!panel) {
+              await sleep(250);
+              waitedMs += 250;
+              if (waitedMs === 30_000 || waitedMs % 60_000 === 0) {
+                log("info", "pipeline:persistent-live-waiting-panel", {
+                  waitedMs,
+                });
+              }
+              continue;
+            }
+
+            if (!announced) {
+              announced = true;
+              log("info", "pipeline:persistent-live-open", {
+                workflowId: panel.workflowId,
                 waitedMs,
+                pollIntervalMs: liveWaitPollIntervalMs,
               });
+              notifyRunBrief(ui, panel);
+              ui.notify(
+                "Live run brief stays open in the editor for the whole run (Pause / Terminate).",
+                "info",
+              );
             }
-          }
-          if (!panel || stopPersistentLive) {
-            log("info", "pipeline:persistent-live-skip", {
-              reason: !panel ? "no-panel" : "stopped-before-open",
-              waitedMs,
+
+            let live: Awaited<ReturnType<typeof presentLiveWaitControls>>;
+            try {
+              live = await presentLiveWaitControls(ui, coordinator, panel, {
+                pollIntervalMs: liveWaitPollIntervalMs,
+                holdUntilRunEnd: true,
+                shouldFinish: () =>
+                  stopPersistentLive || coordinator.isRunTerminated(),
+                onTick: (p) => {
+                  activity.tick(activityDetailFromPanel(p));
+                },
+              });
+            } catch (error) {
+              throw error;
+            }
+
+            log("info", "pipeline:persistent-live-event", {
+              workflowId: panel.workflowId,
+              action: live.action,
             });
-            return;
-          }
-          log("info", "pipeline:persistent-live-open", {
-            workflowId: panel.workflowId,
-            waitedMs,
-            pollIntervalMs: liveWaitPollIntervalMs,
-          });
-          // One chat snapshot so the operator has a readable brief even if the
-          // editor custom surface is easy to miss in a long transcript.
-          notifyRunBrief(ui, panel);
-          ui.notify(
-            "Live run brief is open in the editor until this run ends (Pause / Terminate).",
-            "info",
-          );
-          persistentLiveOpen = true;
-          const live = await presentLiveWaitControls(ui, coordinator, panel, {
-            pollIntervalMs: liveWaitPollIntervalMs,
-            holdUntilRunEnd: true,
-            shouldFinish: () =>
-              stopPersistentLive || coordinator.isRunTerminated(),
-            onTick: (p) => {
-              activity.tick(activityDetailFromPanel(p));
-            },
-          });
-          log("info", "pipeline:persistent-live-close", {
-            workflowId: panel.workflowId,
-            action: live.action,
-          });
-          // Operator used live controls — apply confirmations after custom() closes.
-          const latest =
-            (await coordinator.getPanelState({ mode: "local" })) ?? panel;
-          if (live.action === "pause") {
-            await applyConfirmedPause(coordinator, ui, latest);
-          } else if (live.action === "terminate") {
-            const result = await applyConfirmedTerminate(
-              coordinator,
-              ui,
-              latest,
-            );
-            if (result) {
-              ui.notify(formatTerminateNotify(result), "warning");
+
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+
+            if (live.action === "settled") {
+              // Run ended or stopPersistentLive — leave the hold loop.
+              break;
             }
-          } else if (live.action === "resume") {
-            await applyConfirmedResume(coordinator, ui, latest);
+            if (live.action === "dismissed") {
+              // Esc on paused surface: keep coordinator paused; pipeline will stop.
+              break;
+            }
+            if (live.action === "pause") {
+              await applyConfirmedPause(coordinator, ui, latest);
+              // Re-open immediately so the brief does not stay gone after confirm.
+              continue;
+            }
+            if (live.action === "resume") {
+              await applyConfirmedResume(coordinator, ui, latest);
+              continue;
+            }
+            if (live.action === "terminate") {
+              const result = await applyConfirmedTerminate(
+                coordinator,
+                ui,
+                latest,
+              );
+              if (result) {
+                ui.notify(formatTerminateNotify(result), "warning");
+              }
+              break;
+            }
           }
+
+          log("info", "pipeline:persistent-live-close", {
+            stopPersistentLive,
+            runTerminated: coordinator.isRunTerminated(),
+          });
         } finally {
-          persistentLiveOpen = false;
+          persistentLiveOwnsSurface = false;
           activity.stop();
         }
       })().catch((error) => {
-        persistentLiveOpen = false;
+        persistentLiveOwnsSurface = false;
+        persistentLiveFailed = true;
         log("warn", "pipeline:persistent-live-failed", {
           reason: errorMessage(error),
         });
         ui.notify(
-          `Live run brief failed to open (${errorMessage(error)}). Stage waits will use the control menu / chat brief.`,
+          `Live run brief failed (${errorMessage(error)}). Stage waits will show their own brief/controls.`,
           "warning",
         );
       })
     : Promise.resolve();
+  // Skip stage custom/select whenever persistent owns the brief (including the
+  // pre-panel wait). On failure, stage waits take over so the operator is not blind.
   const skipPersistentLiveSurface = () =>
-    persistentLiveCapable && persistentLiveOpen;
+    persistentLiveCapable && !persistentLiveFailed && persistentLiveOwnsSurface;
 
   try {
   for (let step = 0; step < 50; step += 1) {
