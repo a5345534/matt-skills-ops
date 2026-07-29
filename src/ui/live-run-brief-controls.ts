@@ -7,6 +7,11 @@
  *   - re-render the brief with `tui.requestRender()`
  *   - accept ↑↓/Enter selection for Pause / Terminate at the same time
  *
+ * Pause / Resume / Terminate confirmation stays **inside** this surface so the
+ * brief never goes blank between "Pause…" and the post-confirm Resume UI
+ * (closing custom for a separate ui.select left operators with no responsive
+ * controls when pausePipeline or re-open hung).
+ *
  * Pi docs: extensions.md Custom Components; tui.md SelectList pattern;
  * examples/extensions/overlay-qa-tests.ts AnimationDemo (setInterval + render).
  */
@@ -24,8 +29,11 @@ import type { WorkflowCoordinator, WorkflowPanelState } from "../types.js";
 
 export type LiveWaitControlChoice =
   | { action: "settled" }
+  /** Operator confirmed Pause inside the live surface (outer applies pause). */
   | { action: "pause" }
+  /** Operator confirmed Terminate inside the live surface. */
   | { action: "terminate" }
+  /** Operator confirmed Resume inside the live surface. */
   | { action: "resume" }
   /** Esc on a paused surface: return to chat while preserving pause state. */
   | { action: "dismissed" };
@@ -52,13 +60,13 @@ export type LiveWaitCustomUi = {
 };
 
 export type LiveWaitTheme = {
-  // Accept Pi ThemeColor | string without importing ThemeColor here.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  fg: (color: any, text: string) => string;
-  bold: (text: string) => string;
+  bold: (s: string) => string;
+  fg: (color: string, s: string) => string;
 };
 
 export type LiveWaitPanelSource = Pick<WorkflowCoordinator, "getPanelState">;
+
+type ConfirmKind = "pause" | "resume" | "terminate";
 
 function isSettled(
   panel: WorkflowPanelState | undefined,
@@ -110,13 +118,56 @@ function controlItems(panel: WorkflowPanelState): SelectItem[] {
   ];
 }
 
+function confirmItems(kind: ConfirmKind, workflowId: number): SelectItem[] {
+  if (kind === "pause") {
+    return [
+      {
+        value: "confirm",
+        label: "Confirm Pause",
+        description: `Abort workers for Workflow #${workflowId}; GitHub unchanged`,
+      },
+      {
+        value: "cancel",
+        label: "Cancel",
+        description: "Back to live controls — pipeline keeps running",
+      },
+    ];
+  }
+  if (kind === "resume") {
+    return [
+      {
+        value: "confirm",
+        label: "Confirm Resume",
+        description: `Continue auto-advance for Workflow #${workflowId}`,
+      },
+      {
+        value: "cancel",
+        label: "Cancel",
+        description: "Stay paused",
+      },
+    ];
+  }
+  return [
+    {
+      value: "confirm",
+      label: "Confirm Terminate",
+      description: `Stop the run for Workflow #${workflowId}`,
+    },
+    {
+      value: "cancel",
+      label: "Cancel",
+      description: "Back to live controls",
+    },
+  ];
+}
+
 function makeSelectList(
-  panel: WorkflowPanelState,
+  items: SelectItem[],
   theme: LiveWaitTheme,
-  onPick: (action: "pause" | "terminate" | "resume") => void,
+  onPick: (value: string) => void,
   onCancel: () => void,
 ): SelectList {
-  const list = new SelectList(controlItems(panel), 4, {
+  const list = new SelectList(items, 6, {
     selectedPrefix: (t) => theme.fg("accent", t),
     selectedText: (t) => theme.fg("accent", t),
     description: (t) => theme.fg("muted", t),
@@ -124,7 +175,7 @@ function makeSelectList(
     noMatch: (t) => theme.fg("warning", t),
   });
   list.onSelect = (item) => {
-    onPick(item.value as "pause" | "terminate" | "resume");
+    onPick(item.value);
   };
   list.onCancel = onCancel;
   return list;
@@ -132,7 +183,7 @@ function makeSelectList(
 
 /**
  * Live wait: brief auto-refreshes while Pause/Terminate stay selectable.
- * Resolves when workers settle or the operator picks a control.
+ * Resolves when workers settle or the operator confirms a control.
  */
 export async function presentLiveWaitControls(
   ui: LiveWaitCustomUi,
@@ -164,6 +215,8 @@ export async function presentLiveWaitControls(
       let finished = false;
       let interval: ReturnType<typeof setInterval> | undefined;
       let wasPaused = panel.pipelinePaused === true;
+      /** When set, Controls shows in-surface Confirm / Cancel for that action. */
+      let confirmKind: ConfirmKind | undefined;
       // omitControls: live surface already owns Pause/Terminate SelectList.
       let briefLines = [
         ...buildRunBriefViewModel(panel, { omitControls: true }).lines,
@@ -177,19 +230,68 @@ export async function presentLiveWaitControls(
       };
 
       const dismissIfPaused = () => {
+        // Esc during confirm cancels the confirm, not the whole surface.
+        if (confirmKind) {
+          confirmKind = undefined;
+          rebuildSelectList();
+          tui.requestRender();
+          return;
+        }
         // Esc is a safe dismissal only after Pause has aborted all workers.
-        // The coordinator remains paused; `/matt-auto resume` can restart it.
         if (canDismissPausedLiveWait(panel)) finish({ action: "dismissed" });
       };
 
-      let selectList = makeSelectList(
-        panel,
-        theme,
-        (action) => {
-          finish({ action });
-        },
-        dismissIfPaused,
-      );
+      const onControlPick = (value: string) => {
+        if (confirmKind) {
+          if (value === "confirm") {
+            finish({ action: confirmKind });
+            return;
+          }
+          // cancel
+          confirmKind = undefined;
+          rebuildSelectList();
+          tui.requestRender();
+          return;
+        }
+        if (value === "pause" || value === "resume" || value === "terminate") {
+          confirmKind = value;
+          rebuildSelectList();
+          tui.requestRender();
+        }
+      };
+
+      function rebuildSelectList() {
+        const items = confirmKind
+          ? confirmItems(confirmKind, panel.workflowId)
+          : controlItems(panel);
+        selectList = makeSelectList(items, theme, onControlPick, dismissIfPaused);
+        help = new Text(
+          theme.fg(
+            "dim",
+            confirmKind
+              ? `Confirm ${confirmKind} for Workflow #${panel.workflowId} · Esc cancels`
+              : helpText(panel.pipelinePaused === true),
+          ),
+          1,
+          0,
+        );
+        controlsHeader = new Text(
+          theme.fg(
+            "accent",
+            theme.bold(
+              confirmKind
+                ? `Confirm ${confirmKind.charAt(0).toUpperCase()}${confirmKind.slice(1)}`
+                : "Controls",
+            ),
+          ),
+          1,
+          0,
+        );
+      }
+
+      let selectList: SelectList;
+      let help: Text;
+      let controlsHeader: Text;
 
       const title = new Text(
         theme.fg(
@@ -209,12 +311,20 @@ export async function presentLiveWaitControls(
           : holdUntilRunEnd
             ? "Brief stays up for the whole run · 0.5s refresh · ↑↓ / Enter controls"
             : "Brief auto-refreshes · ↑↓ / Enter pick control · Esc stays here";
-      let help = new Text(
+
+      // Initialize select list after helpers exist.
+      selectList = makeSelectList(
+        controlItems(panel),
+        theme,
+        onControlPick,
+        dismissIfPaused,
+      );
+      help = new Text(
         theme.fg("dim", helpText(panel.pipelinePaused)),
         1,
         0,
       );
-      const controlsHeader = new Text(
+      controlsHeader = new Text(
         theme.fg("accent", theme.bold("Controls")),
         1,
         0,
@@ -236,8 +346,6 @@ export async function presentLiveWaitControls(
           briefLines = [
             ...buildRunBriefViewModel(panel, { omitControls: true }).lines,
           ];
-          // Keep footer status in sync with the live brief (Context / frontier).
-          // Without this, status-only stayed frozen at an earlier Ready frontier.
           try {
             publishWorkflowPanel(ui, panel, { mode: "status-only" });
           } catch {
@@ -257,24 +365,15 @@ export async function presentLiveWaitControls(
           }
 
           const nowPaused = panel.pipelinePaused === true;
-          if (nowPaused !== wasPaused) {
+          // Rebuild primary controls when pause state flips, but never while the
+          // operator is mid-confirm (would wipe Confirm Pause under them).
+          if (nowPaused !== wasPaused && !confirmKind) {
             wasPaused = nowPaused;
-            selectList = makeSelectList(
-              panel,
-              theme,
-              (action) => {
-                finish({ action });
-              },
-              dismissIfPaused,
-            );
-            help = new Text(
-              theme.fg("dim", helpText(nowPaused)),
-              1,
-              0,
-            );
+            rebuildSelectList();
+          } else if (nowPaused !== wasPaused) {
+            wasPaused = nowPaused;
           }
 
-          // Outer wait loop is blocked on this custom() — drive title/OSC here.
           try {
             options.onTick?.(panel);
           } catch {
@@ -301,7 +400,9 @@ export async function presentLiveWaitControls(
           );
           for (const line of briefLines) {
             lines.push(
-              line.length > width ? `${line.slice(0, Math.max(0, width - 1))}…` : line,
+              line.length > width
+                ? `${line.slice(0, Math.max(0, width - 1))}…`
+                : line,
             );
           }
           lines.push(
@@ -320,7 +421,10 @@ export async function presentLiveWaitControls(
         },
         handleInput(data: string) {
           if (matchesKey(data, "ctrl+c")) {
-            finish({ action: "terminate" });
+            // Emergency path: still require in-surface terminate confirm.
+            confirmKind = "terminate";
+            rebuildSelectList();
+            tui.requestRender();
             return;
           }
           selectList.handleInput(data);
@@ -354,5 +458,6 @@ export function canPresentLiveWaitControls(
 export const __liveWaitTestables = {
   isSettled,
   controlItems,
+  confirmItems,
   canDismissPausedLiveWait,
 };

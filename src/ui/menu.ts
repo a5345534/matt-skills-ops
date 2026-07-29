@@ -585,6 +585,38 @@ function touchRunBriefStatus(
   return brief;
 }
 
+/**
+ * Apply Pause after the operator already confirmed (live in-surface Confirm, or
+ * select Confirm Pause). Always re-paints the run brief so the UI is never blank.
+ */
+async function applyPauseAlreadyConfirmed(
+  coordinator: RunBriefCoordinator,
+  ui: MattAutoUi,
+  panel: WorkflowPanelState,
+  via: string,
+): Promise<void> {
+  const workflowId = panel.workflowId;
+  ui.notify(`Pausing Workflow #${workflowId}…`, "warning");
+  const result = await coordinator.pausePipeline();
+  log("info", "run-brief:operator-pause", {
+    workflowId,
+    abortedWorkerCount: result.abortedWorkerCount,
+    affectedAttempts: result.affectedAttempts,
+    via,
+  });
+  const after =
+    (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+  notifyRunBrief(ui, after, "warning");
+  ui.notify(
+    [
+      `Pipeline paused for Workflow #${workflowId}.`,
+      `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
+      "GitHub workflow state is unchanged. Choose Resume or Terminate.",
+    ].join("\n"),
+    "warning",
+  );
+}
+
 async function applyConfirmedPause(
   coordinator: RunBriefCoordinator,
   ui: MattAutoUi,
@@ -600,19 +632,11 @@ async function applyConfirmedPause(
     ui.notify("Pause cancelled — pipeline and workers unchanged.", "info");
     return false;
   }
-  const result = await coordinator.pausePipeline();
-  log("info", "run-brief:operator-pause", {
-    workflowId,
-    abortedWorkerCount: result.abortedWorkerCount,
-    affectedAttempts: result.affectedAttempts,
-  });
-  ui.notify(
-    [
-      `Pipeline paused for Workflow #${workflowId}.`,
-      `Aborted ${result.abortedWorkerCount} session-owned worker(s).`,
-      "GitHub workflow state is unchanged. Choose Resume or Terminate.",
-    ].join("\n"),
-    "warning",
+  await applyPauseAlreadyConfirmed(
+    coordinator,
+    ui,
+    panel,
+    "select-confirm",
   );
   return true;
 }
@@ -1055,18 +1079,29 @@ export async function waitForPipelineWorkers(
             return { status: "paused" };
           }
           if (live.action === "resume") {
-            await applyConfirmedResume(controls, ui, panel);
+            // Confirmed in-surface.
+            await controls.resumePipeline();
+            log("info", "run-brief:operator-resume", {
+              workflowId: panel.workflowId,
+              via: "live-inline-confirm",
+            });
+            const after =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, after, "info");
             continue;
           }
           if (live.action === "terminate") {
-            const result = await applyConfirmedTerminate(controls, ui, panel);
-            if (result) {
-              const latest =
-                (await coordinator.getPanelState({ mode: "local" })) ?? panel;
-              notifyRunBrief(ui, latest, "warning");
-              ui.notify(formatTerminateNotify(result), "warning");
-              return { status: "terminated", result };
-            }
+            const result = await controls.terminateRun();
+            log("info", "run-brief:operator-terminate", {
+              workflowId: panel.workflowId,
+              mode: result.mode,
+              via: "live-inline-confirm",
+            });
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, latest, "warning");
+            ui.notify(formatTerminateNotify(result), "warning");
+            return { status: "terminated", result };
           }
           continue;
         }
@@ -1252,20 +1287,37 @@ export async function waitForPipelineWorkers(
             continue;
           }
           if (live.action === "pause") {
-            const applied = await applyConfirmedPause(controls, ui, panel);
-            if (applied) continue;
-          } else if (live.action === "resume") {
-            const applied = await applyConfirmedResume(controls, ui, panel);
-            if (applied) continue;
-          } else if (live.action === "terminate") {
-            const result = await applyConfirmedTerminate(controls, ui, panel);
-            if (result) {
-              const latest =
-                (await coordinator.getPanelState({ mode: "local" })) ?? panel;
-              notifyRunBrief(ui, latest, "warning");
-              ui.notify(formatTerminateNotify(result), "warning");
-              return { status: "terminated", result };
-            }
+            await applyPauseAlreadyConfirmed(
+              controls,
+              ui,
+              panel,
+              "live-inline-confirm",
+            );
+            continue;
+          }
+          if (live.action === "resume") {
+            await controls.resumePipeline();
+            log("info", "run-brief:operator-resume", {
+              workflowId: panel.workflowId,
+              via: "live-inline-confirm",
+            });
+            const after =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, after, "info");
+            continue;
+          }
+          if (live.action === "terminate") {
+            const result = await controls.terminateRun();
+            log("info", "run-brief:operator-terminate", {
+              workflowId: panel.workflowId,
+              mode: result.mode,
+              via: "live-inline-confirm",
+            });
+            const latest =
+              (await coordinator.getPanelState({ mode: "local" })) ?? panel;
+            notifyRunBrief(ui, latest, "warning");
+            ui.notify(formatTerminateNotify(result), "warning");
+            return { status: "terminated", result };
           }
           continue;
         } else if (offerRunningControls) {
@@ -2430,23 +2482,40 @@ export async function runPostGrillPipeline(
               break;
             }
             if (live.action === "pause") {
-              await applyConfirmedPause(coordinator, ui, latest);
-              // Re-open immediately so the brief does not stay gone after confirm.
-              continue;
-            }
-            if (live.action === "resume") {
-              await applyConfirmedResume(coordinator, ui, latest);
-              continue;
-            }
-            if (live.action === "terminate") {
-              const result = await applyConfirmedTerminate(
+              // Confirmed inside the live surface — no second ui.select Confirm.
+              await applyPauseAlreadyConfirmed(
                 coordinator,
                 ui,
                 latest,
+                "live-inline-confirm",
               );
-              if (result) {
-                ui.notify(formatTerminateNotify(result), "warning");
-              }
+              // Re-open live surface with Resume/Terminate (still holdUntilRunEnd).
+              continue;
+            }
+            if (live.action === "resume") {
+              ui.notify(
+                `Resuming Workflow #${latest.workflowId}…`,
+                "info",
+              );
+              await coordinator.resumePipeline();
+              log("info", "run-brief:operator-resume", {
+                workflowId: latest.workflowId,
+                via: "live-inline-confirm",
+              });
+              const after =
+                (await coordinator.getPanelState({ mode: "local" })) ?? latest;
+              notifyRunBrief(ui, after, "info");
+              continue;
+            }
+            if (live.action === "terminate") {
+              // Confirmed in-surface; apply without a second select dialog.
+              const result = await coordinator.terminateRun();
+              log("info", "run-brief:operator-terminate", {
+                workflowId: latest.workflowId,
+                mode: result.mode,
+                via: "live-inline-confirm",
+              });
+              ui.notify(formatTerminateNotify(result), "warning");
               break;
             }
           }

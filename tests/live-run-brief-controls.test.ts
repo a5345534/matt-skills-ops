@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { __liveWaitTestables } from "../src/ui/live-run-brief-controls.js";
 import type { WorkflowPanelState } from "../src/types.js";
 
-const { isSettled, controlItems, canDismissPausedLiveWait } =
+const { isSettled, controlItems, confirmItems, canDismissPausedLiveWait } =
   __liveWaitTestables;
 
 function panel(
@@ -71,5 +71,12 @@ describe("live wait helpers", () => {
     // Esc is an exit only after workers were paused; running live waits stay put.
     expect(canDismissPausedLiveWait(panel())).toBe(false);
     expect(canDismissPausedLiveWait(paused)).toBe(true);
+  });
+
+  it("in-surface confirm items include Confirm Pause and Cancel", () => {
+    const items = confirmItems("pause", 374);
+    expect(items.map((i) => i.value)).toEqual(["confirm", "cancel"]);
+    expect(items[0]?.label).toBe("Confirm Pause");
+    expect(items[0]?.description).toMatch(/#374/);
   });
 });
